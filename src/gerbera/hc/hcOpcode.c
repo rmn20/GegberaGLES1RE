@@ -1,7 +1,7 @@
 /* hcOpcode.c - HC instruction encoding (hcOpcode.h / hcOpcode.c).
  *
- * The opcode table HC_opcodeDecls[55] is transcribed verbatim from the DLL
- * (docs/libGLES_CM.dll.c:5820). Each byte encodes:
+ * The first 55 opcode entries are transcribed from the reference DLL;
+ * later entries describe internal ARM lowering operations. Each byte encodes:
  *   bits 0-2: argument count
  *   bits 3-4: type (0=ALUOP, 1=MEMOP, 2=BRANCH)
  *   bit 5: commutative
@@ -10,7 +10,7 @@
 #include "gerbera/hc/hcOpcode.h"
 #include "gerbera/grState.h"
 
-const unsigned char HC_opcodeDecls[55] =
+const unsigned char HC_opcodeDecls[HCOP_MAX] =
 {
     '#',    '#',    '\x03', '\x03', '\x03', '\x03', '\x03', '\x03',
     '#',    '#',    '#',    '#',    '#',    '#',    '\"',   '\"',
@@ -18,7 +18,9 @@ const unsigned char HC_opcodeDecls[55] =
     '+',    '+',    '+',    '\v',   '\v',   '+',    '\v',   'k',
     'k',    'K',    'k',    'K',    'K',    'K',    'K',    '\xD0',
     '\x91', '\xB3', '\xB3', '\x93', '\x93', '\x93', '\x93', '\x93',
-    '\x93', '\x93', '\x93', '\xB3', '\xB3', '\xD0', '\xD1'
+    '\x93', '\x93', '\x93', '\xB3', '\xB3', '\xD0', '\xD1',
+    '#', '\x03', '\x03', '\x03', '\x03', '\x03', /* internal packed-color ops */
+    '\x03', '\x03', '\x03', '\x03', '\x03'
 };
 
 static const unsigned char indexSize[10] =

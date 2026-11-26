@@ -25,6 +25,7 @@
 #define HC_MAX_LABEL_INDEX 0x800u
 #define HC_MAX_HARD_REGS   32
 #define HC_INFINITE_SPCOST 0x7FFFFFFF
+enum { HC_ARM11_SPILL_REGISTER_WINDOW = 9 };
 
 /* --- internal types (CodeView NB11 TI=0x1AAB..0x1B70) --------------------- */
 
@@ -409,6 +410,7 @@ static void compactInstructionList(HCInstr_s *lst)
     while (HC_getOpcodeOper(&lst[prev]) != HCOP_EOP);
 }
 
+#if HG_ASSERT_ENABLED
 static int findLabel(HCInstr_s *lst, int label)
 {
     int i = 0;
@@ -429,6 +431,7 @@ static int findLabel(HCInstr_s *lst, int label)
     while (HC_getOpcodeOper(&lst[prev]) != HCOP_EOP);
     return -1;
 }
+#endif
 
 static RegInstrCount_s scanNumRegs(HCInstr_s *lst)
 {
@@ -507,6 +510,7 @@ static int swapToHiMem(HCArena_s *mgr, HCInstr_s **dst, HCInstr_s *lst)
     return mark;
 }
 
+#if HG_ASSERT_ENABLED
 static void validateProgramInternal(HCArena_s *mgr, int nHardRegs, HCInstr_s *src)
 {
     HCMark_s mark = HCArena_mark(mgr);
@@ -605,6 +609,10 @@ static void validateProgram(HCArena_s *mgr, int nHardRegs, HCInstr_s *lst)
 {
     validateProgramInternal(mgr, nHardRegs, lst);
 }
+#else
+/* Validation builds temporary analyses solely for the assertions above. */
+#define validateProgram(mgr, nHardRegs, lst) ((void)0)
+#endif
 
 /* --- CFG, dominators, loop nesting, liveness, DU/UD chains ---------------- */
 
@@ -1707,6 +1715,291 @@ static void peephole(HCInstr_s *lst)
         compactInstructionList(lst);
 }
 
+/* Bit provenance for a locally unpacked/repacked texel. Each output bit is
+ * either zero or a bit of one loaded word. This handles byte swizzles as well
+ * as the replicated bits used to expand RGB565/RGBA4444 to 8-bit components. */
+typedef struct RepackBits_s
+{
+    int source;
+    signed char bit[32]; /* -1 = constant zero */
+} RepackBits_s;
+
+static int traceRepack(HCInstr_s *lst, const int *defPos, int first, int end,
+                       int reg, RepackBits_s *out, int *budget, int depth)
+{
+    int pc = defPos[reg], op, src, i;
+    unsigned int imm;
+    HCInstr_s *ins;
+
+    if (depth == 0 || --*budget < 0 || pc < first || pc >= end)
+        return 0;
+    ins = &lst[pc];
+    op = HC_getOpcodeOper(ins);
+    if (HC_isLoadOp(op))
+    {
+        int width;
+        switch (op)
+        {
+        case HCOP_LBU: width = 8; break;
+        case HCOP_LWU: case HCOP_LW2U: width = 16; break;
+        case HCOP_LD: case HCOP_LD4: width = 32; break;
+        default: return 0;
+        }
+        out->source = reg;
+        for (i = 0; i < 32; ++i) out->bit[i] = i < width ? i : -1;
+        return 1;
+    }
+    src = HC_getOpcodeSrc0Raw(ins);
+    if (op == HCOP_OR && !HC_opcodeHasImm(ins))
+    {
+        RepackBits_s rhs;
+        if (!traceRepack(lst, defPos, first, pc, src, out, budget, depth - 1) ||
+            !traceRepack(lst, defPos, first, pc, HC_getOpcodeSrc1Raw(ins), &rhs, budget, depth - 1) ||
+            out->source != rhs.source)
+            return 0;
+        for (i = 0; i < 32; ++i)
+        {
+            if (out->bit[i] < 0) out->bit[i] = rhs.bit[i];
+            else if (rhs.bit[i] >= 0 && out->bit[i] != rhs.bit[i]) return 0;
+        }
+        return 1;
+    }
+    if (op == HCOP_MOV && !HC_opcodeHasImm(ins))
+        return traceRepack(lst, defPos, first, pc, src, out, budget, depth - 1);
+    if (!HC_opcodeHasImm(ins) || (op != HCOP_AND && op != HCOP_LSL &&
+        op != HCOP_LSR && op != HCOP_MINS && op != HCOP_MINU))
+        return 0;
+    imm = ins->instr1;
+    if (!traceRepack(lst, defPos, first, pc, src, out, budget, depth - 1))
+        return 0;
+    if (op == HCOP_AND)
+    {
+        for (i = 0; i < 32; ++i)
+            if (((imm >> i) & 1u) == 0) out->bit[i] = -1;
+    }
+    else if (op == HCOP_LSL || op == HCOP_LSR)
+    {
+        if (imm >= 32u) return 0;
+        if (op == HCOP_LSR)
+            for (i = 0; i < 32; ++i)
+                out->bit[i] = i + (int)imm < 32 ? out->bit[i + (int)imm] : -1;
+        else
+            for (i = 31; i >= 0; --i)
+                out->bit[i] = i >= (int)imm ? out->bit[i - (int)imm] : -1;
+    }
+    else
+    {
+        /* Skip a clamp only when it cannot change the value. */
+        unsigned int max = 0;
+        for (i = 0; i < 32; ++i)
+            if (out->bit[i] >= 0) max |= 1u << i;
+        if (max > imm || (op == HCOP_MINS && (max | imm) >= 0x80000000u))
+            return 0;
+    }
+    return 1;
+}
+
+static HCInstr_s *repackDef(HCInstr_s *lst, const int *defPos, int first, int end, int reg)
+{
+    int pc = defPos[reg];
+    return pc >= first && pc < end ? &lst[pc] : NULL;
+}
+
+static int traceLoadedByte(HCInstr_s *lst, const int *defPos, int first, int end,
+                           int reg, int lane, int *budget)
+{
+    RepackBits_s value;
+    int i;
+    if (!traceRepack(lst, defPos, first, end, reg, &value, budget, 8)) return -1;
+    for (i = 0; i < 32; ++i)
+        if (value.bit[i] != (i < 8 ? i + lane : -1)) return -1;
+    return value.source;
+}
+
+static int repackOp(HCInstr_s *ins, int op, int hasImm, unsigned int imm)
+{
+    return ins != NULL && HC_getOpcodeOper(ins) == op && HC_opcodeHasImm(ins) == hasImm &&
+           (!hasImm || ins->instr1 == imm);
+}
+
+/* Trace one independently truncated framebuffer term, (color*factor+color)>>8.
+ * The bias must be the color, not the factor (as in SRC_ALPHA_SATURATE). */
+static int traceAlphaTerm(HCInstr_s *lst, const int *defPos, int first, HCInstr_s *consumer,
+                          int term, int lane, int *budget, int *alpha, int *inverse)
+{
+    HCInstr_s *shift, *add, *mul, *weight;
+    int pc = (int)(consumer - lst), i;
+    shift = repackDef(lst, defPos, first, pc, term);
+    if (!repackOp(shift, HCOP_LSR, 1, 8)) return -1;
+    add = repackDef(lst, defPos, first, (int)(shift - lst), HC_getOpcodeSrc0Raw(shift));
+    if (!repackOp(add, HCOP_ADD, 0, 0)) return -1;
+    for (i = 0; i < 2; ++i)
+    {
+        int idx = (int)(add - lst);
+        int color = i == 0 ? HC_getOpcodeSrc0Raw(add) : HC_getOpcodeSrc1Raw(add);
+        int product = i == 0 ? HC_getOpcodeSrc1Raw(add) : HC_getOpcodeSrc0Raw(add);
+        int a, b, factor, packed;
+        mul = repackDef(lst, defPos, first, idx, product);
+        if ((!repackOp(mul, HCOP_MULS, 0, 0) && !repackOp(mul, HCOP_MULU, 0, 0))) continue;
+        a = HC_getOpcodeSrc0Raw(mul);
+        b = HC_getOpcodeSrc1Raw(mul);
+        if (a != color && b != color) continue;
+        factor = a == color ? b : a;
+        idx = (int)(mul - lst);
+        packed = traceLoadedByte(lst, defPos, first, idx, color, lane, budget);
+        if (packed < 0) continue;
+        weight = repackDef(lst, defPos, first, idx, factor);
+        *inverse = repackOp(weight, HCOP_XOR, 1, 255) || repackOp(weight, HCOP_SUBR, 1, 255);
+        if (*inverse)
+        {
+            factor = HC_getOpcodeSrc0Raw(weight);
+            idx = (int)(weight - lst);
+        }
+        *alpha = traceLoadedByte(lst, defPos, first, idx, factor, 24, budget);
+        if (*alpha >= 0) return packed;
+    }
+    return -1;
+}
+
+typedef struct PackedBlend_s
+{
+    int op, a, b;
+    unsigned int lanes;
+} PackedBlend_s;
+
+/* Match the entire OR tree, with the same packed operands and operation in
+ * every written lane. No assumptions about the GL state or gradient range. */
+static int tracePackedBlend(HCInstr_s *lst, const int *defPos, int first, int end,
+                            int reg, PackedBlend_s *blend, int *budget, int depth)
+{
+    HCInstr_s *ins = repackDef(lst, defPos, first, end, reg);
+    int lane = 0, a = -1, b = -1, op = HCOP_UQADD8;
+    unsigned int laneBit;
+
+    if (ins == NULL || depth == 0 || --*budget < 0) return 0;
+    end = (int)(ins - lst);
+    if (repackOp(ins, HCOP_OR, 0, 0))
+        return tracePackedBlend(lst, defPos, first, end, HC_getOpcodeSrc0Raw(ins), blend, budget, depth - 1) &&
+               tracePackedBlend(lst, defPos, first, end, HC_getOpcodeSrc1Raw(ins), blend, budget, depth - 1);
+    if (HC_getOpcodeOper(ins) == HCOP_LSL && HC_opcodeHasImm(ins))
+    {
+        if (ins->instr1 > 24u || (ins->instr1 & 7u) != 0) return 0;
+        lane = (int)ins->instr1;
+        ins = repackDef(lst, defPos, first, end, HC_getOpcodeSrc0Raw(ins));
+    }
+    laneBit = 1u << (lane / 8);
+    if ((blend->lanes & laneBit) || (!repackOp(ins, HCOP_MINU, 1, 255) && !repackOp(ins, HCOP_MINS, 1, 255)))
+        return 0;
+    ins = repackDef(lst, defPos, first, (int)(ins - lst), HC_getOpcodeSrc0Raw(ins));
+    if (repackOp(ins, HCOP_MAXS, 1, 0))
+    {
+        op = HCOP_UQSUB8;
+        ins = repackDef(lst, defPos, first, (int)(ins - lst), HC_getOpcodeSrc0Raw(ins));
+    }
+    if ((op == HCOP_UQADD8 && repackOp(ins, HCOP_ADD, 0, 0)) ||
+        (op == HCOP_UQSUB8 && (repackOp(ins, HCOP_SUB, 0, 0) || repackOp(ins, HCOP_SUBR, 0, 0))))
+    {
+        int x = HC_getOpcodeSrc0Raw(ins), y = HC_getOpcodeSrc1Raw(ins);
+        if (HC_getOpcodeOper(ins) == HCOP_SUBR) { int tmp = x; x = y; y = tmp; }
+        end = (int)(ins - lst);
+        a = traceLoadedByte(lst, defPos, first, end, x, lane, budget);
+        b = traceLoadedByte(lst, defPos, first, end, y, lane, budget);
+        if ((a < 0 || b < 0) && op == HCOP_UQADD8)
+        {
+            int ax, ay, ix, iy;
+            a = traceAlphaTerm(lst, defPos, first, ins, x, lane, budget, &ax, &ix);
+            b = traceAlphaTerm(lst, defPos, first, ins, y, lane, budget, &ay, &iy);
+            if (a < 0 || b < 0 || ax != ay || ix == iy) return 0;
+            if (ix) { int tmp = a; a = b; b = tmp; } /* first term uses the direct alpha */
+            if (ax == a) op = HCOP_PACKED_ALPHA_A;
+            else if (ax == b) op = HCOP_PACKED_ALPHA_B;
+            else return 0;
+        }
+    }
+    if (a < 0 || b < 0) return 0;
+    if (op == HCOP_UQADD8 && a > b) { int tmp = a; a = b; b = tmp; }
+    if (blend->lanes == 0)
+    {
+        blend->op = op;
+        blend->a = a;
+        blend->b = b;
+    }
+    else if (op != blend->op || a != blend->a || b != blend->b)
+        return 0;
+    blend->lanes |= laneBit;
+    return 1;
+}
+
+static int peepholeRepackStore(HCArena_s *mgr, HCInstr_s *lst, int packedBlend)
+{
+    HCMark_s mark = HCArena_mark(mgr);
+    RegInstrCount_s info = scanNumRegs(lst);
+    int *defPos, i, first = 0, changed = 0;
+
+    if (info.numRegs <= 0) return 0;
+    defPos = (int *)HCArena_allocBottom(mgr, sizeof(int) * (unsigned int)info.numRegs);
+    for (i = 0; i < info.numRegs; ++i) defPos[i] = -1;
+    for (i = 0; i < info.numInstrs; ++i)
+    {
+        int def = HC_getDef(&lst[i]);
+        if (def >= 0) defPos[def] = defPos[def] == -1 ? i : -2;
+    }
+    for (i = 0; i < info.numInstrs; ++i)
+    {
+        HCInstr_s *ins = &lst[i];
+        int op = HC_getOpcodeOper(ins);
+        int reg, pc, width, bit, budget = 48;
+        RepackBits_s bits;
+        if (op == HCOP_LABEL || HC_isBranchOp(op))
+            first = i + 1;
+        if (op == HCOP_SW || op == HCOP_SW2) width = 16;
+        else if (op == HCOP_SD || op == HCOP_SD4) width = 32;
+        else continue;
+        reg = HC_getOpcodeDst(ins);
+        pc = defPos[reg];
+        if (pc < first || pc >= i || HC_getOpcodeOper(&lst[pc]) != HCOP_OR)
+            continue;
+        if (packedBlend && width == 32)
+        {
+            PackedBlend_s blend = { 0, 0, 0, 0 };
+            int blendBudget = 120;
+            if (tracePackedBlend(lst, defPos, first, i, reg, &blend, &blendBudget, 8))
+            {
+                int op = blend.op;
+                if (blend.lanes == 7u)
+                {
+                    /* The tree proves bits 24..31 are zero, not a preserved
+                     * byte. RGB-only media pseudo-ops keep that exact value. */
+                    switch (op)
+                    {
+                    case HCOP_UQADD8: op = HCOP_UQADD8_RGB; break;
+                    case HCOP_UQSUB8: op = HCOP_UQSUB8_RGB; break;
+                    case HCOP_PACKED_ALPHA_A: op = HCOP_PACKED_ALPHA_RGB_A; break;
+                    case HCOP_PACKED_ALPHA_B: op = HCOP_PACKED_ALPHA_RGB_B; break;
+                    }
+                }
+                if (blend.lanes == 7u || blend.lanes == 15u)
+                {
+                    lst[pc] = HC_genOp3(op, reg, blend.a, blend.b);
+                    changed = 1;
+                }
+            }
+            continue;
+        }
+        if (packedBlend || !traceRepack(lst, defPos, first, i, reg, &bits, &budget, 12))
+            continue;
+        for (bit = 0; bit < width; ++bit)
+            if (bits.bit[bit] != bit) break;
+        if (bit == width)
+        {
+            HC_setOpcodeDst(ins, bits.source);
+            changed = 1;
+        }
+    }
+    HCArena_release(mgr, &mark);
+    return changed;
+}
+
 static void peepholeFills(HCArena_s *mgr, HCInstr_s *lst)
 {
     int i = 0;
@@ -2714,6 +3007,10 @@ static HCInstr_s *genSpillCode(HCArena_s *mgr, int *dispCount,
             {
                 if (spillsTop[sIdx].type == 1)
                 {
+                    if (HC_isSpillLoad(instr) &&
+                        HC_getOpcodeDst(instr) == spillsTop[sIdx].reg &&
+                        HC_getOpcodeImm(instr) == (int)spillsTop[sIdx].disp)
+                        continue;
                     HCArena_growCurrent(mgr, (unsigned int)sizeof(HCInstr_s));
                     *dst++ = genSpillStore(spillsTop[sIdx].reg, spillsTop[sIdx].disp);
                 }
@@ -2730,7 +3027,7 @@ static int minColor(HCMemory_s *mgr, HCBitSet_s *offStack,
                     const AdjEntry_s *adjLists, HCAdjList_s *igraph,
                     int nSymRegs, int nHardRegs,
                     const SpillRegMap_s *spillRegs,
-                    const unsigned short *symToLoc, int r)
+                    const unsigned short *symToLoc, int r, int rotate)
 {
     int mark = HCMemory_mark(mgr);
     HCBitSet_s *usedColors = HCBitSet_create(mgr, nHardRegs);
@@ -2776,6 +3073,15 @@ static int minColor(HCMemory_s *mgr, HCBitSet_s *offStack,
                 bestColor = c;
                 bestScore = colorBias[c];
             }
+        }
+        /* Distinct spill temporaries leave independent loads available to
+         * the scheduler instead of repeatedly overwriting the first register. */
+        if (bestScore == 0 && rotate)
+        {
+            int hint = r % HC_ARM11_SPILL_REGISTER_WINDOW;
+            for (c = HCBitSet_getFirstUnset(usedColors); c != -1;
+                 c = HCBitSet_getNextUnset(usedColors, c))
+                if (c >= hint) { bestColor = c; break; }
         }
         HCMemory_release(mgr, mark);
         return bestColor;
@@ -2860,7 +3166,7 @@ static SpillRegMap_s *initializeSpillRegMapping(HCMemory_s *mgr,
 static int assignRegisters(HCMemory_s *mgr, const unsigned short *stack,
                            int nSymRegs, AdjEntry_s *adjLists,
                            HCAdjList_s *igraph, int nHardRegs,
-                           unsigned short *colorToReg, HCInstr_s *lst)
+                           unsigned short *colorToReg, HCInstr_s *lst, int rotate)
 {
     int ok = 1;
     int mark = HCMemory_mark(mgr);
@@ -2886,7 +3192,7 @@ static int assignRegisters(HCMemory_s *mgr, const unsigned short *stack,
         HCBitSet_or(offStack, r);
 
         col = minColor(mgr, offStack, adjLists, igraph, nSymRegs, nHardRegs,
-                       spillRegs, symToLoc, r);
+                       spillRegs, symToLoc, r, rotate);
         if (col == -1)
         {
             if (r < nHardRegs)
@@ -2919,7 +3225,7 @@ static int hcModulo(int x, int y)
 static int pruneGraph(HCArena_s *mgr, HCInstr_s **outputLst,
                       AdjEntry_s *adjLists, HCAdjList_s *igraph,
                       unsigned short *colorToReg, int *dispCount,
-                      int nHardRegs, int nSymRegs, HCInstr_s *lst)
+                      int nHardRegs, int nSymRegs, HCInstr_s *lst, int rotate)
 {
     HCMark_s fullMark = HCArena_mark(mgr);
     HCMemory_s topMem = HCArena_topInterface(mgr);
@@ -3095,8 +3401,26 @@ static int pruneGraph(HCArena_s *mgr, HCInstr_s **outputLst,
     if (stackSize != nSymRegs)
         HC_assertFail("stackSize == nSymRegs", "hcCompiler.c", 4477, NULL);
 
-    success = assignRegisters(&topMem, stack, nSymRegs, adjLists, igraph,
-                              nHardRegs, colorToReg, lst);
+    {
+        unsigned int *savedColors = NULL;
+        if (rotate)
+        {
+            savedColors = (unsigned int *)HCMemory_alloc(&topMem, sizeof(*savedColors) * (unsigned int)nSymRegs);
+            for (i = 0; i < nSymRegs; ++i) savedColors[i] = adjLists[i].color;
+        }
+        success = assignRegisters(&topMem, stack, nSymRegs, adjLists, igraph,
+                                  nHardRegs, colorToReg, lst, rotate);
+        if (!success && rotate)
+        {
+            for (i = 0; i < nSymRegs; ++i)
+            {
+                adjLists[i].spill = 0;
+                adjLists[i].color = savedColors[i];
+            }
+            success = assignRegisters(&topMem, stack, nSymRegs, adjLists, igraph,
+                                      nHardRegs, colorToReg, lst, 0);
+        }
+    }
     HCArena_releaseBottom(mgr, botMark);
     if (success != 0)
     {
@@ -3112,7 +3436,7 @@ static int pruneGraph(HCArena_s *mgr, HCInstr_s **outputLst,
 }
 
 static HCInstr_s *registerAllocation(HCArena_s *mgr, HCInstr_s *lst,
-                                     int spillStart, int nHardRegs)
+                                     int spillStart, int nHardRegs, int rotate)
 {
     int round = 0;
     int dispCount = spillStart;
@@ -3155,7 +3479,7 @@ static HCInstr_s *registerAllocation(HCArena_s *mgr, HCInstr_s *lst,
         botMrk = HCMemory_mark(&botMem);
         sc = computeSpillCosts(mgr, spillStart, nHardRegs, lst);
         colored = pruneGraph(mgr, &outLst, sc.adjLists, sc.graph,
-                             colorToReg, &dispCount, nHardRegs, sc.numSymRegs, lst);
+                             colorToReg, &dispCount, nHardRegs, sc.numSymRegs, lst, rotate);
         if (colored != 0)
         {
             HCMemory_release(&botMem, botMrk);
@@ -3407,7 +3731,8 @@ static void coalesceSpillLocations(HCArena_s *mgr, int spillStart, HCInstr_s *ls
         HCInstr_s *instr = &lst[i];
         UDChainStub_s *perUse = chains.udChains[i];
 
-        if (perUse != NULL && HC_isSpillStore(instr) != 0)
+        if (perUse != NULL && HC_isSpillStore(instr) != 0 &&
+            HC_getOpcodeImm(instr) >= spillStart)
         {
             int storeSlot = HC_getOpcodeImm(instr) >> 2;
             if (HCBitSet_contains(storeSet, 2 * storeSlot + 1) == 0)
@@ -3524,7 +3849,7 @@ static void optimizeLoopConstantLoads(HCArena_s *mgr,
         int op = HC_getOpcodeOper(instr);
         if (op == HCOP_LABEL || HC_isCondBranchOp(op) != 0 || op == HCOP_EOP)
             break;
-        if (HC_isSpillStore(instr) != 0)
+        if (HC_isSpillStore(instr) != 0 && HC_getOpcodeImm(instr) >= spillStart)
         {
             int dstSlot = HC_getOpcodeImm(instr) >> 2;
             int valReg  = HC_getOpcodeDst(instr);
@@ -3616,6 +3941,14 @@ static void removeRedundantSpills(HCArena_s *mgr, HCInstr_s *lst)
                 }
                 else
                 {
+                    for (r = 1; r < HC_MAX_HARD_REGS; ++r)
+                    {
+                        if (r != reg && regSlot[r] == offs)
+                        {
+                            *instr = HC_genOp2(HCOP_MOV, reg, r);
+                            break;
+                        }
+                    }
                     regSlot[reg] = offs;
                 }
             }
@@ -3626,7 +3959,10 @@ static void removeRedundantSpills(HCArena_s *mgr, HCInstr_s *lst)
                 {
                     if (d < 0 || d >= HC_MAX_HARD_REGS)
                         HC_assertFail("d >= 0 && d < HC_MAX_HARD_REGS", "hcCompiler.c", 5252, NULL);
-                    regSlot[d] = -1;
+                    if (d == 0)
+                        for (r = 0; r < HC_MAX_HARD_REGS; ++r) regSlot[r] = -1;
+                    else
+                        regSlot[d] = -1;
                 }
                 if (HC_isSpillStore(instr) != 0)
                 {
@@ -3635,9 +3971,17 @@ static void removeRedundantSpills(HCArena_s *mgr, HCInstr_s *lst)
                         HC_assertFail("loc >= 0", "hcCompiler.c", 5262, NULL);
                     for (r = 0; r < HC_MAX_HARD_REGS; ++r)
                     {
-                        if (loc == regSlot[r])
+                        if (regSlot[r] >= 0 &&
+                            ((unsigned int)(loc - regSlot[r]) < 4u ||
+                             (unsigned int)(regSlot[r] - loc) < 4u))
                             regSlot[r] = -1;
                     }
+                    regSlot[HC_getOpcodeDst(instr)] = loc;
+                }
+                else if (HC_isStoreOp(HC_getOpcodeOper(instr)))
+                {
+                    /* A pointer-based or partial-width write may alias any slot. */
+                    for (r = 0; r < HC_MAX_HARD_REGS; ++r) regSlot[r] = -1;
                 }
             }
         }
@@ -3662,6 +4006,10 @@ static void removeRedundantSpills(HCArena_s *mgr, HCInstr_s *lst)
             else if (HC_isSpillLoad(instr) != 0)
             {
                 HCBitSet_or(slotNeeded, HC_getOpcodeImm(instr) >> 2);
+            }
+            else if (HC_getOpcodeType(instr) == HCOP_TYPE_MEMOP || HC_getDef(instr) == 0)
+            {
+                HCBitSet_set(slotNeeded);
             }
         }
     }
@@ -3978,6 +4326,568 @@ static void loadScheduler(HCArena_s *mgr, HCInstr_s *lst)
     HCArena_release(mgr, &mark);
 }
 
+#if GERBERA_ARMV6_JIT
+/* Schedule hard-register instructions by data dependencies and ARM1136
+ * producer latency. Preserve memory ordering unless two parameter slots
+ * have disjoint byte ranges, and keep backend fusion operands together. */
+enum { SCHED_MAX = 120 };
+
+static int schedIsMem(int op) { return op >= HCOP_LBS && op <= HCOP_SD4; }
+static int schedIsShift(int op)
+{
+    return op == HCOP_ASR || op == HCOP_LSL || op == HCOP_LSR || op == HCOP_ROR;
+}
+static int schedIsBarrier(int op)
+{
+    return op < 0 || (op > HCOP_SD4 && (op < HCOP_UQADD8 || op > HCOP_UXTB_ROR)) || op == HCOP_NOP;
+}
+static int schedLat(int op)
+{
+    if (HC_isLoadOp(op) != 0 || op == HCOP_MULS || op == HCOP_MULU)
+        return 3;
+    return 1;
+}
+
+static int schedMemDep(HCInstr_s *a, HCInstr_s *b, int opA, int opB)
+{
+    int sa, sb, ra, rb;
+    if (!schedIsMem(opA) || !schedIsMem(opB))
+        return 0;
+    sa = HC_isStoreOp(opA) != 0;
+    sb = HC_isStoreOp(opB) != 0;
+    if (!sa && !sb)
+        return 0;
+    ra = ((a->instr0 >> 21) == 0) && (a->instr0 & 0x100u);
+    rb = ((b->instr0 >> 21) == 0) && (b->instr0 & 0x100u);
+    if (ra && rb)
+        return a->instr1 - b->instr1 < 4u || b->instr1 - a->instr1 < 4u;
+    return 1;
+}
+
+/* returns -1 if b does not depend on a, else the minimum issue distance */
+static int schedDep(HCInstr_s *a, HCInstr_s *b, int opA, int opB)
+{
+    int ua[4], ub[4];
+    int da = HC_getDef(a), db = HC_getDef(b);
+    int na = HC_getUses(a, ua), nb = HC_getUses(b, ub);
+    int d = -1;
+
+    if (da != -1 && HC_containsInt(ub, nb, da) != 0)
+    {
+        int early = 0;
+        if (schedIsMem(opB))
+        {
+            int base = (int)(b->instr0 >> 21);
+            int idx  = (b->instr0 & 0x100u) ? -1 : (int)(b->instr1 & 0x7FFu);
+            early = (da == base || da == idx);
+        }
+        else if (schedIsShift(opB))
+            early = 1;
+        d = schedLat(opA) + early;
+    }
+    if (db != -1 && HC_containsInt(ua, na, db) != 0 && d < 0)
+        d = 0;
+    if (da != -1 && da == db && d < 0)
+        d = 0;
+    if (schedMemDep(a, b, opA, opB) != 0 && d < 0)
+        d = 0;
+    return d;
+}
+
+static void schedSegment(HCArena_s *mgr, HCInstr_s *lst, int lo, int n, int pinLast)
+{
+    typedef struct SchedRegisters
+    {
+        unsigned int defined, used, early;
+    } SchedRegisters;
+    HCMark_s mark = HCArena_mark(mgr);
+    HCInstr_s *orig = (HCInstr_s *)HCArena_allocBottom(mgr, (unsigned int)(n * (int)sizeof(HCInstr_s)));
+    signed char *dep = (signed char *)HCArena_allocBottom(mgr, (unsigned int)(n * n));
+    signed char *ud  = (signed char *)HCArena_allocBottom(mgr, (unsigned int)(n * n));
+    int *op      = (int *)HCArena_allocBottom(mgr, (unsigned int)(n * 4 * 8));
+    int *unitOf  = op + n;
+    int *cnt     = unitOf + n;     /* members per unit (indexed by unit id = last member) */
+    int *npred   = cnt + n;
+    int *readyAt = npred + n;
+    int *height  = readyAt + n;
+    int *done    = height + n;
+    int *order   = done + n;
+    unsigned char *mem = (unsigned char *)HCArena_allocBottom(mgr, (unsigned int)(n * 4));
+    SchedRegisters smallRegisters[sizeof(SchedRegisters)];
+    /* Register metadata is dead before the unit dependency matrix is built. */
+    SchedRegisters *registers = n >= (int)sizeof(SchedRegisters)
+        ? (SchedRegisters *)ud : smallRegisters;
+    int maskable = 1;
+    int i, j, k, t = 0, emitted = 0, outPos = 0;
+
+    memcpy(orig, &lst[lo], (size_t)n * sizeof(HCInstr_s));
+    for (i = 0; i < n; ++i)
+    {
+        int uses[4], count = HC_getUses(&orig[i], uses);
+        int def = HC_getDef(&orig[i]);
+        op[i] = HC_getOpcodeOper(&orig[i]);
+        unitOf[i] = i; cnt[i] = 1; mem[i * 4] = (unsigned char)i;
+        npred[i] = 0; readyAt[i] = 0; height[i] = 0; done[i] = 0;
+        registers[i].defined = registers[i].used = registers[i].early = 0;
+        if (def >= 0)
+        {
+            if (def >= HC_MAX_HARD_REGS) maskable = 0;
+            else registers[i].defined = 1u << def;
+        }
+        for (j = 0; j < count; ++j)
+        {
+            if ((unsigned int)uses[j] >= HC_MAX_HARD_REGS) maskable = 0;
+            else registers[i].used |= 1u << uses[j];
+        }
+        if (schedIsMem(op[i]))
+        {
+            int base = (int)(orig[i].instr0 >> 21);
+            int index = (orig[i].instr0 & 0x100u) ? -1 : (int)(orig[i].instr1 & 0x7FFu);
+            if ((unsigned int)base < HC_MAX_HARD_REGS) registers[i].early = 1u << base;
+            if ((unsigned int)index < HC_MAX_HARD_REGS) registers[i].early |= 1u << index;
+        }
+        else if (schedIsShift(op[i]))
+            registers[i].early = registers[i].used;
+    }
+    if (maskable)
+    {
+        for (i = 0; i < n; ++i)
+        {
+            unsigned int defined = registers[i].defined, used = registers[i].used;
+            int latency = schedLat(op[i]);
+            for (j = i + 1; j < n; ++j)
+            {
+                int d = -1;
+                if (defined & registers[j].used)
+                    d = latency + ((defined & registers[j].early) != 0);
+                else if (registers[j].defined & (used | defined))
+                    d = 0;
+                else if (schedMemDep(&orig[i], &orig[j], op[i], op[j]))
+                    d = 0;
+                dep[i * n + j] = (signed char)d;
+            }
+        }
+    }
+    else
+        for (i = 0; i < n; ++i)
+            for (j = i + 1; j < n; ++j)
+                dep[i * n + j] = (signed char)schedDep(&orig[i], &orig[j], op[i], op[j]);
+
+    /* glue: MUL + following ADD, shift or MAXS #0 + single consumer */
+    for (i = 0; i < n; ++i)
+    {
+        int target = -1;
+        if (op[i] == HCOP_MULS || op[i] == HCOP_MULU || schedIsShift(op[i]) ||
+            (op[i] == HCOP_MAXS && HC_opcodeHasImm(&orig[i]) && orig[i].instr1 == 0))
+        {
+            int def = HC_getDef(&orig[i]), nuse = 0, first = -1;
+            for (j = i + 1; j < n; ++j)
+            {
+                int depends, redefines;
+                if (maskable)
+                {
+                    depends = (registers[j].used & registers[i].defined) != 0;
+                    redefines = registers[j].defined == registers[i].defined;
+                }
+                else
+                {
+                    int u[4], nu = HC_getUses(&orig[j], u);
+                    depends = HC_containsInt(u, nu, def) != 0;
+                    redefines = HC_getDef(&orig[j]) == def;
+                }
+                if (depends)
+                {
+                    if (first < 0) first = j;
+                    ++nuse;
+                }
+                if (redefines)
+                    break;
+            }
+            if (nuse == 1 &&
+                (((op[i] == HCOP_MULS || op[i] == HCOP_MULU) &&
+                  op[first] == HCOP_ADD && (orig[first].instr0 & 0x100u) == 0) ||
+                 schedIsShift(op[i]) ||
+                 ((op[i] == HCOP_MAXS) && (op[first] == HCOP_MINS || op[first] == HCOP_MINU))))
+                target = first;
+        }
+        if (target < 0 || unitOf[i] != i || cnt[i] != 1 || cnt[unitOf[target]] >= 3)
+            continue;
+        for (k = i + 1; k < target; ++k)          /* i would move past k */
+            if (unitOf[k] != unitOf[target] && dep[i * n + k] >= 0)
+                break;
+        if (k < target)
+            continue;
+        /* the glued unit id is the unit of target (its last member) */
+        {
+            int u = unitOf[target], c = cnt[u], m;
+            if (c == 1 && unitOf[i] != i) continue;
+            for (m = c; m > 0; --m) mem[u * 4 + m] = mem[u * 4 + m - 1];
+            mem[u * 4] = (unsigned char)i;
+            cnt[u] = c + 1;
+            unitOf[i] = u;
+            cnt[i] = 0;
+        }
+    }
+    /* members of a unit must stay in original order */
+    for (i = 0; i < n; ++i)
+        if (cnt[i] > 1)
+            for (j = 1; j < cnt[i]; ++j)
+                for (k = j; k > 0 && mem[i * 4 + k - 1] > mem[i * 4 + k]; --k)
+                {
+                    unsigned char tmp = mem[i * 4 + k];
+                    mem[i * 4 + k] = mem[i * 4 + k - 1];
+                    mem[i * 4 + k - 1] = tmp;
+                }
+
+    memset(ud, -1, (size_t)(n * n));
+    for (i = 0; i < n; ++i)
+        for (j = i + 1; j < n; ++j)
+            if (dep[i * n + j] >= 0 && unitOf[i] != unitOf[j])
+            {
+                int u = unitOf[i], v = unitOf[j];
+                if (ud[u * n + v] < dep[i * n + j])
+                    ud[u * n + v] = dep[i * n + j];
+            }
+    if (pinLast)
+    {
+        int last = unitOf[n - 1];
+        for (i = 0; i < n; ++i)
+            if (cnt[i] > 0 && i != last && ud[i * n + last] < 0)
+                ud[i * n + last] = 0;
+    }
+    for (i = 0; i < n; ++i)
+        for (j = 0; j < n; ++j)
+            if (cnt[i] > 0 && cnt[j] > 0 && ud[i * n + j] >= 0)
+                ++npred[j];
+    for (i = n - 1; i >= 0; --i)
+    {
+        int best = 0;
+        if (cnt[i] == 0) continue;
+        for (j = i + 1; j < n; ++j)
+            if (cnt[j] > 0 && ud[i * n + j] >= 0 && ud[i * n + j] + height[j] > best)
+                best = ud[i * n + j] + height[j];
+        height[i] = best > schedLat(op[i]) + cnt[i] - 1 ? best : schedLat(op[i]) + cnt[i] - 1;
+    }
+
+    {
+        int units = 0;
+        for (i = 0; i < n; ++i) if (cnt[i] > 0) ++units;
+        while (emitted < units)
+        {
+            int pick = -1, pickReady = 0x7FFFFFFF;
+            for (i = 0; i < n; ++i)
+            {
+                if (cnt[i] == 0 || done[i] || npred[i] != 0) continue;
+                {
+                    int r = readyAt[i];
+                    int better;
+                    if (pick < 0) better = 1;
+                    else if (r <= t && pickReady <= t) better = height[i] > height[pick];
+                    else if (r <= t) better = 1;
+                    else if (pickReady <= t) better = 0;
+                    else better = r < pickReady || (r == pickReady && height[i] > height[pick]);
+                    if (better) { pick = i; pickReady = r; }
+                }
+            }
+            if (pick < 0)
+            {
+                outPos = -1;
+                break;
+            }
+            if (t < readyAt[pick]) t = readyAt[pick];
+            for (k = 0; k < cnt[pick]; ++k)
+                order[outPos++] = mem[pick * 4 + k];
+            done[pick] = 1;
+            ++emitted;
+            for (j = 0; j < n; ++j)
+                if (cnt[j] > 0 && ud[pick * n + j] >= 0)
+                {
+                    int r = t + cnt[pick] - 1 + ud[pick * n + j];
+                    if (readyAt[j] < r) readyAt[j] = r;
+                    --npred[j];
+                }
+            t += cnt[pick];
+        }
+    }
+    if (outPos == n)
+        for (i = 0; i < n; ++i)
+            lst[lo + i] = orig[order[i]];
+    HCArena_release(mgr, &mark);
+}
+
+static void renameScratchLoads(HCArena_s *mgr, HCInstr_s *lst, int nHardRegs)
+{
+    HCMark_s mark = HCArena_mark(mgr);
+    BasicBlock_s *blocks = NULL;
+    int nBlocks = HC_buildBasicBlocks(mgr, &blocks, lst);
+    int nInstrs = scanNumRegs(lst).numInstrs;
+    unsigned int *useMask, *defMask, *liveIn, *liveOut, *liveAfter;
+    unsigned int usedRegs = 0;
+    int b, pos, changed, cursor = 1;
+    int uses[4];
+
+    if (nHardRegs <= 2 || nHardRegs > 30 || nInstrs <= 2)
+    {
+        HCArena_release(mgr, &mark);
+        return;
+    }
+
+    for (pos = 0; pos < nInstrs; ++pos)
+    {
+        int def = HC_getDef(&lst[pos]);
+        int nUses = HC_getRegUses(uses, &lst[pos]);
+        int u;
+        if (def >= 1 && def < nHardRegs)
+            usedRegs |= 1u << def;
+        for (u = 0; u < nUses; ++u)
+            if (uses[u] >= 1 && uses[u] < nHardRegs)
+                usedRegs |= 1u << uses[u];
+    }
+
+    useMask   = (unsigned int *)HCArena_allocBottom(mgr, (unsigned int)(4 * nBlocks * sizeof(unsigned int)));
+    defMask   = useMask + nBlocks;
+    liveIn    = defMask + nBlocks;
+    liveOut   = liveIn + nBlocks;
+    liveAfter = (unsigned int *)HCArena_allocBottom(mgr, (unsigned int)(nInstrs * sizeof(unsigned int)));
+    memset(useMask, 0, (size_t)(4 * nBlocks) * sizeof(unsigned int));
+
+    for (b = 0; b < nBlocks; ++b)
+    {
+        int start = BasicBlock_getStart(&blocks[b]);
+        int end   = BasicBlock_getEnd(&blocks[b]);
+        unsigned int live = 0, defs = 0;
+        for (pos = end; pos >= start; --pos)
+        {
+            int def = HC_getDef(&lst[pos]);
+            int nUses = HC_getRegUses(uses, &lst[pos]);
+            int u;
+            if (def >= 1 && def < nHardRegs)
+            {
+                live &= ~(1u << def);
+                defs |= 1u << def;
+            }
+            for (u = 0; u < nUses; ++u)
+                if (uses[u] >= 1 && uses[u] < nHardRegs)
+                    live |= 1u << uses[u];
+        }
+        useMask[b] = live;
+        defMask[b] = defs;
+    }
+
+    do
+    {
+        changed = 0;
+        for (b = nBlocks - 1; b >= 0; --b)
+        {
+            BasicBlock_s *bb = &blocks[b];
+            unsigned int out = 0, in;
+            int s;
+            for (s = 0; s < (int)bb->numSuccs; ++s)
+                out |= liveIn[bb->succ[s]];
+            in = useMask[b] | (out & ~defMask[b]);
+            if (out != liveOut[b] || in != liveIn[b])
+            {
+                liveOut[b] = out;
+                liveIn[b] = in;
+                changed = 1;
+            }
+        }
+    }
+    while (changed);
+
+    for (b = 0; b < nBlocks; ++b)
+    {
+        int start = BasicBlock_getStart(&blocks[b]);
+        int end   = BasicBlock_getEnd(&blocks[b]);
+        unsigned int live = liveOut[b];
+        for (pos = end; pos >= start; --pos)
+        {
+            int def = HC_getDef(&lst[pos]);
+            int nUses = HC_getRegUses(uses, &lst[pos]);
+            int u;
+            liveAfter[pos] = live;
+            if (def >= 1 && def < nHardRegs)
+                live &= ~(1u << def);
+            for (u = 0; u < nUses; ++u)
+                if (uses[u] >= 1 && uses[u] < nHardRegs)
+                    live |= 1u << uses[u];
+        }
+
+        /* Keep inputs of backend-deferred instructions (MULS/MULU -> MLA,
+         * shift -> barrel-shifter, MAXS #0 -> USAT) live until their single
+         * consumer so scratch renaming never blocks backend fusion. */
+        for (pos = start; pos < end; ++pos)
+        {
+            int mop = HC_getOpcodeOper(&lst[pos]);
+            int mdef = HC_getDef(&lst[pos]);
+            if (mdef >= 1 && mdef < nHardRegs &&
+                (mop == HCOP_MULS || mop == HCOP_MULU || schedIsShift(mop) ||
+                 (mop == HCOP_MAXS && HC_opcodeHasImm(&lst[pos]) && lst[pos].instr1 == 0)))
+            {
+                int mUses[4], nmUses = HC_getRegUses(mUses, &lst[pos]);
+                int consumer = -1, nCons = 0, k, u;
+                for (k = pos + 1; k <= end; ++k)
+                {
+                    int cUses[4], ncUses = HC_getRegUses(cUses, &lst[k]);
+                    for (u = 0; u < ncUses; ++u)
+                        if (cUses[u] == mdef)
+                        {
+                            consumer = k;
+                            ++nCons;
+                        }
+                    if (HC_getDef(&lst[k]) == mdef)
+                        break;
+                }
+                if (nCons == 1 && consumer > pos)
+                {
+                    unsigned int pin = 0;
+                    for (u = 0; u < nmUses; ++u)
+                        if (mUses[u] >= 1 && mUses[u] < nHardRegs)
+                            pin |= 1u << mUses[u];
+                    for (k = pos; k < consumer; ++k)
+                        liveAfter[k] |= pin;
+                }
+            }
+        }
+
+        for (pos = start; pos < end; ++pos)
+        {
+            int op = HC_getOpcodeOper(&lst[pos]);
+            int r = HC_getDef(&lst[pos]);
+            int usePos = -1, holdEnd, k, step, cand = -1;
+            unsigned int busy = 0;
+
+            if (!HC_isLoadOp(op) || r < 1 || r >= nHardRegs || schedIsBarrier(op))
+                continue;
+            /* Skip if base register of the load is r itself and kept live. */
+            for (k = pos + 1; k <= end && k - pos < SCHED_MAX; ++k)
+            {
+                int kop = HC_getOpcodeOper(&lst[k]);
+                int kdef = HC_getDef(&lst[k]);
+                int nUses = HC_getRegUses(uses, &lst[k]);
+                int u, usedHere = 0;
+
+                if (schedIsBarrier(kop))
+                    break;
+                for (u = 0; u < nUses; ++u)
+                    if (uses[u] == r)
+                        usedHere = 1;
+                if (usedHere)
+                {
+                    if (usePos >= 0) { usePos = -1; break; }
+                    usePos = k;
+                }
+                if (kdef == r && k != usePos)
+                    break;
+                if (usePos == k && ((liveAfter[k] >> r) & 1u) == 0)
+                    break;
+            }
+            if (usePos < 0 || ((liveAfter[usePos] >> r) & 1u) != 0)
+                continue;
+
+            /* Preserve backend instruction fusion windows (MUL+ADD -> MLA,
+             * shift+ALU barrel-shifter, MAXS+MIN -> USAT) so nothing can be
+             * scheduled in between that overwrites the renamed source reg. */
+            holdEnd = usePos;
+            {
+                int uop = HC_getOpcodeOper(&lst[usePos]);
+                int udef = HC_getDef(&lst[usePos]);
+                if (udef >= 1 && udef < nHardRegs &&
+                    (uop == HCOP_MULS || uop == HCOP_MULU || schedIsShift(uop) ||
+                     (uop == HCOP_MAXS && HC_opcodeHasImm(&lst[usePos]) && lst[usePos].instr1 == 0)))
+                {
+                    for (k = usePos + 1; k <= end && k - pos < SCHED_MAX; ++k)
+                    {
+                        int kop = HC_getOpcodeOper(&lst[k]);
+                        int nUses = HC_getRegUses(uses, &lst[k]);
+                        int u;
+                        if (schedIsBarrier(kop))
+                            break;
+                        for (u = 0; u < nUses; ++u)
+                            if (uses[u] == udef)
+                                holdEnd = k;
+                        if (HC_getDef(&lst[k]) == udef)
+                            break;
+                    }
+                }
+            }
+
+            for (k = pos; k < holdEnd; ++k)
+                busy |= liveAfter[k] & ~(1u << r);
+            for (k = pos + 1; k <= holdEnd; ++k)
+            {
+                int kdef = HC_getDef(&lst[k]);
+                int nUses = HC_getRegUses(uses, &lst[k]);
+                int u;
+                if (k < holdEnd && kdef >= 1 && kdef < nHardRegs && kdef != r)
+                    busy |= 1u << kdef;
+                for (u = 0; u < nUses; ++u)
+                    if (uses[u] >= 1 && uses[u] < nHardRegs && uses[u] != r)
+                        busy |= 1u << uses[u];
+            }
+
+            for (step = 0; step < nHardRegs - 1; ++step)
+            {
+                int c = 1 + ((cursor - 1 + step) % (nHardRegs - 1));
+                if (((usedRegs >> c) & 1u) != 0 && ((busy >> c) & 1u) == 0)
+                {
+                    cand = c;
+                    break;
+                }
+            }
+            if (cand < 1)
+                continue;
+            cursor = 1 + (cand % (nHardRegs - 1));
+            if (cand == r)
+                continue;
+
+            HC_setOpcodeDst(&lst[pos], cand);
+            {
+                int nUses = HC_getRegUses(uses, &lst[usePos]);
+                int u;
+                for (u = 0; u < nUses; ++u)
+                    if (uses[u] == r)
+                        HC_setUse(&lst[usePos], u, cand);
+            }
+            for (k = pos; k < usePos; ++k)
+                liveAfter[k] = (liveAfter[k] & ~(1u << r)) | (1u << cand);
+            for (k = usePos; k < holdEnd; ++k)
+                liveAfter[k] |= 1u << cand;
+        }
+    }
+
+    HCArena_release(mgr, &mark);
+}
+
+static void armListScheduler(HCArena_s *mgr, HCInstr_s *lst)
+{
+    int pos = 0;
+    for (;;)
+    {
+        int op = HC_getOpcodeOper(&lst[pos]);
+        int lo, n;
+        if (op == HCOP_EOP)
+            return;
+        if (schedIsBarrier(op))
+        {
+            ++pos;
+            continue;
+        }
+        lo = pos;
+        n = 0;
+        while (n < SCHED_MAX && !schedIsBarrier(HC_getOpcodeOper(&lst[lo + n])))
+            ++n;
+        if (n > 1)
+        {
+            int nextOp = HC_getOpcodeOper(&lst[lo + n]);
+            schedSegment(mgr, lst, lo, n, HC_isCondBranchOp(nextOp) != 0 || nextOp == HCOP_BRA);
+        }
+        pos = lo + n;
+    }
+}
+
+#endif
+
 static void sort32(unsigned int *a, int N)
 {
     int i;
@@ -4194,6 +5104,389 @@ static HCInstr_s *panicRegisterAllocation(HCArena_s *mgr, HCBackend_s *backend,
 
 /* --- compilation driver & public entrypoints ------------------------------ */
 
+#if GERBERA_ARMV6_JIT
+/* Parameter values remain reusable until a definition, overlapping store,
+ * or control-flow boundary invalidates them. Other pointers may alias r0. */
+static void cseInvariantR0Loads(HCInstr_s *lst)
+{
+    enum { CAPACITY = 32 };
+    unsigned int offsets[CAPACITY];
+    int registers[CAPACITY], count = 0, i;
+    for (i = 0; HC_getOpcodeOper(&lst[i]) != HCOP_EOP; ++i)
+    {
+        HCInstr_s *instr = &lst[i];
+        int op = HC_getOpcodeOper(instr), def = HC_getDef(instr), j;
+        if (op == HCOP_LABEL || HC_isBranchOp(op) || def == 0)
+        {
+            count = 0;
+            continue;
+        }
+        if (HC_isStoreOp(op))
+        {
+            if (!HC_isSpillStore(instr))
+                count = 0;
+            else
+                for (j = 0; j < count; )
+                {
+                    unsigned int offset = instr->instr1;
+                    if (offset - offsets[j] < 4u || offsets[j] - offset < 4u)
+                    {
+                        offsets[j] = offsets[--count];
+                        registers[j] = registers[count];
+                    }
+                    else ++j;
+                }
+            continue;
+        }
+        for (j = 0; j < count; )
+        {
+            if (registers[j] == def)
+            {
+                offsets[j] = offsets[--count];
+                registers[j] = registers[count];
+            }
+            else ++j;
+        }
+        if (HC_isSpillLoad(instr))
+        {
+            for (j = 0; j < count; ++j)
+                if (offsets[j] == instr->instr1) break;
+            if (j < count)
+                *instr = HC_genOp2(HCOP_MOV, def, registers[j]);
+            else if (count < CAPACITY)
+            {
+                offsets[count] = instr->instr1;
+                registers[count++] = def;
+            }
+        }
+    }
+}
+
+/* Reuse pure expressions within a straight-line region. Limit the search
+ * window so compile time stays bounded for long generated programs. */
+static void reuseALUValues(HCInstr_s *lst)
+{
+    int first = 0, j;
+    for (j = 0; HC_getOpcodeOper(&lst[j]) != HCOP_EOP; ++j)
+    {
+        int op = HC_getOpcodeOper(&lst[j]), i;
+        int dst = HC_getDef(&lst[j]);
+        unsigned int key = lst[j].instr0 & ~(0x7FFu << 10);
+        if (op == HCOP_LABEL || HC_isBranchOp(op)) first = j + 1;
+        if (op > HCOP_XOR || op == HCOP_NOP || op == HCOP_MOV || op == HCOP_MOVN || dst < 0)
+            continue;
+        for (i = j - 1; i >= first && i >= j - 64; --i)
+        {
+            int uses[4], count, previous, k;
+            if ((lst[i].instr0 & ~(0x7FFu << 10)) != key || lst[i].instr1 != lst[j].instr1)
+                continue;
+            previous = HC_getDef(&lst[i]);
+            count = HC_getUses(&lst[i], uses);
+            if (previous < 0 || previous == dst || HC_containsInt(uses, count, previous)) continue;
+            for (k = i + 1; k < j; ++k)
+            {
+                int def = HC_getDef(&lst[k]);
+                if (def >= 0 && (def == previous || HC_containsInt(uses, count, def))) break;
+            }
+            if (k == j)
+            {
+                lst[j] = HC_genOp2(HCOP_MOV, dst, previous);
+                break;
+            }
+        }
+    }
+}
+
+/* The pixel-pipe bytecode uses labels 2/3/4 for the row head, the empty-row
+ * path, and the pixel loop. A gradient ordinarily starts at ref + dx*left
+ * and advances by dx even when depth rejects a pixel. For a single-use
+ * gradient, anchor it at the right edge instead and recover its value at
+ * that use: (ref + dx*(left+count)) + dx*(i-count). All arithmetic is HC
+ * low-word arithmetic, so this also preserves negative steps and wrap.
+ * This trades a loop-carried, often spilled value for a multiply-add only
+ * on the path needing it. The pixel-pipe selector limits
+ * this transform to smooth nearest MODULATE with 16-bit color and depth. */
+typedef struct SpanGradient_s
+{
+    int init, use, update;
+    int adder, value;
+} SpanGradient_s;
+
+static int spanRegOp(HCInstr_s *ins, int op, int s0, int s1)
+{
+    return HC_getOpcodeOper(ins) == op && !HC_opcodeHasImm(ins) &&
+           HC_getOpcodeSrc0Raw(ins) == s0 && HC_getOpcodeSrc1Raw(ins) == s1;
+}
+
+static int spanImmOp(HCInstr_s *ins, int op, int s0, unsigned int imm)
+{
+    return HC_getOpcodeOper(ins) == op && HC_opcodeHasImm(ins) &&
+           HC_getOpcodeSrc0Raw(ins) == s0 && ins->instr1 == imm;
+}
+
+/* Skip a contiguous run of depth failures without advancing texture and
+ * dither state per pixel. The passing path retains its ordinary shader loop. */
+static int skipDepthRejects(HCArena_s *mgr, HCInstr_s *lst, RegInstrCount_s shape,
+                            int pixel, int back, int join, int index,
+                            SpanGradient_s *plan, int nPlan, int nHardRegs)
+{
+    int color = pixel + 4, z, storedZ, cmp, i, g, label = 0, dither = -1, depthStore;
+    int reject, advance, shade, done, savedIndex, zStep, delta, temp, next = shape.numRegs;
+    int n = 0, topMark;
+    HCInstr_s *out;
+
+    if (nPlan != 3 || join < color || plan[0].use != pixel + 1 ||
+        !spanImmOp(&lst[pixel + 1], HCOP_LSR, plan[0].value, 14)) return 0;
+    z = HC_getDef(&lst[pixel + 1]);
+    storedZ = HC_getDef(&lst[pixel + 2]);
+    cmp = HC_getOpcodeOper(&lst[pixel + 3]);
+    if (HC_getOpcodeOper(&lst[pixel + 2]) != HCOP_LW2U ||
+        HC_getOpcodeSrc1Raw(&lst[pixel + 2]) != index ||
+        (cmp != HCOP_CBGTU && cmp != HCOP_CBGEU) ||
+        !spanRegOp(&lst[pixel + 3], cmp, z, storedZ) ||
+        (unsigned int)HC_getOpcodeDst(&lst[pixel + 3]) != lst[join].instr1) return 0;
+    depthStore = spanRegOp(&lst[color], HCOP_SW2, HC_getOpcodeSrc0Raw(&lst[pixel + 2]), index) &&
+                 HC_getOpcodeDst(&lst[color]) == z;
+    for (i = join + 1; i < back - 1; ++i)
+    {
+        HCInstr_s *ins = &lst[i];
+        if (HC_getOpcodeOper(ins) == HCOP_ROR && HC_opcodeHasImm(ins) && ins->instr1 == 8u &&
+            HC_getOpcodeDst(ins) == HC_getOpcodeSrc0Raw(ins))
+        {
+            if (dither >= 0) return 0;
+            dither = HC_getOpcodeDst(ins);
+        }
+    }
+    if (back - join != nPlan + 2 + (dither >= 0)) return 0;
+    for (i = 0; i < shape.numInstrs; ++i)
+        if (HC_getOpcodeOper(&lst[i]) == HCOP_LABEL)
+            label = HC_max(label, (int)lst[i].instr1);
+    if (label + 4 >= (int)HC_MAX_LABEL_INDEX || next + 4 + nHardRegs >= HC_MAX_REG_INDEX) return 0;
+    reject = ++label; advance = ++label; shade = ++label; done = ++label;
+    savedIndex = next++; zStep = next++; delta = next++; temp = next++;
+    topMark = HCArena_markTop(mgr);
+    out = (HCInstr_s *)HCArena_allocTop(mgr, sizeof(*out) * (shape.numInstrs + 32));
+    for (i = 0; i < shape.numInstrs - 1; ++i)
+    {
+        HCInstr_s ins = lst[i];
+        if (i == color + depthStore) out[n++] = HC_genOp1Imm(HCOP_LABEL, shade);
+        if (i == pixel + 3) HC_setOpcodeDst(&ins, reject);
+        out[n++] = ins;
+    }
+    out[n++] = HC_genOp1(HCOP_BRA, done);
+    out[n++] = HC_genOp1Imm(HCOP_LABEL, reject);
+    out[n++] = HC_genOp2(HCOP_MOV, savedIndex, index);
+    out[n++] = genSpillLoad(zStep, 232);
+    out[n++] = HC_genOp1Imm(HCOP_LABEL, advance);
+    out[n++] = HC_genOp3Imm(HCOP_ADD, index, index, 1);
+    out[n++] = HC_genOp3Imm(HCOP_CBEQ, 3, index, 0);
+    out[n++] = HC_genOp3(HCOP_ADD, plan[0].value, plan[0].value, zStep);
+    out[n++] = lst[pixel + 1];
+    out[n++] = lst[pixel + 2];
+    out[n] = lst[pixel + 3];
+    HC_setOpcodeDst(&out[n++], advance);
+    if (depthStore) out[n++] = lst[color];
+    out[n++] = HC_genOp3(HCOP_SUB, delta, index, savedIndex);
+    for (g = 1; g < nPlan; ++g)
+    {
+        out[n++] = HC_genOp3(HCOP_MULS, temp, plan[g].adder, delta);
+        out[n++] = HC_genOp3(HCOP_ADD, plan[g].value, plan[g].value, temp);
+    }
+    if (dither >= 0)
+    {
+        out[n++] = HC_genOp3Imm(HCOP_LSL, temp, delta, 3);
+        out[n++] = HC_genOp3(HCOP_ROR, dither, dither, temp);
+    }
+    out[n++] = HC_genOp1(HCOP_BRA, shade);
+    out[n++] = HC_genOp1Imm(HCOP_LABEL, done);
+    out[n++] = lst[shape.numInstrs - 1];
+    HCArena_growCurrent(mgr, sizeof(*out) * (n - shape.numInstrs));
+    memcpy(lst, out, sizeof(*out) * n);
+    HCArena_releaseTop(mgr, topMark);
+    return 1;
+}
+
+static void rematerializeSpanGradients(HCArena_s *mgr, HCInstr_s *lst, int nHardRegs, int split)
+{
+    enum { ROW = 2, EXIT = 3, PIXEL = 4, FIRST_X_ADDER = 232, MAX_GRADIENTS = 8 };
+    RegInstrCount_s shape = scanNumRegs(lst);
+    SpanGradient_s plan[MAX_GRADIENTS];
+    int row = -1, pixel = -1, back = -1, rightOp = -1, latestTarget = -1;
+    int left, count, right, index, span, i, j, g, nPlan = 0;
+    int next = shape.numRegs, n = 0, topMark;
+    HCInstr_s *out;
+
+    if (next + 2 * MAX_GRADIENTS + 8 + nHardRegs >= HC_MAX_REG_INDEX)
+        return;
+    for (i = 0; i < shape.numInstrs; ++i)
+    {
+        HCInstr_s *ins = &lst[i];
+        if (HC_getOpcodeOper(ins) == HCOP_LABEL)
+        {
+            if (ins->instr1 == ROW) row = i;
+            if (ins->instr1 == PIXEL) pixel = i;
+        }
+        if (HC_isBranchOp(HC_getOpcodeOper(ins)) && HC_getOpcodeDst(ins) == PIXEL)
+        {
+            if (back >= 0) return;
+            back = i;
+        }
+    }
+    if (row < 0 || pixel <= row + 7 || back <= pixel + 2 || back + 1 >= shape.numInstrs ||
+        HC_getOpcodeOper(&lst[row + 1]) != HCOP_LD ||
+        HC_getOpcodeOper(&lst[back + 1]) != HCOP_LABEL || lst[back + 1].instr1 != EXIT)
+        return;
+
+    span = HC_getOpcodeDst(&lst[row + 1]);
+    if (!spanImmOp(&lst[row + 3], HCOP_LSR, span, 16) ||
+        !spanImmOp(&lst[row + 4], HCOP_AND, span, 65535))
+        return;
+    count = HC_getOpcodeDst(&lst[row + 3]);
+    left = HC_getOpcodeDst(&lst[row + 4]);
+    if (!spanImmOp(&lst[pixel - 2], HCOP_SUBR, count, 0))
+        return;
+    index = HC_getOpcodeDst(&lst[pixel - 2]);
+    if (!spanImmOp(&lst[pixel - 1], HCOP_CBGES, index, 0) || HC_getOpcodeDst(&lst[pixel - 1]) != EXIT ||
+        !spanImmOp(&lst[back - 1], HCOP_ADD, index, 1) || HC_getDef(&lst[back - 1]) != index ||
+        !spanImmOp(&lst[back], HCOP_CBNEQ, index, 0))
+        return;
+
+    for (i = row + 1; i < back; ++i)
+    {
+        HCInstr_s *ins = &lst[i];
+        int op = HC_getOpcodeOper(ins), def = HC_getDef(ins);
+        if ((def == index && i != pixel - 2 && i != back - 1) ||
+            (def == span && i > row + 1 && i <= row + 4) ||
+            (def == count && i != row + 3 && i < pixel) ||
+            (def == left && i != row + 4 && i < pixel))
+            return;
+        if (i < pixel - 2 && spanRegOp(ins, HCOP_ADD, left, count))
+            rightOp = i;
+        if (i < pixel - 1 && (op == HCOP_LABEL || HC_isBranchOp(op)))
+            return;  /* no entry or exit between the row head and its setup */
+        if (i > pixel && HC_isBranchOp(op))
+        {
+            /* Only forward skips in the body, and none may bypass the
+             * induction-variable updates (checked below for each gradient). */
+            unsigned int target = (unsigned int)HC_getOpcodeDst(ins);
+            for (j = i + 1; j < back - 1; ++j)
+                if (HC_getOpcodeOper(&lst[j]) == HCOP_LABEL && lst[j].instr1 == target)
+                    break;
+            if (j == back - 1) return;
+            latestTarget = HC_max(latestTarget, j);
+        }
+    }
+    if (rightOp <= row + 4) return;
+    right = HC_getDef(&lst[rightOp]);
+    for (i = 0; i < rightOp; ++i)
+    {
+        int uses[4], nUses = HC_getUses(&lst[i], uses);
+        if (HC_getDef(&lst[i]) == right || HC_containsInt(uses, nUses, right)) return;
+    }
+    /* The generated program has no outside entry into the pixel body. */
+    for (i = pixel + 1; i < back; ++i)
+        if (HC_getOpcodeOper(&lst[i]) == HCOP_LABEL)
+            for (j = 0; j < shape.numInstrs; ++j)
+                if ((j < pixel || j > back) && HC_isBranchOp(HC_getOpcodeOper(&lst[j])) &&
+                    (unsigned int)HC_getOpcodeDst(&lst[j]) == lst[i].instr1)
+                    return;
+
+    for (g = split ? 0 : 2; g < (split ? MAX_GRADIENTS : 5); ++g)
+    {
+        int load, mul, value, adder, product, use = -1, update = -1;
+        for (load = 0; load < row; ++load)
+            if (HC_isSpillLoad(&lst[load]) && lst[load].instr1 == FIRST_X_ADDER + 4u * g)
+                break;
+        if (load == row) continue;
+        adder = HC_getDef(&lst[load]);
+        for (mul = row + 5; mul < (split ? pixel - 2 : rightOp); ++mul)
+            if (spanRegOp(&lst[mul], HCOP_MULS, adder, left)) break;
+        if (mul == (split ? pixel - 2 : rightOp)) continue;
+        product = HC_getDef(&lst[mul]);
+        value = HC_getDef(&lst[mul + 1]);
+        if (!spanRegOp(&lst[mul + 1], HCOP_ADD, HC_getOpcodeSrc0Raw(&lst[mul + 1]), product) ||
+            HC_getOpcodeSrc0Raw(&lst[mul + 1]) == product || HC_getOpcodeSrc0Raw(&lst[mul + 1]) == value ||
+            value <= 0 || adder <= 0 || product <= 0)
+            continue;
+
+        for (i = 0; i < shape.numInstrs; ++i)
+        {
+            int uses[4], nUses = HC_getUses(&lst[i], uses), def = HC_getDef(&lst[i]);
+            if ((def == adder && i != load) || (def == product && i != mul) ||
+                (HC_containsInt(uses, nUses, product) && i != mul + 1)) break;
+            if (i == mul + 1) continue;
+            if (def == value)
+            {
+                if (update >= 0 || i <= pixel || i <= latestTarget || i >= back - 1 ||
+                    !spanRegOp(&lst[i], HCOP_ADD, value, adder)) break;
+                update = i;
+            }
+            else if (HC_containsInt(uses, nUses, value))
+            {
+                if (use >= 0 || i <= pixel || i >= back) break;
+                use = i;
+            }
+        }
+        if (i == shape.numInstrs && use >= 0 && update > use)
+        {
+            SpanGradient_s entry = {mul, use, update, adder, value};
+            plan[nPlan++] = entry;
+        }
+    }
+    if (split)
+    {
+        skipDepthRejects(mgr, lst, shape, pixel, back, latestTarget, index, plan, nPlan, nHardRegs);
+        return;
+    }
+    if (nPlan == 0) return;
+
+    topMark = HCArena_markTop(mgr);
+    out = (HCInstr_s *)HCArena_allocTop(mgr, sizeof(*out) * (shape.numInstrs + nPlan));
+    for (i = 0; i < shape.numInstrs; ++i)
+    {
+        HCInstr_s ins = lst[i];
+        int skip = 0;
+        if (i == row + 5) out[n++] = lst[rightOp];
+        if (i == rightOp) continue;
+        for (g = 0; g < nPlan; ++g)
+        {
+            const SpanGradient_s *p = &plan[g];
+            if (i == p->init) HC_setOpcodeSrc1(&ins, right);
+            if (i == p->update) skip = 1;
+            if (i == p->use)
+            {
+                int uses[4], u, nUses = HC_getRegUses(uses, &ins), tmp = next++;
+                out[n++] = HC_genOp3(HCOP_MULS, tmp, p->adder, index);
+                out[n++] = HC_genOp3(HCOP_ADD, tmp, p->value, tmp);
+                for (u = 0; u < nUses; ++u)
+                    if (uses[u] == p->value) HC_setUse(&ins, u, tmp);
+            }
+        }
+        if (!skip) out[n++] = ins;
+    }
+    HCArena_growCurrent(mgr, sizeof(*out) * nPlan);
+    memcpy(lst, out, sizeof(*out) * n);
+    HCArena_releaseTop(mgr, topMark);
+}
+
+#endif
+
+int HC_setConstantParameter(HCInstr_s *instructions, int byteOffset, int value)
+{
+    HCInstr_s *ins;
+    int replaced = 0;
+    for (ins = instructions; HC_getOpcodeOper(ins) != HCOP_EOP; ++ins)
+        if (HC_isSpillStore(ins) && HC_getOpcodeImm(ins) == byteOffset)
+            return 0;
+    for (ins = instructions; HC_getOpcodeOper(ins) != HCOP_EOP; ++ins)
+        if (HC_isSpillLoad(ins) && HC_getOpcodeImm(ins) == byteOffset)
+        {
+            *ins = HC_genOp2Imm(HCOP_MOV, HC_getOpcodeDst(ins), value);
+            ++replaced;
+        }
+    return replaced;
+}
+
 static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
                            HCInstr_s *instructions, HCBackend_s *backend,
                            unsigned int optimizationMask,
@@ -4207,6 +5500,10 @@ static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
     int botMark;
     int prevInstrs;
     int curInstrs;
+    int backendOptions = backend != NULL && backend->optimizationMask != NULL
+        ? backend->optimizationMask() : 0;
+    int scheduleARM11 = (backendOptions & HC_BACKEND_ARM11_SCHEDULE) &&
+                       (optimizationMask & HC_OPT_SCHEDULE);
 
     if (backend != NULL && backend->internalStackSpaceAfterInvars != NULL)
         spillStart += backend->internalStackSpaceAfterInvars();
@@ -4223,6 +5520,10 @@ static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
             constantPropagation(mgr, lst);
         if ((optimizationMask & HC_OPT_DEAD_CODE) != 0)
             deadCodeElimination(mgr, lst);
+#if GERBERA_ARMV6_JIT
+        if (backend == HCARMBackend_create() && (optimizationMask & HC_OPT_LOCAL_COPY_PROP))
+            reuseALUValues(lst);
+#endif
         if ((optimizationMask & HC_OPT_LOCAL_COPY_PROP) != 0)
             localCopyPropagation(mgr, lst);
         if ((optimizationMask & HC_OPT_BRANCHES) != 0)
@@ -4231,7 +5532,14 @@ static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
             removeRedundantBranches(mgr, lst);
         }
         if ((optimizationMask & HC_OPT_PEEPHOLE) != 0)
+        {
             peephole(lst);
+#if GERBERA_ARMV6_JIT
+            if (backend == HCARMBackend_create())
+                cseInvariantR0Loads(lst);
+#endif
+            peepholeRepackStore(mgr, lst, 0);
+        }
         if ((optimizationMask & HC_OPT_SHIFTS) != 0)
         {
             liveRangeAnalysis(mgr, lst, 1);
@@ -4270,6 +5578,18 @@ static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
         void *codePtr = NULL;
         int nBytes;
 
+#if GERBERA_ARMV6_JIT
+        if (backend == HCARMBackend_create() &&
+            (optimizationMask & (HC_OPT_PEEPHOLE | HC_OPT_DEAD_CODE)) == (HC_OPT_PEEPHOLE | HC_OPT_DEAD_CODE) &&
+            peepholeRepackStore(mgr, lst, 1))
+            deadCodeElimination(mgr, lst);
+        if ((optimizationMask & HC_OPT_SPAN_GRADIENTS) != 0 && backend == HCARMBackend_create())
+        {
+            rematerializeSpanGradients(mgr, lst, nHardRegs, 0);
+            if ((optimizationMask & HC_OPT_DEPTH_REJECT_RUNS) != 0)
+                rematerializeSpanGradients(mgr, lst, nHardRegs, 1);
+        }
+#endif
         offsetRegs(lst, nHardRegs);
         topMark = swapToHiMem(mgr, &lst, lst);
         HCArena_releaseBottom(mgr, botMark);
@@ -4289,9 +5609,9 @@ static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
         if ((optimizationMask & HC_OPT_REGALLOC) != 0)
         {
             int doSpillOpts = 1;
-            lst = registerAllocation(mgr, lst, spillStart, nHardRegs);
+            lst = registerAllocation(mgr, lst, spillStart, nHardRegs, scheduleARM11);
             if (backend->optimizationMask != NULL)
-                doSpillOpts = (backend->optimizationMask() & 1) == 0;
+                doSpillOpts = (backendOptions & HC_BACKEND_NO_SPILL_OPT) == 0;
             if (doSpillOpts != 0)
             {
                 coalesceSpillLocations(mgr, spillStart, lst);
@@ -4314,7 +5634,16 @@ static int compileInternal(HCArena_s *mgr, void **output, HCInstr_s *emuDst,
         if (emuDst != NULL)
             copyInstrs(emuDst, lst);
 
-        loadScheduler(mgr, lst);
+#if GERBERA_ARMV6_JIT
+        if (scheduleARM11)
+        {
+            renameScratchLoads(mgr, lst, nHardRegs);
+            armListScheduler(mgr, lst);
+            removeRedundantSpills(mgr, lst);
+        }
+        else
+#endif
+            loadScheduler(mgr, lst);
         remapRegisters(backend, lst);
         beInfo = computeBackEndInfo(mgr, lst, nHardRegs);
         nBytes = backend->codegen(mgr, &codePtr, lst, &beInfo, spillStart);

@@ -4,68 +4,57 @@
 #
 # Uses klaxons1/gcc-symbian and SymbianRevive/elf2e32 on Linux.
 # Missing tools are downloaded or built under SYMBIAN_TOOLS_DIR.
+# The packaged compiler needs x86-64 Linux with glibc 2.38 or newer.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOLS_DIR="${SYMBIAN_TOOLS_DIR:-/tmp/symbian_tools}"
-GCC_DIR="${TOOLS_DIR}/gcc"
-ELF2E32="${TOOLS_DIR}/elf2e32_bin"
-BUILD_DIR="/tmp/gerbera_symbian_build"
-OUT_DIR="${REPO_ROOT}/symbian/out"
+TOOLS_DIR="${REPO_ROOT}/symbian_tools"
+GCC_DIR="${SYMBIAN_GCC_DIR:-${TOOLS_DIR}/gcc}"
+ELF2E32="${SYMBIAN_ELF2E32:-${TOOLS_DIR}/elf2e32_bin}"
+BUILD_DIR="${SYMBIAN_BUILD_DIR:-/tmp/gerbera_symbian_build}"
+OUT_DIR="${SYMBIAN_OUT_DIR:-${REPO_ROOT}/symbian/out}"
+ARM_ARCH="${SYMBIAN_ARM_ARCH:-armv6j}"
+case "${ARM_ARCH}" in
+    armv5t|armv5te) ARCHIVE_ARCH=ARMv5 ;;
+    armv6j) ARCHIVE_ARCH=ARMv6 ;;
+    *) echo "Unsupported SYMBIAN_ARM_ARCH: ${ARM_ARCH}" >&2; exit 2 ;;
+esac
 
 # Bootstrap missing compiler and image-conversion tools.
 if [[ ! -x "${GCC_DIR}/bin/arm-none-symbianelf-gcc" ]]; then
     echo "[symbian] Downloading arm-none-symbianelf-gcc 14.2.0..."
     mkdir -p "${TOOLS_DIR}"
-    python3 - "${TOOLS_DIR}" <<'PY'
-import json, os, subprocess, sys, tarfile, urllib.request
+    python - "${TOOLS_DIR}" "${GCC_DIR}" <<'PY'
+import hashlib
+from pathlib import Path
+import shutil
+import sys
+import tarfile
+import tempfile
+import urllib.request
 
-tools_dir = sys.argv[1]
-req = urllib.request.Request(
-    "https://api.github.com/repos/klaxons1/gcc-symbian/releases",
-    headers={"User-Agent": "gerbera-symbian-build"},
-)
-releases = json.loads(urllib.request.urlopen(req).read().decode())
-asset_url = None
-for rel in releases:
-    for a in rel.get("assets", []):
-        if "linux" in a["name"].lower() and a["name"].endswith((".tar.gz", ".tgz", ".tar.xz")):
-            asset_url = a["browser_download_url"]
-            asset_name = a["name"]
-            break
-    if asset_url:
-        break
-assert asset_url, "Could not find Linux gcc-symbian release asset"
-archive = os.path.join(tools_dir, asset_name)
-subprocess.check_call(["curl", "-L", "-o", archive, asset_url])
-extract_dir = os.path.join(tools_dir, "gcc_extract")
-os.makedirs(extract_dir, exist_ok=True)
-with tarfile.open(archive) as tf:
-    tf.extractall(extract_dir)
-entries = os.listdir(extract_dir)
-root = os.path.join(extract_dir, entries[0]) if len(entries) == 1 else extract_dir
-os.rename(root, os.path.join(tools_dir, "gcc"))
+tools_dir, gcc_dir = map(Path, sys.argv[1:])
+revision = "2a59df9e2824ed6721988240e506f52d7cf8591f"
+name = "cc3d-symbian-gcc-14.2.0-linux-x86_64.tar.xz"
+expected = "6bc3a4d3c7eec317c1dfe21b5cb71cefed8c27b55683a950ff4bede478c3c6c9"
+url = f"https://raw.githubusercontent.com/klaxons1/gcc-symbian/{revision}/bin/{name}"
+archive = tools_dir / name
+if gcc_dir.exists():
+    raise SystemExit(f"Compiler directory exists without arm-none-symbianelf-gcc: {gcc_dir}")
+if not archive.exists():
+    with tempfile.NamedTemporaryFile(dir=tools_dir) as output:
+        with urllib.request.urlopen(url) as response:
+            shutil.copyfileobj(response, output)
+        output.flush()
+        shutil.copyfile(output.name, archive)
+if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+    raise SystemExit(f"Compiler archive checksum mismatch: {archive}")
+with tempfile.TemporaryDirectory(prefix="gcc-extract-", dir=tools_dir) as temporary:
+    with tarfile.open(archive) as package:
+        package.extractall(temporary)
+    gcc_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(Path(temporary) / "gcc"), gcc_dir)
 
-# Redirect C23 conversion symbols to legacy entry points for older glibc hosts.
-for sub in ("bin", "arm-none-symbianelf/bin"):
-    d = os.path.join(tools_dir, "gcc", sub)
-    if not os.path.isdir(d):
-        continue
-    for fn in os.listdir(d):
-        p = os.path.join(d, fn)
-        if not os.path.isfile(p) or os.path.islink(p):
-            continue
-        data = open(p, "rb").read()
-        if b"__isoc23_" in data:
-            for old, new in [
-                (b"__isoc23_strtoul", b"strtoul\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
-                (b"__isoc23_strtol",  b"strtol\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
-                (b"__isoc23_sscanf",  b"sscanf\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
-                (b"GLIBC_2.38",      b"GLIBC_2.34"),
-            ]:
-                data = data.replace(old, new)
-            with open(p, "wb") as out:
-                out.write(data)
 PY
 fi
 
@@ -87,12 +76,12 @@ mkdir -p "${BUILD_DIR}/obj" "${BUILD_DIR}/implibs" "${OUT_DIR}"
 
 # Generate Symbian OS import libraries from the ordinal table.
 echo "[symbian] Generating Symbian EKA2 OS import libraries (.dso)..."
-python3 "${REPO_ROOT}/symbian/gen_implibs.py" "${ELF2E32}" "${BUILD_DIR}/implibs"
+python "${REPO_ROOT}/symbian/gen_implibs.py" "${ELF2E32}" "${BUILD_DIR}/implibs"
 
 # Compile the freestanding runtime and startup assembly.
 COMMON_FLAGS=(
     -std=c99
-    -march=armv5t
+    -march="${ARM_ARCH}"
     -mtune=arm1136jf-s
     -marm
     -mfloat-abi=soft
@@ -117,12 +106,12 @@ COMMON_FLAGS=(
     -I"${REPO_ROOT}/src/include"
 )
 
-echo "[symbian] Assembling EKA2 startup, TLS, setjmp & ARMv5 CLZ divmod..."
-"${CC}" -march=armv5t -marm -mfloat-abi=soft -O2 -fno-pic \
+echo "[symbian] Assembling EKA2 startup, TLS, setjmp & CLZ divmod..."
+"${CC}" -march="${ARM_ARCH}" -marm -mfloat-abi=soft -O2 -fno-pic \
     -c "${REPO_ROOT}/symbian/symbian_entry.S" -o "${BUILD_DIR}/obj/symbian_entry.o"
-"${CC}" -march=armv5t -marm -mfloat-abi=soft -O2 -fno-pic \
+"${CC}" -march="${ARM_ARCH}" -marm -mfloat-abi=soft -O2 -fno-pic \
     -c "${REPO_ROOT}/symbian/arm_divmod.S" -o "${BUILD_DIR}/obj/arm_divmod.o"
-"${CC}" "${COMMON_FLAGS[@]}" -O2 \
+"${CC}" "${COMMON_FLAGS[@]}" -O2 -ffreestanding -fno-tree-loop-distribute-patterns \
     -c "${REPO_ROOT}/symbian/symbian_rt.c" -o "${BUILD_DIR}/obj/symbian_rt.o"
 
 # Combine the renderer sources for whole-program optimization.
@@ -134,12 +123,12 @@ UNITY_C="${BUILD_DIR}/gerbera_symbian_unity.c"
         if [[ "$(basename "${src}")" == "hcX86Backend.c" ]]; then
             continue
         fi
-        rel="${src#${REPO_ROOT}/}"
+        rel="${src#"${REPO_ROOT}"/}"
         echo "#include \"${rel}\""
     done < <(find "${REPO_ROOT}/src" -name '*.c' | sort)
 } > "${UNITY_C}"
 
-echo "[symbian] Compiling Gerbera Whole-Program Unity TU (-march=armv5t -mtune=arm1136jf-s -O2 -finline-functions -fgcse-after-reload -fpredictive-commoning -funswitch-loops -fwhole-program)..."
+echo "[symbian] Compiling Gerbera unity for ${ARM_ARCH}, tuned for ARM1136JF-S..."
 "${CC}" "${COMMON_FLAGS[@]}" -O2 -finline-functions -fgcse-after-reload -fpredictive-commoning -funswitch-loops -fwhole-program \
     -c "${UNITY_C}" -o "${BUILD_DIR}/obj/gerbera_unity.o"
 
@@ -156,7 +145,7 @@ DSOS=(
 )
 
 "${CC}" \
-    -march=armv5t -mtune=arm1136jf-s -marm -mfloat-abi=soft \
+    -march="${ARM_ARCH}" -mtune=arm1136jf-s -marm -mfloat-abi=soft \
     -O2 -fno-pic \
     -nostdlib -shared \
     -Wl,-T,"${REPO_ROOT}/symbian/symbian_dll.ld" \
@@ -184,7 +173,7 @@ echo "[symbian] Running elf2e32 -> libgles_cm.dll & libgles_cm.dso..."
     --output="${OUT_DIR}/libgles_cm.dll" \
     --dso="${OUT_DIR}/libgles_cm{000a0000}.dso" \
     --defoutput="${OUT_DIR}/libgles_cm.def" \
-    --libpath="${BUILD_DIR}/implibs" \
+    --libpath="${BUILD_DIR}" \
     --linkas="libgles_cm{000a0000}.dll" \
     --uid1=0x10000079 \
     --uid2=0x1000008d \
@@ -198,10 +187,10 @@ echo "[symbian] Running elf2e32 -> libgles_cm.dll & libgles_cm.dso..."
 
 cp -f "${OUT_DIR}/libgles_cm{000a0000}.dso" "${OUT_DIR}/libgles_cm.dso"
 
-python3 - "${OUT_DIR}" "${REPO_ROOT}" <<'PY'
+python - "${OUT_DIR}" "${REPO_ROOT}" "${ARCHIVE_ARCH}" <<'PY'
 import os, sys, zipfile
-out_dir, repo_root = sys.argv[1], sys.argv[2]
-zip_path = os.path.join(out_dir, "Gerbera-GLES1-Symbian-EKA2-ARMv5.zip")
+out_dir, repo_root, arch = sys.argv[1:]
+zip_path = os.path.join(out_dir, f"Gerbera-GLES1-Symbian-EKA2-{arch}.zip")
 with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
     zf.write(os.path.join(out_dir, "libgles_cm.dll"), "sys/bin/libgles_cm.dll")
     zf.write(os.path.join(out_dir, "libgles_cm.dso"), "epoc32/release/armv5/lib/libgles_cm.dso")
@@ -212,4 +201,4 @@ with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
 PY
 
 echo "[symbian] Build complete:"
-ls -lh "${OUT_DIR}/libgles_cm.dll" "${OUT_DIR}/libgles_cm.dso" "${OUT_DIR}/Gerbera-GLES1-Symbian-EKA2-ARMv5.zip"
+ls -lh "${OUT_DIR}/libgles_cm.dll" "${OUT_DIR}/libgles_cm.dso" "${OUT_DIR}/Gerbera-GLES1-Symbian-EKA2-${ARCHIVE_ARCH}.zip"

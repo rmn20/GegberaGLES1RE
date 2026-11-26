@@ -12,6 +12,20 @@
 extern "C" {
 #endif
 
+#ifndef GERBERA_ARMV6_JIT
+#if defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+#define GERBERA_ARMV6_JIT 1
+#else
+#define GERBERA_ARMV6_JIT 0
+#endif
+#endif
+
+enum
+{
+    HC_BACKEND_NO_SPILL_OPT = 1,
+    HC_BACKEND_ARM11_SCHEDULE = 2
+};
+
 typedef struct HCBackend_s
 {
     int (*canCreateImmediate)(HCInstr_s *instr);                    /* +0  */

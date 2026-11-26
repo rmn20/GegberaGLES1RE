@@ -13,7 +13,7 @@ index 207c732..94f19f0 100644
 -	#define GLAPI WINGDIAPI
 -#elif defined CC_BUILD_SYMBIAN && !defined __WINSCW__
 +#if defined CC_BUILD_WIN && !defined CC_BUILD_GLES
-+	/* Avoid pointless includes */
++	/* Limit Windows headers to the APIs used by the GL backend. */
 +	#define WIN32_LEAN_AND_MEAN
 +	#define NOSERVICE
 +	#define NOMCX
@@ -368,7 +368,7 @@ index 242b585..2d84719 100644
 -#else
 +#if defined CC_BUILD_SYMBIAN || defined CC_BUILD_GLES
 +	_glReadPixels(0, 0, bmp.width, bmp.height, GL_RGBA, TRANSFER_FORMAT, bmp.scan0);
-+	/* ??? */
++	/* Convert RGBA readback to the screenshot bitmap channel order. */
 +	if (convert_rgba) {
 +		BitmapCol* tmp = (BitmapCol*)Mem_TryAlloc(bmp.width * bmp.height, BITMAPCOLOR_SIZE);
 +		if (!tmp) return ERR_OUT_OF_MEMORY;

@@ -90,7 +90,10 @@ int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
         else
         {
             slot = (int)(hash & 0x3F);
-            if (hgGetBit64(cache->batchLockMask, slot) != 0)
+            unsigned int locked = slot < 32
+                ? (unsigned int)hgGet64l(cache->batchLockMask)
+                : (unsigned int)hgGet64h(cache->batchLockMask);
+            if ((locked & (1u << (slot & 31))) != 0)
             {
                 HGint64 notMask = hgNot64(cache->batchLockMask);
 
@@ -111,8 +114,12 @@ int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
             {
                 vertexBuffer[slot].weightIndices =
                     grFetchWeightAndIndex(state, vertexBuffer[slot].weights, vtxIndex);
+                grTransformVertexPreloaded(state, &vertexBuffer[slot], 1);
             }
-            grTransformVertex(state, &vertexBuffer[slot]);
+            else
+            {
+                grTransformVertexPreloaded(state, &vertexBuffer[slot], 0);
+            }
         }
     }
     cache->cacheIndices[hash & 0x1F] = entry;
@@ -122,10 +129,21 @@ int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
                  "grApiFast.inl", 830) != 0)
         grDie(0);
     {
-        HGint64 mask = cache->batchLockMask;
+        unsigned int low = (unsigned int)hgGet64l(cache->batchLockMask);
+        unsigned int high = (unsigned int)hgGet64h(cache->batchLockMask);
+        unsigned int bit = 1u << (slot & 31);
 
-        cache->totalFreeSlots -= (int)(hgGetBit64(mask, slot) ^ 1);
-        cache->batchLockMask = hgSetBit64(mask, slot);
+        if (slot < 32)
+        {
+            cache->totalFreeSlots -= (low & bit) == 0;
+            low |= bit;
+        }
+        else
+        {
+            cache->totalFreeSlots -= (high & bit) == 0;
+            high |= bit;
+        }
+        cache->batchLockMask = hgSet64((int)high, low);
     }
     return slot;
 }
@@ -828,7 +846,9 @@ void grRenderElements(Gerbera_s *state, int primitiveType, int vertexCount,
             grDie(0);
     }
     grFetchPrimitives(state, fetchType, numVertices, vertexCount, indices, 0);
+#if HG_ASSERT_ENABLED
     grCheckPixelPipeStack(state);
+#endif
 }
 
 /* --- grRenderArrays (grApiFast.inl 1636; DLL 33026-33074) ------------------- */
@@ -877,12 +897,18 @@ void grRenderArrays(Gerbera_s *state, int primitiveType, int vertexCount, int ba
 
 void grrBeginRendering(Gerbera_s *state)
 {
-    grLockSurface(GR_SURFACE_DRAW);
+    if (state != NULL && state->surfaceTlsState != NULL)
+        grLockSurfaceState(state->surfaceTlsState, GR_SURFACE_DRAW);
+    else
+        grLockSurface(GR_SURFACE_DRAW);
 }
 
 void grrEndRendering(Gerbera_s *state)
 {
-    grReleaseSurface(GR_SURFACE_DRAW);
+    if (state != NULL && state->surfaceTlsState != NULL)
+        grReleaseSurfaceState(state->surfaceTlsState, GR_SURFACE_DRAW);
+    else
+        grReleaseSurface(GR_SURFACE_DRAW);
 }
 
 void grrUpdateState(Gerbera_s *state)
@@ -929,6 +955,30 @@ void grSetupRendering(Gerbera_s *state)
         }
         state->useTexUnit[i] = (unsigned char)enabled;
         state->textureUnitEnabled[i] = (unsigned char)enabled;
+    }
+#if GERBERA_ARMV6_JIT
+    if (state->pixelTextureLayout != grGetPixelTextureLayout(state))
+        state->pixelPipelineDirty = 1;
+#endif
+    {
+        unsigned char whiteMod = 0;
+        if (state->useTexUnit[0] != 0 &&
+            state->textureUnit[0].texEnvMode == GR_TEXENVMODE_MODULATE &&
+            grTestCapability(state, GR_CAPABILITY_LIGHTING) == 0 &&
+            (grTestCapability(state, GR_CAPABILITY_COLOR_ARRAY) == 0 ||
+             state->vertexArray[2].data == NULL) &&
+            state->defaultColorRGBA[0] >= 0xFF00u &&
+            state->defaultColorRGBA[1] >= 0xFF00u &&
+            state->defaultColorRGBA[2] >= 0xFF00u &&
+            state->defaultColorRGBA[3] >= 0xFF00u)
+        {
+            whiteMod = 1;
+        }
+        if (state->constWhiteModulate != whiteMod)
+        {
+            state->constWhiteModulate = whiteMod;
+            state->pixelPipelineDirty = 1;
+        }
     }
     grCheckPixelPipeConsistency(state);
     if (state->pixelPipelineDirty == 0 && state->scissorDirty == 0)

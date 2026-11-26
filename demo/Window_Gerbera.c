@@ -1,8 +1,7 @@
 #include "Core.h"
 #if CC_WIN_BACKEND == 99
 
-/* Prevent _WindowBase.h from pulling in EGL 1.2+ context helpers;
- * we bind directly to Gerbera's reconstructed Khronos EGL 1.1 API. */
+/* Use Gerbera's EGL 1.1 bindings instead of _WindowBase.h's EGL 1.2 helpers. */
 #undef CC_BUILD_EGL
 #include "_WindowBase.h"
 #include "String_.h"
@@ -96,8 +95,7 @@ static void FadeOutChatHUD(void) {
 	}
 }
 
-/* Scan the generated Notchy map for the most scenic coastal hillside vista
- * overlooking water, sand beaches, grass hills, and oak trees. */
+/* Score viewpoints by visible terrain types and nearby obstructions. */
 static void FindScenicVista(void) {
 	int bestScore = -1;
 	int x, z, a, step;
@@ -115,7 +113,7 @@ static void FindScenicVista(void) {
 			int cx, cz, cy, canopyNear = 0;
 			if (groundBlk != BLOCK_GRASS || groundY < 33 || groundY > 46) continue;
 
-			/* Ensure a 5x5 clearing around the camera is completely free of tree canopy */
+			/* Reject occupied space in the 5x5 area above the camera site. */
 			for (cx = -2; cx <= 2 && !canopyNear; cx++) {
 				for (cz = -2; cz <= 2 && !canopyNear; cz++) {
 					for (cy = groundY + 1; cy <= groundY + 9 && cy <= World.MaxY; cy++) {
@@ -187,15 +185,13 @@ static void SafeSetBlock(int x, int y, int z, BlockID block) {
 	}
 }
 
-/* Build a vibrant ClassiCube block showcase pavilion & garden near the vista
- * (looking toward -Z, i.e. yaw = 0) so opaque blocks, alpha-tested cross-quads,
- * and alpha-blended glass/water are all visible together. */
+/* Place opaque, alpha-tested and blended geometry in the same view (-Z). */
 static void BuildShowcasePavilion(void) {
 	int bx = World.Width / 2;
 	int bz = World.Length / 2;
 	int by, dx, dz, dy;
 
-	/* Pick a pleasant spot near the coastal vista if within bounds */
+	/* Leave enough room around the viewpoint for the pavilion. */
 	if ((int)g_vistaX >= 24 && (int)g_vistaX <= World.Width - 24 &&
 	    (int)g_vistaZ >= 32 && (int)g_vistaZ <= World.Length - 20) {
 		bx = (int)g_vistaX;
@@ -231,7 +227,7 @@ static void BuildShowcasePavilion(void) {
 		}
 	}
 
-	/* Small reflective water pool behind the glass window (dz = -12..-13) */
+	/* Water behind the glass window exercises overlapping transparency. */
 	for (dx = -4; dx <= 4; dx++) {
 		SafeSetBlock(bx + dx, by, bz - 12, BLOCK_STILL_WATER);
 		SafeSetBlock(bx + dx, by + 1, bz - 12, BLOCK_AIR);
@@ -291,7 +287,7 @@ static void BuildShowcasePavilion(void) {
 static void SaveDemoScreenshot(const char* filename) {
 	static char pathBuf[512];
 	const char* outDir = getenv("CC_DEMO_DIR");
-	if (!outDir || !*outDir) outDir = "/home/user/GegberaGLES1RE/demo";
+	if (!outDir || !*outDir) outDir = ".";
 	snprintf(pathBuf, sizeof(pathBuf), "%s/%s", outDir, filename);
 	g_pendingShotPath = pathBuf;
 }
@@ -341,7 +337,7 @@ static void DriveShowcaseFrames(void) {
 
 	switch (g_stage) {
 	case 0:
-		/* Stage 0: Let all terrain chunks build VBOs, capture scenic overworld vista */
+		/* Allow terrain VBOs to build before capturing the landscape. */
 		SetPlayerPose(g_vistaX, g_vistaY, g_vistaZ, g_vistaYaw, g_vistaPitch, true);
 		if (g_stageFrames == 32) {
 			FadeOutChatHUD();
@@ -354,7 +350,7 @@ static void DriveShowcaseFrames(void) {
 		break;
 
 	case 1:
-		/* Stage 1: Trigger /client gpuinfo so ClassiCube displays Nokia / OpenGL ES-CM 1.1 / EGL 1.1 HUD */
+		/* Capture the renderer information overlay. */
 		if (g_stageFrames == 1) {
 			cc_string cmd = String_FromConst("/client gpuinfo");
 			FadeOutChatHUD();
@@ -369,7 +365,7 @@ static void DriveShowcaseFrames(void) {
 		break;
 
 	case 2:
-		/* Stage 2: Build the Block Showcase Pavilion & Garden and render from front walkway */
+		/* Capture the pavilion from the front walkway. */
 		if (g_stageFrames == 1) {
 			FadeOutChatHUD();
 			if (!g_showcaseBuilt) {
@@ -387,7 +383,7 @@ static void DriveShowcaseFrames(void) {
 		break;
 
 	case 3:
-		/* Stage 3: Open 3D isometric Block Inventory GUI overlay */
+		/* Capture the inventory overlay. */
 		if (g_stageFrames == 1) {
 			InventoryScreen_Show();
 		}
@@ -400,7 +396,7 @@ static void DriveShowcaseFrames(void) {
 		break;
 
 	case 4:
-		/* Stage 4: Close inventory, switch to Third-Person camera showing 3D player character */
+		/* Capture the player model in third person. */
 		if (g_stageFrames == 1) {
 			InventoryScreen_Hide();
 			Inventory_SetSelectedBlock(BLOCK_GOLD);
@@ -417,7 +413,7 @@ static void DriveShowcaseFrames(void) {
 		break;
 
 	case 5:
-		/* Stage 5: Return to First-Person & apply golden-hour sunset sky/lighting + GLES 1.1 linear fog */
+		/* Capture first-person terrain with sunset colors and a shorter view distance. */
 		if (g_stageFrames == 1) {
 			while (Camera.Active->isThirdPerson) {
 				Camera_CycleActive();
@@ -475,7 +471,7 @@ void Window_Free(void) {
 static void DoCreateWindow(int width, int height, cc_bool is3D) {
 	if (width  <= 0) width  = g_winWidth;
 	if (height <= 0) height = g_winHeight;
-	/* Force clean target showcase resolution */
+	/* Fixed capture dimensions. */
 	width  = g_winWidth;
 	height = g_winHeight;
 
@@ -539,7 +535,7 @@ void Window_ProcessEvents(float delta) {
 
 	DriveShowcaseFrames();
 
-	/* Timeout safety net so headless run can never hang */
+	/* Stop after 600 rendered world frames if the capture sequence stalls. */
 	if (g_worldFrames > 600) {
 		Window_Main.Exists = false;
 		Event_RaiseVoid(&WindowEvents.Closing);

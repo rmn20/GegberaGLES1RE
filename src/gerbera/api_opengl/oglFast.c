@@ -108,7 +108,8 @@ int oglMapPrimitive(unsigned int mode)
 
 GL_API void GL_APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
-    oglContext_s *context = oglGetContext();
+    eglState_s *tlsState = NULL;
+    oglContext_s *context = oglGetContextAndState(&tlsState);
 
     if (context != NULL)
     {
@@ -124,9 +125,11 @@ GL_API void GL_APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
                     int primType = oglGetPrimitiveType(primitive);
                     if (grSetupCulling(gerbera, primType) != GR_COMMAND_STOP)
                     {
+                        gerbera->surfaceTlsState = tlsState;
                         grSetupRendering(gerbera);
                         grRenderArrays(gerbera, primitive, count, first);
                         grCleanupRendering(gerbera);
+                        gerbera->surfaceTlsState = NULL;
                     }
                 }
             }
@@ -144,7 +147,8 @@ GL_API void GL_APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
 
 GL_API void GL_APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
 {
-    oglContext_s *context = oglGetContext();
+    eglState_s *tlsState = NULL;
+    oglContext_s *context = oglGetContextAndState(&tlsState);
 
     if (context != NULL)
     {
@@ -182,9 +186,11 @@ GL_API void GL_APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, 
                         return;
                     ind = (char *)bufObj->buffer + (uintptr_t)indices;
                 }
+                gerbera->surfaceTlsState = tlsState;
                 grSetupRendering(gerbera);
                 grRenderElements(gerbera, primitive, count, oglMapDataType(type), ind);
                 grCleanupRendering(gerbera);
+                gerbera->surfaceTlsState = NULL;
             }
         }
     }
@@ -194,7 +200,8 @@ GL_API void GL_APIENTRY glDrawTexfOES(GLfloat xs, GLfloat ys, GLfloat zs, GLfloa
 {
     unsigned int magic0 = 0xDEADBEEFu;
     unsigned int magic1 = 0xC001D00Eu;
-    oglContext_s *context = oglGetContext();
+    eglState_s *tlsState = NULL;
+    oglContext_s *context = oglGetContextAndState(&tlsState);
 
     if (context != NULL)
     {
@@ -218,9 +225,11 @@ GL_API void GL_APIENTRY glDrawTexfOES(GLfloat xs, GLfloat ys, GLfloat zs, GLfloa
                 }
                 else
                 {
+                    gerbera->surfaceTlsState = tlsState;
                     grSetupRendering(gerbera);
                     grRenderTextureRect(gerbera, sx, sy, sw, sh, sz);
                     grCleanupRendering(gerbera);
+                    gerbera->surfaceTlsState = NULL;
                     OGL_ASSERT_AT("oglFast.c", 332,
                                   "__grMemoryCheck[0]==GR_STACK_CHECK_MAGIC0 && __grMemoryCheck[1]==GR_STACK_CHECK_MAGIC1",
                                   magic0 == 0xDEADBEEFu && magic1 == 0xC001D00Eu);

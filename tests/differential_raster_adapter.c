@@ -7,6 +7,7 @@
 #include "gerbera/hc/hcBackend.h"
 
 extern const unsigned char g_mutableParamsMask[12];
+extern const int g_orderedDitherKernel[4];
 
 typedef struct SignatureInput
 {
@@ -53,6 +54,23 @@ int differential_raster_compile(void *instructions, unsigned int optimizationMas
 {
     return raster_compile(instructions, optimizationMask, bytes, capacity, parameterMask,
                           HCARMBackend_create());
+}
+
+int differential_arm_codegen(HCInstr_s *instructions, void *bytes, int capacity)
+{
+    static union { uint64_t alignment; unsigned char bytes[256 * 1024]; } storage;
+    HCArena_s arena;
+    HCBackendInfo_s info;
+    HCInstr_s *fixed;
+    void *output;
+    int length;
+    HCArena_init(&arena, storage.bytes, sizeof(storage.bytes));
+    HCARMBackend_create()->preRegallocFixer(&arena, &fixed, instructions, NULL);
+    info = computeBackEndInfo(&arena, fixed, 16);
+    length = HCARMBackend_create()->codegen(&arena, &output, fixed, &info, 0);
+    if (length >= 0 && length <= capacity)
+        memcpy(bytes, output, (size_t)length);
+    return length;
 }
 
 int differential_raster_compile_x86(void *instructions, unsigned int optimizationMask,
@@ -109,6 +127,8 @@ void differential_raster_span_sample(const _grSignature *signature, const int *g
     state.capabilities[GR_CAPABILITY_SMOOTH_SHADING] = 1;
     state.activeGradientMask = 63;
     state.capabilities[GR_CAPABILITY_FOG] = signature->fogEnabled;
+    state.capabilities[GR_CAPABILITY_DITHER] = signature->dither;
+    pipe.ditherKernel = (void *)g_orderedDitherKernel;
     state.fogColor = inputs ? inputs->fogColor : 0;
     for (unit = 0; unit < 2; ++unit)
     {

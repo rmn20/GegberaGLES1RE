@@ -3,8 +3,10 @@
  * ARM machine-code generator, pre-regalloc fixer,
  * immediate recognizer (rotated imm8 + multi-chunk MOV/ORR & MVN/BIC
  * synthesis), barrel-shifter operand fusion, CPSR flag-setting CMP/TST
- * elision, MUL Rd!=Rm register allocator/spiller, and backendDecl vtable
- * from docs/libgles_cm.dll.epoc.c (sub_23B4C..sub_25484) and image bytes in
+ * elision, and backendDecl vtable. ARMv6 targets additionally use multiply-add,
+ * media instructions and the AAPCS callee-save mask.
+ * The ARMv5 implementation is recovered from docs/libgles_cm.dll.epoc.c
+ * (sub_23B4C..sub_25484) and image bytes in
  * docs/libgles_cm.dll.epoc (VA 0x36EB8..0x36F9B, file = VA - 0x7F64).
  */
 #include "gerbera/hc/hcBackend.h"
@@ -21,13 +23,13 @@
  * HCOP_MAXS, HCOP_MAXU, HCOP_MINS, HCOP_MINU. */
 static const unsigned char armMinMaxCond[4] = { 11, 3, 12, 8 };
 
-/* VA 0x36EBC: per-opcode metadata word (55 entries):
+/* VA 0x36EBC: per-opcode metadata word (first 55 entries):
  *   bits 0..4   (w & 0x1F)        : ARM data-processing opcode
  *   bits 5..7   ((w >> 5) & 7)    : immediate class for canCreateImmediate
  *   bits 8..9   ((w >> 8) & 3)    : CPSR flag class (0=none, 1=NZ, 2=NZCV)
  *   bit  10     ((w >> 10) & 1)   : barrel-shifter / 0xFFFF-mask ALU op
  *   bits 11..14 ((w >> 11) & 0xF) : codegen switch dispatch class (1..12) */
-static const unsigned short armOpcodeInfo[55] =
+static const unsigned short armOpcodeInfo[HCOP_MAX] =
 {
     0x1624u, 0x1520u, 0x195Fu, 0x195Fu, 0x152Eu, 0x195Fu, 0x195Fu, 0x195Fu,
     0x283Fu, 0x283Fu, 0x283Fu, 0x283Fu, 0x207Fu, 0x207Fu, 0x090Du, 0x090Fu,
@@ -35,7 +37,8 @@ static const unsigned short armOpcodeInfo[55] =
     0x40BFu, 0x409Fu, 0x409Fu, 0x00FFu, 0x00FFu, 0x40BFu, 0x40FFu, 0x40BFu,
     0x409Fu, 0x00FFu, 0x40BFu, 0x40FFu, 0x40FFu, 0x40FFu, 0x40FFu, 0x50DFu,
     0x30DFu, 0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu,
-    0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x58DFu, 0x60DFu
+    0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x383Fu, 0x58DFu, 0x60DFu,
+    0x687Fu, 0x687Fu, 0x68DFu, 0x687Fu, 0x68DFu
 };
 
 /* VA 0x36F2A: maps HC hard register 0..13 -> ARM register r0..r12, lr(r14). */
@@ -80,13 +83,16 @@ typedef struct ArmEmitCtx_s
     unsigned int regMask;
 } ArmEmitCtx_s;
 
-/* Scratch register state for MUL Rd==Rm==Rs temporary allocation (sub_23B4C). */
+/* Scratch register state for ARMv5 MUL destination constraints. */
+#if !GERBERA_ARMV6_JIT
 typedef struct ArmScratchState_s
 {
     unsigned int freeSpillSlots;          /* +0: 1-bit mask (slot 0 -> [r0+60]) */
     unsigned int freeHardRegs;            /* +4: per-instr free hard reg mask   */
     unsigned char regStatus[16];          /* +8: status per ARM register 0..14  */
 } ArmScratchState_s;
+
+#endif
 
 typedef struct ArmLabelNode_s
 {
@@ -95,8 +101,7 @@ typedef struct ArmLabelNode_s
     int offset;
 } ArmLabelNode_s;
 
-/* --- scratch register state & barrel-shift helpers ------------------------ */
-
+#if !GERBERA_ARMV6_JIT
 /* sub_23B4C */
 static void armScratchInit(ArmScratchState_s *st)
 {
@@ -126,6 +131,9 @@ static int armAllocSpillSlot(ArmScratchState_s *st)
     }
     return -1;
 }
+
+#endif
+
 
 /* sub_23BB8: encode immediate shift field (bits 5..11) for shiftType 1..4. */
 static unsigned int armEncodeImmShift(int shiftType, int amount)
@@ -226,6 +234,7 @@ static unsigned char *HCARMBackend_targetRegisterMapping(void)
     return (unsigned char *)armRegRemap;
 }
 
+#if !GERBERA_ARMV6_JIT
 /* sub_23D84 (3rd arg `excludeMask` in r2 verified from VA 0x23DA8 & 0x251E4). */
 static int armAllocScratchReg(ArmScratchState_s *st, ArmEmitCtx_s *ctx,
                               unsigned int excludeMask)
@@ -280,6 +289,8 @@ static void armFreeScratchReg(ArmScratchState_s *st, ArmEmitCtx_s *ctx, int r)
     }
     st->regStatus[r] &= 0x7Fu;
 }
+
+#endif
 
 /* sub_23F04: emit branch `B<cond>` placeholder with labelId in bits 0..23. */
 static void armEmitBranch(ArmEmitCtx_s *ctx, int cond, int labelId)
@@ -452,6 +463,11 @@ static int HCARMBackend_canCreateImmediate(HCInstr_s *instr)
     int imm = (int)instr->instr1;
     unsigned int immCls = ((unsigned int)armOpcodeInfo[op] >> 5) & 7u;
 
+#if GERBERA_ARMV6_JIT
+    if (op == HCOP_AND && imm == 0xFFFF)
+        return 1; /* UXTH */
+#endif
+
     switch (immCls)
     {
     case 0u:
@@ -475,7 +491,64 @@ static int HCARMBackend_canCreateImmediate(HCInstr_s *instr)
     }
 }
 
-/* sub_2417C */
+#if GERBERA_ARMV6_JIT
+/* Widen even and odd byte pairs into two independent 16-bit lanes. Each
+ * product is <= 255*256, so it can't carry across lanes. Extract each term's
+ * high product byte *before* adding, to keep framebuffer blend rounding. */
+static int armLowerPackedAlpha(HCInstr_s *out, HCInstr_s *instr, int *nextReg)
+{
+    int a = HC_getOpcodeSrc0Raw(instr), b = HC_getOpcodeSrc1Raw(instr);
+    int op = HC_getOpcodeOper(instr);
+    int rgb = op == HCOP_PACKED_ALPHA_RGB_A || op == HCOP_PACKED_ALPHA_RGB_B;
+    int alphaSrc = (op == HCOP_PACKED_ALPHA_A || op == HCOP_PACKED_ALPHA_RGB_A) ? a : b;
+    int alpha = (*nextReg)++, direct = (*nextReg)++, inverse = (*nextReg)++;
+    int pair[2], i, n = 0;
+    out[n++] = HC_genOp3Imm(HCOP_LSR, alpha, alphaSrc, 24);
+    out[n++] = HC_genOp3Imm(HCOP_ADD, direct, alpha, 1);
+    out[n++] = HC_genOp3Imm(HCOP_SUBR, inverse, alpha, 256);
+    for (i = 0; i < 2; ++i)
+    {
+        int left = (*nextReg)++, right = (*nextReg)++;
+        /* On RGB, use the single odd byte (G); neither source's high
+         * byte may become part of the stored result. */
+        int widen = (rgb && i == 1) ? HCOP_UXTB_ROR : HCOP_UXTB16;
+        out[n++] = HC_genOp3Imm(widen, left, a, i * 8);
+        out[n++] = HC_genOp3Imm(widen, right, b, i * 8);
+        out[n++] = HC_genOp3(HCOP_MULU, left, left, direct);
+        out[n++] = HC_genOp3(HCOP_MULU, right, right, inverse);
+        out[n++] = HC_genOp3Imm(HCOP_UXTB16, left, left, 8);
+        out[n++] = HC_genOp3(HCOP_UXTAB16_ROR8, left, left, right);
+        pair[i] = left;
+    }
+    /* Each truncated term is <= its multiplier minus one. Their sum
+     * is therefore <= (direct - 1) + (inverse - 1) == 255. */
+    out[n++] = HC_genOp3Imm(HCOP_LSL, pair[1], pair[1], 8);
+    out[n++] = HC_genOp3(HCOP_OR, HC_getOpcodeDst(instr), pair[0], pair[1]);
+    return n;
+}
+
+/* Keeping a shared depth address live is profitable in simple color tails;
+ * destination reads and multiple texture loads need the register for shading. */
+static int armSimpleDepthTail(HCInstr_s *tail)
+{
+    int i, loadBase = -1;
+    for (i = 0; i < 128; ++i)
+    {
+        HCInstr_s *ins = &tail[i];
+        int op = HC_getOpcodeOper(ins);
+        if (op == HCOP_EOP || op == HCOP_LABEL || HC_isBranchOp(op)) return 0;
+        if (HC_isLoadOp(op))
+        {
+            if (loadBase >= 0) return 0;
+            loadBase = HC_getOpcodeSrc0Raw(ins);
+        }
+        if (HC_isStoreOp(op)) return loadBase != HC_getOpcodeSrc0Raw(ins);
+    }
+    return 0;
+}
+
+#endif
+
 static int HCARMBackend_preRegallocFixer(void *mgrVoid, HCInstr_s **dest,
                                          HCInstr_s *src, void *compHandle)
 {
@@ -488,6 +561,9 @@ static int HCARMBackend_preRegallocFixer(void *mgrVoid, HCInstr_s **dest,
     HCInstr_s *out;
     int outIdx = 0;
     int prevOp;
+#if GERBERA_ARMV6_JIT
+    int depthStore = -1, depthAddress = -1;
+#endif
 
     (void)compHandle;
 
@@ -520,7 +596,57 @@ static int HCARMBackend_preRegallocFixer(void *mgrVoid, HCInstr_s **dest,
         HCInstr_s *instr = &src[inIdx];
         int op = HC_getOpcodeOper(instr);
 
+#if GERBERA_ARMV6_JIT
+        if (op == HCOP_PACKED_ALPHA_A || op == HCOP_PACKED_ALPHA_B ||
+            op == HCOP_PACKED_ALPHA_RGB_A || op == HCOP_PACKED_ALPHA_RGB_B)
+        {
+            HCArena_growCurrent(mgr, 17u * sizeof(HCInstr_s));
+            outIdx += armLowerPackedAlpha(out + outIdx, instr, &nextReg);
+            goto next_instr;
+        }
+        if (op == HCOP_UQADD8_RGB || op == HCOP_UQSUB8_RGB)
+        {
+            int temp = nextReg++;
+            HCArena_growCurrent(mgr, 2u * sizeof(HCInstr_s));
+            out[outIdx++] = HC_genOp3(op == HCOP_UQADD8_RGB ? HCOP_UQADD8 : HCOP_UQSUB8,
+                                      temp, HC_getOpcodeSrc0Raw(instr), HC_getOpcodeSrc1Raw(instr));
+            out[outIdx++] = HC_genOp3Imm(HCOP_BIC, HC_getOpcodeDst(instr), temp, (int)0xFF000000u);
+            goto next_instr;
+        }
+#endif
         HCArena_growCurrent(mgr, 8u);
+
+#if GERBERA_ARMV6_JIT
+        if (inIdx == depthStore)
+        {
+            out[outIdx++] = HC_genOp3Imm(HCOP_SW, HC_getOpcodeDst(instr), depthAddress, 0);
+            goto next_instr;
+        }
+        /* The depth load and conditional store address the same halfword.
+         * Keep the full address across the comparison so a spilled base
+         * need not be loaded again on the passing path. */
+        if ((op == HCOP_LW2U || op == HCOP_LW2S) && !HC_opcodeHasImm(instr) &&
+            inIdx + 2 < scanIdx && HC_isCondBranchOp(HC_getOpcodeOper(&src[inIdx + 1])))
+        {
+            HCInstr_s *store = &src[inIdx + 2];
+            int base = HC_getOpcodeSrc0Raw(instr), index = HC_getOpcodeSrc1Raw(instr);
+            int dst = HC_getOpcodeDst(instr);
+            if (HC_getOpcodeOper(store) == HCOP_SW2 && !HC_opcodeHasImm(store) &&
+                dst != base && dst != index && base == HC_getOpcodeSrc0Raw(store) &&
+                index == HC_getOpcodeSrc1Raw(store) && armSimpleDepthTail(store + 1))
+            {
+                int depthIndex = nextReg++;
+                depthAddress = nextReg++;
+                depthStore = inIdx + 2;
+                out[outIdx++] = HC_genOp3Imm(HCOP_LSL, depthIndex, index, 1);
+                HCArena_growCurrent(mgr, 2u * sizeof(HCInstr_s));
+                out[outIdx++] = HC_genOp3(HCOP_ADD, depthAddress, base, depthIndex);
+                out[outIdx++] = HC_genOp3Imm(op == HCOP_LW2U ? HCOP_LWU : HCOP_LWS,
+                                            dst, depthAddress, 0);
+                goto next_instr;
+            }
+        }
+#endif
 
         /* Scaled loads/stores (LW2S, LW2U, LD4, SW2, SD4 -> op 27..35):
          * scale immediate offsets by 2 or 4, and expand halfword scaled-index
@@ -605,7 +731,8 @@ static int HCARMBackend_preRegallocFixer(void *mgrVoid, HCInstr_s **dest,
          * MOVN tmp, #0 (= 0xFFFFFFFF) + LSR tmp, tmp, #20 / #16. */
         if ((instr->instr0 & 0x100u) != 0
             && ((armOpcodeInfo[op] >> 10) & 1u) == 1u
-            && (instr->instr1 == 0xFFFFu || instr->instr1 == 0xFFFu))
+            && (instr->instr1 == 0xFFFu || (instr->instr1 == 0xFFFFu
+                && (!GERBERA_ARMV6_JIT || op != HCOP_AND))))
         {
             int tmp = nextReg++;
             int lsrAmt = (instr->instr1 == 0xFFFu) ? 20 : 16;
@@ -663,8 +790,193 @@ static void armGenLoadStore(ArmEmitCtx_s *ctx, int cond, HCInstr_s *instr)
     armEmitMemOp(ctx, cond, opKind, regsPacked, offsetOrShift, flags);
 }
 
+#if GERBERA_ARMV6_JIT
+/* Bounded proof of an unsigned upper bound, following unique reaching
+ * definitions only. UINT_MAX also represents an unknown bit pattern. Do not
+ * infer a byte bound for an interpolant merely because it supplies a color. */
+static unsigned int armUnsignedMax(HCInstr_s *instrs, int pc, void *info,
+                                   int reg, int depth)
+{
+    void *ud;
+    HCInstr_s *def;
+    int defPC, op, src, imm;
+    unsigned int a, b;
+
+    if (depth == 8)
+        return 0xFFFFFFFFu;
+    ud = HC_getUDChain(info, pc, reg);
+    if (ud == NULL || HCChain_getLength(ud) != 1)
+        return 0xFFFFFFFFu;
+    defPC = HCChain_getValue(ud, 0);
+    if (defPC < 0 || defPC >= pc)
+        return 0xFFFFFFFFu;
+    def = &instrs[defPC];
+    op = HC_getOpcodeOper(def);
+    src = HC_getOpcodeSrc0Raw(def);
+    imm = HC_opcodeHasImm(def);
+    b = def->instr1;
+
+    switch (op)
+    {
+    case HCOP_LBU:
+    case HCOP_UXTB_ROR: return 255u;
+    case HCOP_LWU:
+    case HCOP_LW2U: return 65535u;
+    case HCOP_MOV:
+        return imm ? b : armUnsignedMax(instrs, defPC, info, src, depth + 1);
+    case HCOP_AND:
+        if (imm) return b;
+        a = armUnsignedMax(instrs, defPC, info, src, depth + 1);
+        b = armUnsignedMax(instrs, defPC, info, (int)(b & 0x7ffu), depth + 1);
+        return a < b ? a : b;
+    case HCOP_LSR:
+    case HCOP_LSL:
+        if (!imm || b >= 32u) break;
+        a = armUnsignedMax(instrs, defPC, info, src, depth + 1);
+        if (op == HCOP_LSR) return a >> b;
+        if (a <= (0xFFFFFFFFu >> b)) return a << b;
+        break;
+    case HCOP_MINU:
+        if (imm) return b;
+        break;
+    case HCOP_MINS:
+        if (imm && b <= 0x7FFFFFFFu &&
+            armUnsignedMax(instrs, defPC, info, src, depth + 1) <= 0x7FFFFFFFu)
+            return b;
+        break;
+    case HCOP_SUBR:
+        if (imm && armUnsignedMax(instrs, defPC, info, src, depth + 1) <= b)
+            return b;
+        break;
+    case HCOP_ADD:
+    case HCOP_MULS:
+    case HCOP_MULU:
+        a = armUnsignedMax(instrs, defPC, info, src, depth + 1);
+        if (!imm)
+            b = armUnsignedMax(instrs, defPC, info, (int)(b & 0x7ffu), depth + 1);
+        if (op == HCOP_ADD)
+        {
+            if (a <= 0xFFFFFFFFu - b) return a + b;
+        }
+        else
+        {
+            /* 32x32->64 is UMULL on ARM; avoid a software divide in the JIT. */
+            unsigned long long product = (unsigned long long)a * b;
+            if (product <= 0xFFFFFFFFu) return (unsigned int)product;
+        }
+        break;
+    default:
+        break;
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* SMULxy/SMLAxy sign extend their halfword operands. */
+static int armIsProvably16Bit(HCInstr_s *instrs, int pc, void *info, int reg)
+{
+    void *ud = HC_getUDChain(info, pc, reg);
+    if (ud != NULL && HCChain_getLength(ud) == 1)
+    {
+        int defPC = HCChain_getValue(ud, 0);
+        if (defPC >= 0 && defPC < pc)
+        {
+            HCInstr_s *def = &instrs[defPC];
+            int op = HC_getOpcodeOper(def);
+            if (op == HCOP_LBS || op == HCOP_LWS || op == HCOP_LW2S)
+                return 1;
+            if (HC_opcodeHasImm(def) &&
+                ((op == HCOP_ASR && def->instr1 >= 16u && def->instr1 < 32u) ||
+                 (op == HCOP_MOV && def->instr1 >= 0xFFFF8000u)))
+                return 1;
+        }
+    }
+    return armUnsignedMax(instrs, pc, info, reg, 0) <= 32767u;
+}
+
+/* Return the ARM USAT width for #(2^n - 1), or zero for other immediates. */
+static int armSatWidth(unsigned int limit)
+{
+    int width = 0;
+    if (limit <= 0x7FFFFFFFu && (limit & (limit + 1u)) == 0)
+        for (; limit != 0; limit >>= 1) ++width;
+    return width;
+}
+
+static unsigned int armUSatWord(int rd, int width, int rm, unsigned int asr)
+{
+    return 0xE6E00010u | ((unsigned int)width << 16) | ((unsigned int)rd << 12)
+        | (asr != 0 ? (asr << 7) | 0x40u : 0) | (unsigned int)rm;
+}
+
+static unsigned int armUQAdd8Word(int rd, int rn, int rm)
+{
+    return 0xE6600F90u | ((unsigned int)rn << 16) | ((unsigned int)rd << 12) | (unsigned int)rm;
+}
+
+static unsigned int armUXTBWord(int rd, int rm, unsigned int shift, int pair)
+{
+    return (pair ? 0xE6CF0070u : 0xE6EF0070u) |
+        ((unsigned int)rd << 12) | ((shift / 8u) << 10) | (unsigned int)rm;
+}
+
+/* Check that sinking the producer to its single consumer preserves its input.
+ * Exclude control-flow edges, and do not rely on the DU chain alone: at a join
+ * the use could also have a different reaching definition. */
+static int armSingleUse(HCInstr_s *instrs, int pc, void *info, int reg, int input, int input2)
+{
+    void *du = HC_getDUChain(info, pc);
+    void *ud;
+    int i, usePC;
+    if (du == NULL || HCChain_getLength(du) != 1)
+        return -1;
+    usePC = HCChain_getValue(du, 0);
+    if (usePC <= pc)
+        return -1;
+    ud = HC_getUDChain(info, usePC, reg);
+    if (ud == NULL || HCChain_getLength(ud) != 1 || HCChain_getValue(ud, 0) != pc)
+        return -1;
+    for (i = pc + 1; i < usePC; ++i)
+    {
+        HCInstr_s *mid = &instrs[i];
+        int def = HC_getDef(mid);
+        if ((def >= 0 && (def == input || def == input2)) ||
+            HC_getOpcodeOper(mid) == HCOP_LABEL ||
+            HC_getOpcodeType(mid) == HCOP_TYPE_BRANCH)
+            return -1;
+    }
+    return usePC;
+}
+
+#endif
+
+/* Pending consumers remain ordered even when independent folds overlap. */
+static int armDeferWord(unsigned int *words, int *pcs, int *count, int *first,
+                         int capacity, int pc, unsigned int word)
+{
+    int live = *count - *first, insert = 0, i;
+    if (live >= capacity) return 0;
+    while (insert < live && pcs[*first + insert] < pc) ++insert;
+    if (insert < live && pcs[*first + insert] == pc) return 0;
+    for (i = 0; i < live; ++i)
+    {
+        pcs[i] = pcs[*first + i];
+        words[i] = words[*first + i];
+    }
+    for (i = live; i > insert; --i)
+    {
+        pcs[i] = pcs[i - 1];
+        words[i] = words[i - 1];
+    }
+    pcs[insert] = pc;
+    words[insert] = word;
+    *first = 0;
+    *count = live + 1;
+    return 1;
+}
+
 /* sub_24734: MAXS, MAXU, MINS, MINU. */
-static void armGenMinMax(ArmEmitCtx_s *ctx, HCInstr_s *instr)
+static void armGenMinMax(ArmEmitCtx_s *ctx, HCInstr_s *instr,
+                         HCInstr_s *instrs, int pc, void *info)
 {
     int dst = (int)((instr->instr0 >> 10) & 0x7FFu);
     int op = HC_getOpcodeOper(instr);
@@ -686,6 +998,28 @@ static void armGenMinMax(ArmEmitCtx_s *ctx, HCInstr_s *instr)
                             31u, 14);
             return;
         }
+#if GERBERA_ARMV6_JIT
+        /* ARMv6 USAT: MINS/MINU dst, s0, #(2^n-1) where src is provably
+         * non-negative clamps to [0, 2^n-1] in one instruction. */
+        int width = (op == HCOP_MINS || op == HCOP_MINU) ? armSatWidth(immVal) : 0;
+        if (width != 0)
+        {
+            unsigned int maxVal = armUnsignedMax(instrs, pc, info, s0, 0);
+            if (maxVal <= immVal)
+            {
+                if (dst != s0)
+                    armEmitDataProc(ctx, 14, 13, (dst << 12) | (s0 << 4),
+                                    0xFFFFFFFFu, 2);
+                return;
+            }
+            if (maxVal <= 0x7FFFFFFFu)
+            {
+                ctx->regMask |= (1u << dst) | (1u << s0);
+                ctx->code[ctx->count++] = armUSatWord(dst, width, s0, 0);
+                return;
+            }
+        }
+#endif
         opndImm = immVal;
         cmpRm = 0;
         modeFlags = 0;
@@ -754,7 +1088,8 @@ static void armGenShiftedALU(ArmEmitCtx_s *ctx, HCInstr_s *shiftInstr,
 }
 
 /* sub_2496C: conditional branch with CPSR S-bit fusion onto preceding ALU op. */
-static void armGenCondBranch(ArmEmitCtx_s *ctx, HCInstr_s *instrs, int pc, void *info)
+static void armGenCondBranch(ArmEmitCtx_s *ctx, HCInstr_s *instrs, int pc, void *info,
+                             const int *recentWords)
 {
     HCInstr_s *instr = &instrs[pc];
     int op = HC_getOpcodeOper(instr);
@@ -778,9 +1113,44 @@ static void armGenCondBranch(ArmEmitCtx_s *ctx, HCInstr_s *instrs, int pc, void 
 
     if (tryFuseFlags && pc != 0 && ctx->count > 0)
     {
-        int prevOp = HC_getOpcodeOper(&instrs[pc - 1]);
+        int previous = pc - 1, wordPC = ctx->count - 1;
+#if GERBERA_ARMV6_JIT
+        if (hasImm && instr->instr1 == 0 && (op == HCOP_CBEQ || op == HCOP_CBNEQ))
+        {
+            void *chain = HC_getUDChain(info, pc, s0);
+            if (chain != NULL && HCChain_getLength(chain) == 1)
+            {
+                int def = HCChain_getValue(chain, 0), i;
+                if (def >= 0 && def < pc - 1 && pc - def < 8 &&
+                    recentWords[8 + (def & 7)] == def + 1 &&
+                    recentWords[8 + ((def + 1) & 7)] == def + 2 &&
+                    recentWords[(def + 1) & 7] == recentWords[def & 7] + 1)
+                {
+                    for (i = def + 1; i < pc; ++i)
+                    {
+                        int middle = HC_getOpcodeOper(&instrs[i]);
+                        if ((middle >= HCOP_MAXS && middle <= HCOP_MINU) ||
+                            middle == HCOP_LABEL || HC_isBranchOp(middle)) break;
+                    }
+                    if (i == pc)
+                    {
+                        previous = def;
+                        wordPC = recentWords[def & 7];
+                    }
+                }
+            }
+        }
+#else
+        (void)recentWords;
+#endif
+        int prevOp = HC_getOpcodeOper(&instrs[previous]);
         unsigned int flagCls = ((unsigned int)armOpcodeInfo[prevOp] >> 8) & 3u;
-        if (flagCls != 0)
+        unsigned int word = ctx->code[wordPC];
+        unsigned int actualOp = (word >> 21) & 15u;
+        if (flagCls != 0 && (word & 0x0C000000u) == 0 &&
+            ((word & 0x02000000u) != 0 || (word & 0x90u) != 0x90u) &&
+            ((word >> 12) & 15u) == (unsigned int)s0 &&
+            !(actualOp >= 8 && actualOp <= 11))
         {
             if (flagCls != 1u
                 || op == HCOP_CBEQ || op == HCOP_CBNEQ
@@ -789,10 +1159,11 @@ static void armGenCondBranch(ArmEmitCtx_s *ctx, HCInstr_s *instrs, int pc, void 
                 void *ud = HC_getUDChain(info, pc, s0);
                 if (ud != NULL
                     && HCChain_getLength(ud) == 1
-                    && HCChain_getValue(ud, 0) == pc - 1)
+                    && HCChain_getValue(ud, 0) == previous)
                 {
-                    /* Reuse the preceding ALU instruction's flags to omit CMP/TST. */
-                    ctx->code[ctx->count - 1] |= 0x00100000u;
+                    /* EQ/NE may reuse Z across independent instructions;
+                     * signed comparisons retain the adjacent-only rule. */
+                    ctx->code[wordPC] |= 0x00100000u;
                     armEmitBranch(ctx, armBranchCond[op - HCOP_CBA], dstLabel);
                     return;
                 }
@@ -824,16 +1195,19 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
     int pc = 0;
     int deferredCount = 0;
     int deferredIdx = 0;
-    unsigned int deferredWords[8];
-    int deferredPCs[8];
+    enum { maxDeferred = 8 };
+    unsigned int deferredWords[maxDeferred];
+    int deferredPCs[maxDeferred];
+    int recentWords[16] = {0};
     int running = 1;
     int allocated = 0;
     int topMark = HCArena_markTop(mgr);
     ArmLabelNode_s *labelHead = NULL;
     ArmLabelNode_s *labelTail = NULL;
     ArmEmitCtx_s ctx;
+#if !GERBERA_ARMV6_JIT
     ArmScratchState_s scratch;
-    int bytesEmitted;
+#endif
     int j;
 
     (void)spillStart;
@@ -843,30 +1217,38 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
     ctx.count = 0;
     ctx.regMask = 0;
 
+#if !GERBERA_ARMV6_JIT
     armScratchInit(&scratch);
-    bytesEmitted = 8;
+#endif
     armGrowCodeBuf(mgr, &allocated, 8);
     /* Prologue: STMFD sp!, {r0-r12, lr} (0xE92D5FFF). */
     armEmitBlockMem(&ctx, 14, 22, 13, 0x5FFFu, 0, 1, 0);
+#if GERBERA_ARMV6_JIT
+    ctx.regMask = 0;
+#endif
 
     while (running != 0)
     {
         HCInstr_s *instr = &instrs[pc];
         int op = HC_getOpcodeOper(instr);
-        int prevCount = ctx.count;
         unsigned int cgClass;
 
-        armGrowCodeBuf(mgr, &allocated, bytesEmitted + 16);
+        armGrowCodeBuf(mgr, &allocated, 4 * ctx.count + 16);
+        recentWords[pc & 7] = ctx.count;
+        recentWords[8 + (pc & 7)] = pc + 1;
 
         if (deferredIdx < deferredCount && deferredPCs[deferredIdx] == pc)
         {
-            ctx.code[ctx.count++] = deferredWords[deferredIdx];
+            if (deferredWords[deferredIdx] != 0)
+                ctx.code[ctx.count++] = deferredWords[deferredIdx];
             ++pc;
             ++deferredIdx;
             continue;
         }
 
+#if !GERBERA_ARMV6_JIT
         scratch.freeHardRegs = HC_getFreeHardRegs(info, pc) & 0xFFFFFFFEu;
+#endif
         cgClass = ((unsigned int)armOpcodeInfo[op] >> 11) & 0xFu;
 
         switch (cgClass)
@@ -934,19 +1316,110 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
             break;
 
         case 2u: /* ADD, AND, BIC, OR, SUB, SUBR, XOR */
+#if GERBERA_ARMV6_JIT
+            if (deferredIdx == deferredCount && op == HCOP_ADD && !HC_opcodeHasImm(instr))
+            {
+                int a = HC_getOpcodeSrc0Raw(instr), b = HC_getOpcodeSrc1Raw(instr);
+                int rd = HC_getOpcodeDst(instr);
+                int usePC = armSingleUse(instrs, pc, info, rd, a, b);
+                if (usePC >= 0)
+                {
+                    HCInstr_s *use = &instrs[usePC];
+                    int useOp = HC_getOpcodeOper(use);
+                    /* If both operands are byte values, the other UQADD8
+                     * lanes are zero. Never truncate an unbounded color. */
+                    if ((useOp == HCOP_MINU || useOp == HCOP_MINS) &&
+                        HC_opcodeHasImm(use) && use->instr1 == 255u &&
+                        armUnsignedMax(instrs, pc, info, a, 0) <= 255u &&
+                        armUnsignedMax(instrs, pc, info, b, 0) <= 255u)
+                    {
+                        int dst = HC_getOpcodeDst(use);
+                        deferredWords[0] = armUQAdd8Word(dst, a, b);
+                        deferredPCs[0] = usePC;
+                        deferredCount = 1;
+                        deferredIdx = 0;
+                        ctx.regMask |= (1u << dst) | (1u << a) | (1u << b);
+                        break;
+                    }
+                }
+            }
+            if (op == HCOP_AND && HC_opcodeHasImm(instr) && instr->instr1 == 0xFFFFu)
+            {
+                int rd = HC_getOpcodeDst(instr), rm = HC_getOpcodeSrc0Raw(instr);
+                ctx.regMask |= (1u << rd) | (1u << rm);
+                ctx.code[ctx.count++] = 0xE6FF0070u | ((unsigned int)rd << 12) | (unsigned int)rm;
+                break;
+            }
+#endif
             armGenALU(&ctx, instr, armOpcodeInfo[op] & 0x1F,
                       (int)((instr->instr0 >> 10) & 0x7FFu));
             break;
 
         case 3u: /* ASR, LSL, LSR, ROR (+ barrel-shifter consumer fusion) */
-            if (deferredIdx == deferredCount)
+#if GERBERA_ARMV6_JIT
+            /* An adjacent byte mask needs no deferred slot. An unrelated
+             * pending fold (e.g. the fog weight shift) need not block it. */
+            if (deferredIdx < deferredCount && deferredPCs[deferredIdx] > pc + 1 &&
+                op == HCOP_LSR && HC_opcodeHasImm(instr) &&
+                (instr->instr1 == 8u || instr->instr1 == 16u || instr->instr1 == 24u))
+            {
+                HCInstr_s *use = &instrs[pc + 1];
+                int src = HC_getOpcodeSrc0Raw(instr), dst = HC_getOpcodeDst(instr);
+                if (HC_getOpcodeOper(use) == HCOP_AND && HC_opcodeHasImm(use) &&
+                    use->instr1 == 255u && HC_getOpcodeSrc0Raw(use) == dst &&
+                    armSingleUse(instrs, pc, info, dst, -1, -1) == pc + 1)
+                {
+                    int out = HC_getOpcodeDst(use);
+                    ctx.code[ctx.count++] = armUXTBWord(out, src, instr->instr1, 0);
+                    ctx.regMask |= (1u << out) | (1u << src);
+                    ++pc; /* the usual increment also skips the mask */
+                    break;
+                }
+            }
+            if (op == HCOP_LSR &&
+                HC_opcodeHasImm(instr) && instr->instr1 > 0 && instr->instr1 < 32u)
+            {
+                int src = HC_getOpcodeSrc0Raw(instr), dst = HC_getOpcodeDst(instr);
+                int usePC = armSingleUse(instrs, pc, info, dst, -1, -1);
+                if (usePC >= 0)
+                {
+                    HCInstr_s *use = &instrs[usePC];
+                    int useOp = HC_getOpcodeOper(use), out = HC_getOpcodeDst(use);
+                    unsigned int shift = instr->instr1, word = 0;
+                    if (HC_opcodeHasImm(use) && HC_getOpcodeSrc0Raw(use) == dst)
+                    {
+                        if (useOp == HCOP_AND && use->instr1 == 255u &&
+                            (shift == 8u || shift == 16u || shift == 24u))
+                            word = armUXTBWord(out, src, shift, 0);
+                        /* USAT has ASR, not LSR. For a nonnegative input they
+                         * agree; otherwise LSR could saturate high, not low. */
+                        else if ((useOp == HCOP_MINU || useOp == HCOP_MINS) &&
+                                 armSatWidth(use->instr1) != 0 &&
+                                 armUnsignedMax(instrs, pc, info, src, 0) <= 0x7FFFFFFFu)
+                            word = armUSatWord(out, armSatWidth(use->instr1), src, shift);
+                    }
+                    if (word != 0 && (out == dst || armSingleUse(instrs, pc, info, dst, src, -1) >= 0) &&
+                        armDeferWord(deferredWords, deferredPCs, &deferredCount, &deferredIdx,
+                                     maxDeferred, usePC, out == dst ? 0 : word))
+                    {
+                        /* With an in-place consumer, replace the shift's result
+                         * directly: the unclamped value has no other uses. */
+                        if (out == dst) ctx.code[ctx.count++] = word;
+                        ctx.regMask |= (1u << out) | (1u << src);
+                        break;
+                    }
+                }
+            }
+#endif
+            if (deferredIdx == deferredCount ||
+                (GERBERA_ARMV6_JIT && deferredCount - deferredIdx < maxDeferred))
             {
                 void *du = HC_getDUChain(info, pc);
                 if (du != NULL)
                 {
                     int nUses = HCChain_getLength(du);
                     int hasImm = (instr->instr0 & 0x100u) != 0;
-                    if ((unsigned int)nUses <= 8u
+                    if (nUses > 0 && nUses <= maxDeferred - (deferredCount - deferredIdx)
                         && !(hasImm != 0 && instr->instr1 == 0))
                     {
                         int shiftDst = (int)((instr->instr0 >> 10) & 0x7FFu);
@@ -962,8 +1435,13 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
                             HCInstr_s *useInstr = &instrs[usePC];
                             int useOp = HC_getOpcodeOper(useInstr);
                             void *ud;
+                            int pending;
 
-                            if ((armOpcodeInfo[useOp] & 0x400u) == 0)
+                            for (pending = deferredIdx; pending < deferredCount; ++pending)
+                                if (deferredPCs[pending] == usePC) ok = 0;
+
+                            if (!ok || usePC <= pc || (armOpcodeInfo[useOp] & 0x400u) == 0 ||
+                                (useOp == HCOP_BIC && HC_getOpcodeSrc0Raw(useInstr) == shiftDst))
                             {
                                 ok = 0;
                                 break;
@@ -987,8 +1465,10 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
                                 break;
                             ud = HC_getUDChain(info, usePC, shiftDst);
                             if ((useInstr->instr0 & 0x100u) != 0
+                                || (HC_getOpcodeSrc0Raw(useInstr) == shiftDst &&
+                                    HC_getOpcodeSrc1Raw(useInstr) == shiftDst)
                                 || ud == NULL
-                                || HCChain_getLength(ud) != 1)
+                                || HCChain_getLength(ud) != 1 || HCChain_getValue(ud, 0) != pc)
                             {
                                 ok = 0;
                                 break;
@@ -998,7 +1478,6 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
                         if (ok)
                         {
                             int shiftType = armShiftTypeForOp(op);
-                            deferredIdx = 0;
                             for (u = 0; u < nUses; ++u)
                             {
                                 int usePC = HCChain_getValue(du, u);
@@ -1007,6 +1486,7 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
                                 int useOp = HC_getOpcodeOper(useInstr);
                                 int useDst = (int)((useInstr->instr0 >> 10) & 0x7FFu);
                                 ArmEmitCtx_s tmpCtx;
+                                unsigned int word;
 
                                 if (rn == shiftDst)
                                 {
@@ -1016,16 +1496,16 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
                                     else if (useOp == HCOP_SUBR)
                                         useOp = HCOP_SUB;
                                 }
-                                tmpCtx.code = &deferredWords[u];
+                                tmpCtx.code = &word;
                                 tmpCtx.count = 0;
                                 tmpCtx.regMask = 0;
                                 armGenShiftedALU(&tmpCtx, instr,
                                                  armOpcodeInfo[useOp] & 0x1F,
                                                  useDst, rn, shiftS0, shiftType);
                                 ctx.regMask |= tmpCtx.regMask;
-                                deferredPCs[u] = usePC;
+                                armDeferWord(deferredWords, deferredPCs, &deferredCount,
+                                             &deferredIdx, maxDeferred, usePC, word);
                             }
-                            deferredCount = nUses;
                             break;
                         }
                     }
@@ -1052,6 +1532,80 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
             }
             break;
 
+#if GERBERA_ARMV6_JIT
+        case 4u: /* HCOP_MULS, HCOP_MULU. ARMv6 allows Rd==Rm. */
+        {
+            int rd = (int)((instr->instr0 >> 10) & 0x7FFu);
+            int rm = (int)(instr->instr0 >> 21);
+            int rs = (int)(instr->instr1 & 0x7FFu);
+            int fused = 0;
+
+            /* Sink MUL into its only ADD use if none of its inputs change.
+             * The scheduler may have inserted an unrelated load between them. */
+            int addPC = armSingleUse(instrs, pc, info, rd, rm, rs);
+            int insert = deferredIdx;
+            while (insert < deferredCount && deferredPCs[insert] < addPC)
+                ++insert;
+            if (addPC > pc && (insert == deferredCount || deferredPCs[insert] != addPC) &&
+                (addPC == pc + 1 || deferredCount - deferredIdx < maxDeferred))
+            {
+                HCInstr_s *add = &instrs[addPC];
+                int addS0 = HC_getOpcodeSrc0Raw(add), addS1 = HC_getOpcodeSrc1Raw(add);
+                if (HC_getOpcodeOper(add) == HCOP_ADD && !HC_opcodeHasImm(add) &&
+                    (addS0 == rd) != (addS1 == rd))
+                {
+                    int dst = HC_getOpcodeDst(add), acc = (addS0 == rd) ? addS1 : addS0;
+                    int use16 = armIsProvably16Bit(instrs, pc, info, rm)
+                             && armIsProvably16Bit(instrs, pc, info, rs);
+                    unsigned int word = (use16 ? 0xE1000080u : 0xE0200090u)
+                        | ((unsigned int)dst << 16) | ((unsigned int)acc << 12)
+                        | ((unsigned int)rs << 8) | (unsigned int)rm;
+                    ctx.regMask |= (1u << dst) | (1u << rm) | (1u << rs) | (1u << acc);
+                    if (addPC == pc + 1)
+                    {
+                        ctx.code[ctx.count++] = word;
+                        ++pc;
+                    }
+                    else
+                    {
+                        /* Keep other independent folds. An existing entry for
+                         * this ADD would compete for the same machine word. */
+                        int i, live = deferredCount - deferredIdx;
+                        insert -= deferredIdx;
+                        for (i = 0; i < live; ++i)
+                        {
+                            deferredPCs[i] = deferredPCs[i + deferredIdx];
+                            deferredWords[i] = deferredWords[i + deferredIdx];
+                        }
+                        for (i = live; i > insert; --i)
+                        {
+                            deferredPCs[i] = deferredPCs[i - 1];
+                            deferredWords[i] = deferredWords[i - 1];
+                        }
+                        deferredPCs[insert] = addPC;
+                        deferredWords[insert] = word;
+                        deferredIdx = 0;
+                        deferredCount = live + 1;
+                    }
+                    fused = 1;
+                }
+            }
+
+            if (!fused)
+            {
+                int use16 = armIsProvably16Bit(instrs, pc, info, rm)
+                         && armIsProvably16Bit(instrs, pc, info, rs);
+                unsigned int base = use16 ? 0xE1600080u : 0xE0000090u;
+                ctx.regMask |= (1u << rd) | (1u << rm) | (1u << (rs & 0xF));
+                ctx.code[ctx.count++] = base
+                    | ((unsigned int)rd << 16)
+                    | ((unsigned int)(rs & 0xF) << 8)
+                    | (unsigned int)(rm & 0xF);
+            }
+            break;
+        }
+
+#else
         case 4u: /* HCOP_MULS, HCOP_MULU (ARM `MUL Rd, Rm, Rs`, Rd != Rm) */
         {
             int rd = (int)((instr->instr0 >> 10) & 0x7FFu);
@@ -1087,8 +1641,38 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
             break;
         }
 
+#endif
         case 5u: /* HCOP_MAXS..HCOP_MINU */
-            armGenMinMax(&ctx, instr);
+#if GERBERA_ARMV6_JIT
+            /* MAXS(x, 0) followed by MIN(x, 2^n-1) is a signed-to-unsigned
+             * saturate, including when x is negative (COMBINE SUBTRACT). */
+            if (deferredIdx == deferredCount && op == HCOP_MAXS &&
+                HC_opcodeHasImm(instr) && instr->instr1 == 0)
+            {
+                int rd = HC_getOpcodeDst(instr), src = HC_getOpcodeSrc0Raw(instr);
+                int usePC = armSingleUse(instrs, pc, info, rd, -1, -1);
+                if (usePC >= 0)
+                {
+                    HCInstr_s *use = &instrs[usePC];
+                    int useOp = HC_getOpcodeOper(use);
+                    int dst = HC_getOpcodeDst(use), width = armSatWidth(use->instr1);
+                    if ((useOp == HCOP_MINU || useOp == HCOP_MINS) &&
+                        HC_opcodeHasImm(use) && width != 0 &&
+                        (dst == rd || armSingleUse(instrs, pc, info, rd, src, -1) >= 0))
+                    {
+                        unsigned int word = armUSatWord(dst, width, src, 0);
+                        if (dst == rd) ctx.code[ctx.count++] = word;
+                        deferredWords[0] = dst == rd ? 0 : word;
+                        deferredPCs[0] = usePC;
+                        deferredIdx = 0;
+                        deferredCount = 1;
+                        ctx.regMask |= (1u << dst) | (1u << src);
+                        break;
+                    }
+                }
+            }
+#endif
+            armGenMinMax(&ctx, instr, instrs, pc, info);
             break;
 
         case 6u: /* HCOP_BRA */
@@ -1096,7 +1680,7 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
             break;
 
         case 7u: /* HCOP_CBA..HCOP_CBNEQ */
-            armGenCondBranch(&ctx, instrs, pc, info);
+            armGenCondBranch(&ctx, instrs, pc, info, recentWords);
             break;
 
         case 8u: /* Loads & stores */
@@ -1121,17 +1705,47 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
             break;
         }
 
+#if GERBERA_ARMV6_JIT
+        case 13u: /* ARMv6 packed media instructions */
+        {
+            int rd = HC_getOpcodeDst(instr), a = HC_getOpcodeSrc0Raw(instr), b = HC_getOpcodeSrc1Raw(instr);
+            unsigned int word;
+            ctx.regMask |= (1u << rd) | (1u << a);
+            if (op == HCOP_UXTB16 || op == HCOP_UXTB_ROR)
+            {
+                word = armUXTBWord(rd, a, instr->instr1, op == HCOP_UXTB16);
+            }
+            else
+            {
+                ctx.regMask |= 1u << b;
+                word = op == HCOP_UXTAB16_ROR8 ? 0xE6C00470u :
+                       op == HCOP_UQSUB8 ? 0xE6600FF0u : 0xE6600F90u;
+                word |= ((unsigned int)a << 16) | ((unsigned int)rd << 12) | (unsigned int)b;
+            }
+            ctx.code[ctx.count++] = word;
+            break;
+        }
+
+#endif
         default:
             break;
         }
 
-        bytesEmitted += 4 * (ctx.count - prevCount);
         ++pc;
     }
 
-    armGrowCodeBuf(mgr, &allocated, bytesEmitted + 8);
-    /* Epilogue: LDMFD sp!, {r0-r12, pc} (0xE8BD9FFF). */
+    armGrowCodeBuf(mgr, &allocated, 4 * ctx.count + 8);
+#if GERBERA_ARMV6_JIT
+    /* AAPCS preserves r4-r11. The generated leaf may allocate lr, so save the
+     * return address too; caller-saved registers need no stack traffic. */
+    {
+        unsigned int saved = (ctx.regMask & 0x0FF0u) | 0x4000u;
+        ctx.code[0] = 0xE92D0000u | saved;
+        armEmitBlockMem(&ctx, 14, 20, 13, (saved & 0x0FF0u) | 0x8000u, 1, 1, 1);
+    }
+#else
     armEmitBlockMem(&ctx, 14, 20, 13, 0x9FFFu, 1, 1, 1);
+#endif
 
     /* Patch 24-bit signed word offsets into all emitted `B<cond>` words. */
     for (j = 0; j < ctx.count; ++j)
@@ -1164,6 +1778,13 @@ static int HCARMBackend_codegen(void *mgrVoid, void **destination,
 
 /* --- vtable & factory (VA 0x36F6C, sub_25484) ----------------------------- */
 
+#if GERBERA_ARMV6_JIT
+static int HCARMBackend_optimizationMask(void)
+{
+    return HC_BACKEND_ARM11_SCHEDULE;
+}
+#endif
+
 static const HCBackend_s armBackendDecl =
 {
     &HCARMBackend_canCreateImmediate,
@@ -1177,7 +1798,11 @@ static const HCBackend_s armBackendDecl =
     &HCARMBackend_emulate,
     &HCARMBackend_disasm,               /* VA 0x25480 (`bx lr`)     */
     &HCARMBackend_isNative,
+#if GERBERA_ARMV6_JIT
+    &HCARMBackend_optimizationMask
+#else
     NULL
+#endif
 };
 
 HCBackend_s *HCARMBackend_create(void)

@@ -15,3 +15,6 @@ analysis/
 # Python
 __pycache__/
 *.pyc
+
+# Symbian tools
+/symbian_tools/*

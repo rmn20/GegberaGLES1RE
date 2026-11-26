@@ -501,6 +501,8 @@ int            oglIsScalarTexParam(unsigned int param);
 
 /* --- oglContext.inl -------------------------------------------------------- */
 oglContext_s     *oglGetContext(void);
+struct eglState_s;
+oglContext_s     *oglGetContextAndState(struct eglState_s **outState);
 oglMatrixStack_s *oglInitMatrixStack(oglContext_s *context, int depth);
 int               oglInitContext(oglContext_s *context, unsigned char *sharedWorkMem, int sharedWorkMemSize);
 int               oglIsValidContext(oglContext_s *context);
@@ -538,6 +540,7 @@ typedef struct eglState_s
 eglState_s *egliGetState(void);
 void        eglSetError(int error);
 void        egliSetCurrentContext(oglContext_s *context);
+void        egliInvalidateWindowSurface(struct eglSurface_s *surface);
 
 /* --- oglGetter.inl --------------------------------------------------------- */
 void                  oglIntToOutput(void *output, const void *input, int n, OGL_OUTPUTTYPE dataType);

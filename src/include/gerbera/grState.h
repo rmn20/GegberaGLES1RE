@@ -14,7 +14,7 @@
 #include "hg/hgDefs.h"
 #include "gerbera/grDefs.h"
 #include "gerbera/grTexture.h"
-#include "gerbera/hc/hcOpcode.h"
+#include "gerbera/hc/hcBackend.h"
 #include "hg/hgInt32.h"
 #include "hg/hgFloat.h"
 #include "imath/imApi.h"
@@ -25,8 +25,19 @@ HG_EXTERN_C_BEGIN
 #define GR_MAX_LIGHTS 8
 #define GR_MAX_USER_CLIP_PLANES 6
 #define GR_MAX_DISPLAY_DIMENSION 2048
+#define GR_EDGE_SLOPE_CACHE_SIZE 64
 #define GR_MAX_VIEWPORT_DIMENSION 2048
 #define GR_CLEAR_BUFFER_SIZE 4
+#if GERBERA_ARMV6_JIT
+#define GR_PIPELINE_CACHE_ENTRIES 64
+#define GR_PIPELINE_CACHE_BYTES 0xC000u
+#elif defined(__arm__) || defined(__SYMBIAN32__)
+#define GR_PIPELINE_CACHE_ENTRIES 32
+#define GR_PIPELINE_CACHE_BYTES 0x6000u
+#else
+#define GR_PIPELINE_CACHE_ENTRIES 32
+#define GR_PIPELINE_CACHE_BYTES 0x3000u
+#endif
 #define GR_COLORMASK_FULL 0xFu
 #define GR_SIDEMASK_BOTH 3u
 /* triangle side (grClipPrimitive/grQueuePrimitive: screen-area sign ^ front-
@@ -112,6 +123,7 @@ enum GR_POSITION_e
 #define GR_VERTEXMASK_COLOR_COMPUTED 0x20u
 #define GR_VERTEXMASK_INTERPOLATE_GRADIENTS 0x40u
 #define GR_VERTEXMASK_FORCE_CULL 0x80u
+#define GR_VERTEXMASK_APPROXIMATE_POSITION 0x100u
 
 /* clip mask (vertex->clipMask, u16): bits 0..5 = guardband planes 0..5
  * (IVector4_clip), bits 6..9 = guardband w tests, bits 10..15 = user clip
@@ -123,6 +135,7 @@ enum GR_POSITION_e
  * 0..63 the vertex cache (grVertexCacheGet), 64..91 the rasterizer cache,
  * 92..107 the clipper temp vertices (grVertexCacheGetTemp: index+92). */
 #define GR_VERTEX_CACHE_SIZE 64
+#define GR_FLOAT_TRANSFORM_MISS_LIMIT 4
 #define GR_NUM_RASTERIZER_CACHE_VERTICES 28
 #define GR_MAX_CLIPPER_GENERATED_VERTICES 12
 #define GR_MAX_CLIPPER_VERTICES 15
@@ -1033,6 +1046,7 @@ struct Gerbera_s
     unsigned int cullMask;
     unsigned char cullNegative;
     unsigned char lightingSideMask;
+    unsigned char constWhiteModulate;
 
     /* --- global ambient -------------------------------------------------------- */
     _XColor3 ambientColor;
@@ -1047,6 +1061,17 @@ struct Gerbera_s
     _XColor3 baseColor;             /* ambientLightSum*material.ambient+emission
                                      * (grUpdateLights) */
     int baseColorDirty;
+    void *surfaceTlsState;         /* eglState_s borrowed for the active draw call */
+    struct
+    {
+        unsigned int divisor;     /* zero marks an unused entry */
+        unsigned int reciprocal;
+    } edgeSlopeCache[GR_EDGE_SLOPE_CACHE_SIZE];
+    _IFVertexTransformPlan floatTransformPlan[2];
+    unsigned int floatTransformRecent;
+    unsigned int floatTransformMisses;
+    _ICommonVertexTransform commonTransform;
+    unsigned int pixelTextureLayout; /* dimensions and wrap modes of specialized code */
 };
 
 /* --- grApiSmall.inl: transform stack / user clip planes -------------------- */
@@ -1108,6 +1133,7 @@ void grSetVertexPositionState(_grVertex *v, int state);
 void grUpdateVertexPipeline(Gerbera_s *state);
 unsigned int grFetchWeightAndIndex(Gerbera_s *state, int *weights, int vertexIndex);
 void grTransformVertex(Gerbera_s *state, _grVertex *vertex);
+void grTransformVertexPreloaded(Gerbera_s *state, _grVertex *vertex, int weightsPreloaded);
 unsigned int grComputeVertexClipCodes(Gerbera_s *state, _grVertex *vertex);
 int  grIsOutsideUserClipPlane(_IFVector4 *plane, _IVector4 *clipPos);
 
@@ -1208,6 +1234,7 @@ void grCompressSignature(_grCacheSignature *compressed,
                          _grSignature *uncompressed);
 void grEvaluatePixelPipeline(Gerbera_s *state, _grSignature *signature);
 void grEnsureValidPixelPipeline(Gerbera_s *state);
+unsigned int grGetPixelTextureLayout(const Gerbera_s *state);
 void grCheckPixelPipeConsistency(Gerbera_s *state);
 void grCheckPixelPipeStack(Gerbera_s *state);
 void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
@@ -1220,6 +1247,9 @@ void grRenderArrays(Gerbera_s *state, int primitiveType, int vertexCount, int ba
 void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
                      int reference);
 void grComputeDeltas(_grGradientInfo *info, int gradient, int g01, int g02);
+int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
+                                    int flatShadeIndex, unsigned int gradientMask,
+                                    int rejectDepth);
 void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
                               int flatShadeIndex, unsigned int gradientMask);
 void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*pairs)[2],
@@ -1234,6 +1264,7 @@ int grIsDepthOffsetEnabled(Gerbera_s *state, int primitiveType);
 
 /* --- grScanConvert.inl: scan conversion -------------------------------------- */
 int grDivsu(int a, int b);
+int grDivideEdgeSlope(Gerbera_s *state, int numerator, int denominator);
 void grScanConvertWithXScissoring(_grEdgePair *edgePairs,
                                   unsigned int *scanlineInfo,
                                   _grRect *scissor, int topHeight,
@@ -1248,6 +1279,7 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
 /* --- grSmall.c / grPixelPipeline.h: triangle fill ---------------------------- */
 void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                            unsigned int origIndices, int emptyBits);
+int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess);
 void grExecutePixelPipeline(Gerbera_s *state);
 void grICacheFlush(void *start, unsigned int numBytes);
 int grIsStencilMaskFull(Gerbera_s *state, unsigned int stencilMask);
@@ -1443,6 +1475,8 @@ enum GR_SURFACEOP_e
 
 int  grLockSurface(int op);         /* returns 1 when the heap was locked */
 int  grReleaseSurface(int op);
+int  grLockSurfaceState(void *tlsState, int op);
+int  grReleaseSurfaceState(void *tlsState, int op);
 /* hc-module entry points */
 void *grGetBackend(void);
 int  HC_extraStackSpace(void *backend);

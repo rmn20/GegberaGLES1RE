@@ -321,6 +321,17 @@ void ITCTransform_mulfv4(int *pO, _ITCTransform *pT, int *strq)
 /* --- ITCTransform_mulfv (decompile 55065-55097; asserts IMatrix4.c
  * 1101..1105) - converts float components to IScalars first ------------- */
 
+/* The unit coefficient's high product is mantissa >> 3. Keep the
+ * clamped shifts so large coordinates retain the transform's wrapping. */
+static int texCoordUnitFloat(int value)
+{
+    int scalar = IScalar_iftos(value);
+    int mantissa = IScalar_getMantissa(scalar) >> 3;
+    int shift = (int)IScalar_getExponent(scalar) - 132;
+    return (int)((unsigned int)mantissa << hgClamp32_0_x(shift, 31)) >>
+        hgClamp32_0_x(-shift, 31);
+}
+
 void ITCTransform_mulfv(int *pO, _ITCTransform *pT, int *strq, int n)
 {
     int str1[4];
@@ -333,6 +344,14 @@ void ITCTransform_mulfv(int *pO, _ITCTransform *pT, int *strq, int n)
         imAssert("strq", "IMatrix4.c", 1104);
     if (!(n >= 2 && n <= 4))
         imAssert("n >= 2 && n <= 4", "IMatrix4.c", 1105);
+    if (n == 2 && (unsigned int)pT->cl == 0x80200802u)
+    {
+        int s = texCoordUnitFloat(strq[0]);
+        int t = texCoordUnitFloat(strq[1]);
+        pO[0] = s;
+        pO[1] = t;
+        return;
+    }
     str1[0] = IScalar_iftos(strq[0]);
     str1[1] = IScalar_iftos(strq[1]);
     if (n == 2)

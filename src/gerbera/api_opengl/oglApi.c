@@ -1015,7 +1015,8 @@ GL_API void GL_APIENTRY glDepthRangex(GLclampx zNear, GLclampx zFar)
 
 GL_API void GL_APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    oglContext_s *context = oglGetContext();
+    eglState_s *tlsState = NULL;
+    oglContext_s *context = oglGetContextAndState(&tlsState);
     if (context != NULL)
     {
         if (width >= 0 && height >= 0)
@@ -1023,8 +1024,10 @@ GL_API void GL_APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei heig
             int x0, x1, y0, y1;
             int vp[4];
 
-            grLockSurface(GR_SURFACE_DRAW);
-            grReleaseSurface(GR_SURFACE_DRAW);
+            if (tlsState != NULL)
+                egliInvalidateWindowSurface(tlsState->currentDrawSurface);
+            grLockSurfaceState(tlsState, GR_SURFACE_DRAW);
+            grReleaseSurfaceState(tlsState, GR_SURFACE_DRAW);
             width = hgMin32(width, 2048);
             height = hgMin32(height, 2048);
             x0 = x;

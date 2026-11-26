@@ -1069,6 +1069,10 @@ void IVertexTransform_copy(_IVertexTransform *pD, _IMatrix4x4 *pM)
     }
 }
 
+/* Inlining exposes the implicit W=1 in short-position transforms. */
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && __ARM_ARCH >= 6
+extern inline __attribute__((always_inline))
+#endif
 void IVertexTransform_mulxv4(_IVector4 *pD, _IVertexTransform *pT, int *pB)
 {
     HGint64 acc[4];
@@ -1407,11 +1411,86 @@ void IVertexTransform_mulfv4s(_IFVector4 *pD, _IVertexTransform *pT, _IFVector4 
         imAssert("IScalar_isValid(IFVector4_getf(pD,3))", "IMatrix4.c", 2757);
 }
 
-/* --- IVertexTransform_mulfv4 (decompile 55585-55693) ------------------------
- * _IVector4-out float transform: fast path for the identity-classified
- * record renormalizes the input to a shared exponent; otherwise rows are
- * dp4l'd and the result renormalized into an _IVector4. */
+/* The transform class marks a row containing only +1 on its diagonal.
+ * Check the stored row as well: even a zero product with a nonzero row
+ * exponent can change the reference dot product's maxE and rounding. */
+static inline HGint64 vertexTransformDotRow(_IVertexTransform *t, _IFVector4 *s, int row)
+{
+    unsigned int shift = 8u * (unsigned int)row;
+    _IFVector4 *a = &t->v[row];
+    if (((t->cl >> shift) & 0xFFu) == (2u << (2 * row)) && a->e == (127u << shift) &&
+        a->m[row] == 0x40000000 &&
+        (a->m[(row + 1) & 3] | a->m[(row + 2) & 3] | a->m[(row + 3) & 3]) == 0)
+    {
+        int m = s->m[row] >> 2; /* high half of 0x40000000 * s->m[row] */
+        int e = (int)((s->e >> shift) & 0xFFu);
+        return hgSet64(m, (m == 0 || e == 0) ? 0 : e + 127);
+    }
+    return IFVector4_dp4l_fast(a, s);
+}
 
+void IVertexTransform_prepareFloat(_IFVertexTransformPlan *plan, _IVertexTransform *t, unsigned int exponent)
+{
+    int b0 = exponent & 255u, b1 = (exponent >> 8) & 255u;
+    int b2 = (exponent >> 16) & 255u, b3 = exponent >> 24;
+    int row;
+    plan->inputExponent = exponent;
+    for (row = 0; row < 4; ++row)
+    {
+        unsigned int a = t->v[row].e;
+        int e0 = a & 255u, e1 = (a >> 8) & 255u;
+        int e2 = (a >> 16) & 255u, e3 = a >> 24;
+        int maximum;
+        e0 = e0 && b0 ? e0 + b0 : 0;
+        e1 = e1 && b1 ? e1 + b1 : 0;
+        e2 = e2 && b2 ? e2 + b2 : 0;
+        e3 = e3 && b3 ? e3 + b3 : 0;
+        maximum = hgMax32(hgMax32(e0, e1), hgMax32(e2, e3));
+        plan->shift[row] = (unsigned int)hgMin32(maximum - e0, 31) |
+                          ((unsigned int)hgMin32(maximum - e1, 31) << 8) |
+                          ((unsigned int)hgMin32(maximum - e2, 31) << 16) |
+                          ((unsigned int)hgMin32(maximum - e3, 31) << 24);
+        plan->exponent[row] = maximum;
+    }
+}
+
+static void vertexTransformNormalize(_IVector4 *pD, int *e, int *m)
+{
+    unsigned int maxE, probe = 0;
+    int c;
+    maxE = (unsigned int)e[0];
+    for (c = 1; c < 4; ++c)
+        if (maxE < (unsigned int)e[c])
+            maxE = (unsigned int)e[c];
+    for (c = 0; c < 4; ++c)
+        probe |= (unsigned int)hgAbs32(m[c]) >> hgMin32((int)(maxE - (unsigned int)e[c]), 31);
+    if (probe != 0)
+    {
+        int clz = hgClz32(probe) - 2;
+        int newExp = (int)maxE + 2 - (clz + 127);
+
+        if (newExp > 0)
+        {
+            int sh, mm;
+
+            for (c = 0; c < 4; ++c)
+            {
+                sh = clz - ((int)maxE - e[c]);
+                if (sh >= 0)
+                    mm = (int)((unsigned int)m[c] << sh);
+                else
+                    mm = m[c];
+                mm >>= hgClamp32_0_x(-sh, 31);
+                m[c] = mm;
+            }
+            IVector4_set(pD, (unsigned int)newExp, m[0], m[1], m[2], m[3]);
+            return;
+        }
+    }
+    IVector4_zero(pD);
+}
+
+/* Combine independently aligned dot products into a shared-exponent vector. */
 void IVertexTransform_mulfv4(_IVector4 *pD, _IVertexTransform *pT, _IFVector4 *pS)
 {
     if (pT->cl == 0x80200802u)
@@ -1435,61 +1514,134 @@ void IVertexTransform_mulfv4(_IVector4 *pD, _IVertexTransform *pT, _IFVector4 *p
     {
         HGint64 t;
         int e[4], m[4];
-        unsigned int maxE;
-        unsigned int probe = 0;
-        int c;
 
-        t = IFVector4_dp4l_fast(&pT->v[0], pS);
-        e[0] = hgGet64l(t);
-        m[0] = hgGet64h(t);
-        t = IFVector4_dp4l_fast(&pT->v[1], pS);
-        e[1] = hgGet64l(t);
-        m[1] = hgGet64h(t);
-        t = IFVector4_dp4l_fast(&pT->v[2], pS);
-        e[2] = hgGet64l(t);
-        m[2] = hgGet64h(t);
         if ((pT->cl & 0xFF000000u) == 0x80000000u)
         {
-            int w = IFVector4_getf(pS, 3);
-
+            int w;
+            t = vertexTransformDotRow(pT, pS, 0);
+            e[0] = hgGet64l(t);
+            m[0] = hgGet64h(t);
+            t = vertexTransformDotRow(pT, pS, 1);
+            e[1] = hgGet64l(t);
+            m[1] = hgGet64h(t);
+            t = vertexTransformDotRow(pT, pS, 2);
+            e[2] = hgGet64l(t);
+            m[2] = hgGet64h(t);
+            w = IFVector4_getf(pS, 3);
             e[3] = IScalar_getExponent(w) + 125;
             m[3] = IScalar_getMantissa(w);
         }
         else
         {
+            t = IFVector4_dp4l_fast(&pT->v[0], pS);
+            e[0] = hgGet64l(t);
+            m[0] = hgGet64h(t);
+            t = IFVector4_dp4l_fast(&pT->v[1], pS);
+            e[1] = hgGet64l(t);
+            m[1] = hgGet64h(t);
+            t = IFVector4_dp4l_fast(&pT->v[2], pS);
+            e[2] = hgGet64l(t);
+            m[2] = hgGet64h(t);
             t = IFVector4_dp4l_fast(&pT->v[3], pS);
             e[3] = hgGet64l(t);
             m[3] = hgGet64h(t);
         }
-        maxE = (unsigned int)e[0];
-        for (c = 1; c < 4; ++c)
-            if (maxE < (unsigned int)e[c])
-                maxE = (unsigned int)e[c];
-        for (c = 0; c < 4; ++c)
-            probe |= (unsigned int)hgAbs32(m[c]) >> hgMin32((int)(maxE - (unsigned int)e[c]), 31);
-        if (probe != 0)
-        {
-            int clz = hgClz32(probe) - 2;
-            int newExp = (int)maxE + 2 - (clz + 127);
-
-            if (newExp > 0)
-            {
-                int sh, mm;
-
-                for (c = 0; c < 4; ++c)
-                {
-                    sh = clz - ((int)maxE - e[c]);
-                    if (sh >= 0)
-                        mm = (int)((unsigned int)m[c] << sh);
-                    else
-                        mm = m[c];
-                    mm >>= hgClamp32_0_x(-sh, 31);
-                    m[c] = mm;
-                }
-                IVector4_set(pD, (unsigned int)newExp, m[0], m[1], m[2], m[3]);
-                return;
-            }
-        }
-        IVector4_zero(pD);
+        vertexTransformNormalize(pD, e, m);
     }
+}
+
+void IVertexTransform_mulfv4Prepared(_IVector4 *pD, _IVertexTransform *pT, _IFVector4 *pS,
+                                    const _IFVertexTransformPlan *plan)
+{
+    int e[4], m[4];
+    int c;
+    int rows = (pT->cl & 0xFF000000u) == 0x80000000u ? 3 : 4;
+
+    if (pT->cl == 0x80200802u)
+    {
+        IVertexTransform_mulfv4(pD, pT, pS);
+        return;
+    }
+    for (c = 0; c < rows; ++c)
+    {
+        unsigned int shifts = plan->shift[c];
+        _IFVector4 *a = &pT->v[c];
+        int v = hgMul64h(a->m[0], pS->m[0]) >> (shifts & 255u);
+        v += hgMul64h(a->m[1], pS->m[1]) >> ((shifts >> 8) & 255u);
+        v += hgMul64h(a->m[2], pS->m[2]) >> ((shifts >> 16) & 255u);
+        v += hgMul64h(a->m[3], pS->m[3]) >> (shifts >> 24);
+        m[c] = v;
+        e[c] = v ? plan->exponent[c] : 0;
+    }
+    if (rows == 3)
+    {
+        int w = IFVector4_getf(pS, 3);
+        e[3] = IScalar_getExponent(w) + 125;
+        m[3] = IScalar_getMantissa(w);
+    }
+    vertexTransformNormalize(pD, e, m);
+}
+void IVertexTransform_prepareCommon(_ICommonVertexTransform *plan, const _IVertexTransform *t)
+{
+    int row, col, maximum = t->exp - 16;
+    plan->exponent = maximum;
+    plan->eligible = t->cl != 0x80200802u;
+    for (row = 0; row < 4; ++row)
+        for (col = 0; col < 4; ++col)
+        {
+            int e = (t->v[row].e >> (col * 8)) & 255;
+            int shift = maximum - e + 1;
+            if (t->v[row].m[col] && shift > IM_COMMON_TRANSFORM_SPREAD + 1)
+                plan->eligible = 0;
+            plan->m[row][col] = t->v[row].m[col] >> hgMin32(shift, 31);
+        }
+}
+
+/* For positions decoded by IFVector4_setfv, each accumulated unit represents
+ * 2^(matrixExponent + inputExponent - 280).
+ * Aligning operands and truncating the sum differs from the precise transform
+ * by less than eight units per component. With |x/y| <= 4W and W >= 2^17,
+ * projected XY error is bounded by 40/(W-8), below 0.049 pixels at width 320.
+ * The 32-unit margins preserve canonical and fourfold-guardband clip signs. */
+int IVertexTransform_mulfv4Common(_IVector4 *out, const _ICommonVertexTransform *plan, const _IFVector4 *in)
+{
+    int e0 = in->e & 255, e1 = (in->e >> 8) & 255;
+    int e2 = (in->e >> 16) & 255, e3 = in->e >> 24;
+    int maximum = hgMax32(hgMax32(e0, e1), hgMax32(e2, e3));
+    int x, y, z, w, m[4], row, shift, exponent;
+    unsigned int probe;
+    if (!plan->eligible ||
+        (in->m[0] && maximum - e0 > IM_COMMON_TRANSFORM_SPREAD) ||
+        (in->m[1] && maximum - e1 > IM_COMMON_TRANSFORM_SPREAD) ||
+        (in->m[2] && maximum - e2 > IM_COMMON_TRANSFORM_SPREAD) ||
+        (in->m[3] && maximum - e3 > IM_COMMON_TRANSFORM_SPREAD))
+        return 0;
+    x = in->m[0] >> hgMin32(maximum - e0, 31);
+    y = in->m[1] >> hgMin32(maximum - e1, 31);
+    z = in->m[2] >> hgMin32(maximum - e2, 31);
+    w = in->m[3] >> hgMin32(maximum - e3, 31);
+    for (row = 0; row < 4; ++row)
+    {
+        const int *q = plan->m[row];
+        /* Four products of magnitudes below 2^30 fit in signed 64 bits. */
+        HGint64 sum = (HGint64)q[0] * x + (HGint64)q[1] * y +
+                      (HGint64)q[2] * z + (HGint64)q[3] * w;
+        m[row] = (int)(sum >> 32);
+    }
+    probe = (unsigned int)(hgAbs32(m[0]) | hgAbs32(m[1]) | hgAbs32(m[2]) | hgAbs32(m[3]));
+    if (m[3] < IM_COMMON_TRANSFORM_MIN_W ||
+        (hgAbs32(m[0]) >> 2) >= m[3] - IM_COMMON_TRANSFORM_CLIP_MARGIN ||
+        (hgAbs32(m[1]) >> 2) >= m[3] - IM_COMMON_TRANSFORM_CLIP_MARGIN ||
+        (unsigned int)(hgAbs32(m[0]) - m[3] + IM_COMMON_TRANSFORM_CLIP_MARGIN) < 2 * IM_COMMON_TRANSFORM_CLIP_MARGIN ||
+        (unsigned int)(hgAbs32(m[1]) - m[3] + IM_COMMON_TRANSFORM_CLIP_MARGIN) < 2 * IM_COMMON_TRANSFORM_CLIP_MARGIN ||
+        (unsigned int)(hgAbs32(m[2]) - m[3] + IM_COMMON_TRANSFORM_CLIP_MARGIN) < 2 * IM_COMMON_TRANSFORM_CLIP_MARGIN)
+        return 0;
+    shift = hgClz32(probe) - 2;
+    exponent = plan->exponent + maximum - 124 - shift;
+    if ((unsigned int)(exponent - 2) >= 252)
+        return 0;
+    out->e = (unsigned int)exponent;
+    for (row = 0; row < 4; ++row)
+        out->m[row] = (int)((unsigned int)m[row] << shift);
+    return 1;
 }

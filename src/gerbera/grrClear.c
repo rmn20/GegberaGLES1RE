@@ -54,10 +54,10 @@ void grFlushBufferClears(Gerbera_s *state)
     GR_GRR_CHECK(hgInRange32(state->clearInfoIndex, 0, GR_CLEAR_BUFFER_SIZE), "grApiFast.inl", 34);
     if (state->clearInfoIndex != 0)
     {
-        grLockSurface(GR_SURFACE_DRAW);
+        grrBeginRendering(state);
         for (i = 0; i < state->clearInfoIndex; ++i)
             grrClearBuffers(&state->drawSurface, &state->clearInfos[i]);
-        grReleaseSurface(GR_SURFACE_DRAW);
+        grrEndRendering(state);
         state->clearInfoIndex = 0;
     }
     GR_GRR_CHECK(state->clearInfoIndex == 0, "grApiFast.inl", 48);

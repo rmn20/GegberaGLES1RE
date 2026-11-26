@@ -31,6 +31,8 @@ static unsigned int oldPixels[16 * 16], newPixels[16 * 16];
 static oglSurfaceDescriptor installedDraw, installedRead;
 static int updates;
 static int resizeFails;
+static int tlsCalls;
+static int windowQueries, bitmapAddresses, displayModeQueries, strideQueries;
 
 typedef struct MockHeapVtable_s {
     void *(*alloc)(void *, int);
@@ -65,11 +67,12 @@ static void mock_free(void *ptr, void *allocation)
 
 static const MockHeapVtable heapVtable = { mock_alloc, mock_free };
 
-void *sym_DllTls(void) { return &state; }
+void *sym_DllTls(void) { ++tlsCalls; return &state; }
 int sym_DllSetTls(void *ptr) { (void)ptr; return 0; }
 
 void sym_RWindowBase_Size(SymTSize *size, const void *window)
 {
+    ++windowQueries;
     *size = *(const SymTSize *)window;
 }
 
@@ -105,18 +108,21 @@ void sym_CFbsBitmap_UnlockHeap(const void *bitmap, int always)
 
 void *sym_CFbsBitmap_DataAddress(const void *bitmap)
 {
+    ++bitmapAddresses;
     CHECK(((const MockBitmap *)bitmap)->locks == 1);
     return ((const MockBitmap *)bitmap)->data;
 }
 
 int sym_CFbsBitmap_DisplayMode(const void *bitmap)
 {
+    ++displayModeQueries;
     (void)bitmap;
     return EGL_SYMBIAN_ECOLOR16MA;
 }
 
 int sym_CFbsBitmap_ScanLineLength(int width, int mode)
 {
+    ++strideQueries;
     CHECK(mode == EGL_SYMBIAN_ECOLOR16MA);
     return width * 4;
 }
@@ -233,11 +239,38 @@ int main(void)
     check_locked_target(&window.surface, &bitmap, GR_SURFACE_DRAW, 16);
     CHECK(bitmap.resizes == 1);
     check_locked_target(&window.surface, &bitmap, GR_SURFACE_DRAW, 32);
+    CHECK(window.sizeValidated && window.ownWindow == 0);
+    {
+        int queries = windowQueries, addresses = bitmapAddresses;
+        int modes = displayModeQueries, strides = strideQueries, before = updates, i;
+        for (i = 0; i < 8; ++i)
+        {
+            CHECK(grLockSurfaceState(&state, GR_SURFACE_DRAW) == 1);
+            CHECK(grReleaseSurfaceState(&state, GR_SURFACE_DRAW) == 1);
+        }
+        CHECK(windowQueries == queries && bitmapAddresses == addresses + 8);
+        CHECK(displayModeQueries == modes && strideQueries == strides);
+        CHECK(updates == before && bitmap.locks == 0);
+        bitmap.data = oldPixels;
+        CHECK(grLockSurfaceState(&state, GR_SURFACE_DRAW) == 1);
+        CHECK(window.surface.colorBuffer == oldPixels && installedDraw.colorBuffer == oldPixels);
+        CHECK(grReleaseSurfaceState(&state, GR_SURFACE_DRAW) == 1);
+        CHECK(updates == before + 1 && window.ownWindow == 0);
+        bitmap.data = newPixels;
+        check_locked_target(&window.surface, &bitmap, GR_SURFACE_DRAW, 32);
+        egliInvalidateWindowSurface(&window.surface);
+        CHECK(!window.sizeValidated);
+        queries = windowQueries;
+        CHECK(grLockSurfaceState(&state, GR_SURFACE_DRAW) == 1);
+        CHECK(grReleaseSurfaceState(&state, GR_SURFACE_DRAW) == 1);
+        CHECK(windowQueries == queries + 1 && window.sizeValidated);
+    }
 
     /* The native resize notification itself only refreshes dimensions. */
     windowSize.iWidth = 12;
     CHECK(egliSurfaceResized(&window.surface) == 1);
     CHECK(window.surface.width == 12 && window.surface.height == 6);
+    CHECK(!window.sizeValidated);
     CHECK(window.surface.colorBuffer == newPixels);
     CHECK(window.surface.colorBufferStride == 32);
     CHECK(bitmap.resizes == 1 && bitmap.size.iWidth == 8);
@@ -268,6 +301,17 @@ int main(void)
     check_locked_target(&pixmap.surface, &bitmap, GR_SURFACE_READ, 16);
     check_locked_target(&pixmap.surface, &bitmap, GR_SURFACE_READ, 32);
     CHECK(bitmap.resizes == 1);
+
+    {
+        int before = tlsCalls;
+        CHECK(grLockSurfaceState(&state, GR_SURFACE_READ) == 1);
+        CHECK(bitmap.locks == 1);
+        CHECK(grReleaseSurfaceState(&state, GR_SURFACE_READ) == 1);
+        CHECK(bitmap.locks == 0);
+        CHECK(tlsCalls == before);
+        CHECK(grLockSurfaceState(NULL, GR_SURFACE_DRAW) == 0);
+        CHECK(grReleaseSurfaceState(NULL, GR_SURFACE_DRAW) == 0);
+    }
 
     test_buffer_allocation_failure();
 

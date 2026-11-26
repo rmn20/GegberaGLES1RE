@@ -1611,8 +1611,331 @@ static void test_gl_viewport_resize(void)
     CHECK(eglTerminate(display) == EGL_TRUE);
 }
 
+static void test_gl_white_modulate_and_skinning(void)
+{
+    oglContext_s *ctx;
+    RGBA8SurfaceFixture surf;
+    unsigned char px[4];
+    GLuint tex[2];
+    GLint envMode = 0;
+    const GLfloat quadVerts[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+    const GLfloat quadUV[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+    const GLubyte nonWhiteColors[] = {
+        128, 255, 255, 255,  128, 255, 255, 255,
+        128, 255, 255, 255,  128, 255, 255, 255
+    };
+    const unsigned char rgbaTexel[4] = { 200, 100, 50, 128 };
+    const unsigned char lumTexel[1] = { 180 };
+    void *replaceCode, *whiteModCode, *tintedModCode;
+    unsigned int replaceGrads, whiteModGrads;
+
+    ctx = oglCreateContext(NULL, NULL);
+    init_rgba8_surface(&surf, 8, 8);
+    oglSetBuffers(ctx, &surf.descriptor, &surf.descriptor);
+    egliSetCurrentContext(ctx);
+    glViewport(0, 0, 8, 8);
+    glDisable(GL_DITHER);
+
+    glGenTextures(2, tex);
+    glBindTexture(GL_TEXTURE_2D, tex[0]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgbaTexel);
+
+    glEnable(GL_TEXTURE_2D);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, quadVerts);
+    glTexCoordPointer(2, GL_FLOAT, 0, quadUV);
+
+    /* Explicit GL_REPLACE baseline. */
+    glColor4ub(255, 255, 255, 255);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    replaceCode = (void *)ctx->gerbera->pixelPipelineCode;
+    replaceGrads = ctx->gerbera->activeGradientMask;
+    glReadPixels(3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK(px[0] == 200 && px[1] == 100 && px[2] == 50 && px[3] == 128);
+
+    /* Constant white GL_MODULATE reuses the exact GL_REPLACE pipeline
+     *    while keeping GL_TEXTURE_ENV_MODE observable as GL_MODULATE. */
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &envMode);
+    CHECK(envMode == GL_MODULATE);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    whiteModCode = (void *)ctx->gerbera->pixelPipelineCode;
+    whiteModGrads = ctx->gerbera->activeGradientMask;
+    CHECK(ctx->gerbera->constWhiteModulate == 1);
+    CHECK(whiteModCode == replaceCode && whiteModGrads == replaceGrads);
+    glReadPixels(3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK(px[0] == 200 && px[1] == 100 && px[2] == 50 && px[3] == 128);
+
+    /* Non-white constant color uses MODULATE. */
+    glColor4ub(128, 255, 255, 64);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    tintedModCode = (void *)ctx->gerbera->pixelPipelineCode;
+    CHECK(ctx->gerbera->constWhiteModulate == 0);
+    CHECK(tintedModCode != replaceCode);
+    glReadPixels(3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK(px[0] >= 99 && px[0] <= 102 && px[1] == 100 && px[2] == 50 && px[3] >= 31 && px[3] <= 33);
+
+    /* White modulation also supports GL_LUMINANCE
+     *    (where Cf = Lt, Af = Ap = 1.0 matches GL_REPLACE) and glDrawTexiOES. */
+    glColor4ub(255, 255, 255, 255);
+    glBindTexture(GL_TEXTURE_2D, tex[1]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 1, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, lumTexel);
+    {
+        GLint crop[4] = { 0, 0, 1, 1 };
+        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_CROP_RECT_OES, crop);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawTexiOES(0, 0, 0, 8, 8);
+        CHECK(ctx->gerbera->constWhiteModulate == 1);
+        glReadPixels(3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        CHECK(px[0] == 180 && px[1] == 180 && px[2] == 180 && px[3] == 255);
+    }
+
+    /* Enabling GL_COLOR_ARRAY disables constWhiteModulate. */
+    glBindTexture(GL_TEXTURE_2D, tex[0]);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glColorPointer(4, GL_UNSIGNED_BYTE, 0, nonWhiteColors);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    CHECK(ctx->gerbera->constWhiteModulate == 0);
+    glReadPixels(3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK(px[0] >= 99 && px[0] <= 102 && px[1] == 100);
+    glDisableClientState(GL_COLOR_ARRAY);
+
+    /* Indexed GL_MATRIX_PALETTE_OES skinning exercises grTransformVertexPreloaded
+     *    across both cache misses and shared-vertex cache hits. */
+    glDisable(GL_TEXTURE_2D);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    {
+        const GLfloat skinVerts[] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f };
+        const GLfloat weights[] = { 0.5f, 0.5f,  0.5f, 0.5f,  0.5f, 0.5f,  0.5f, 0.5f };
+        const GLubyte indices[] = { 0, 1,  0, 1,  0, 1,  0, 1 };
+        const GLubyte elemIdx[] = { 0, 1, 2, 2, 1, 3 };
+        glEnable(GL_MATRIX_PALETTE_OES);
+        glMatrixMode(GL_MATRIX_PALETTE_OES);
+        glCurrentPaletteMatrixOES(0);
+        glLoadIdentity();
+        glTranslatef(-0.5f, 0.0f, 0.0f);
+        glCurrentPaletteMatrixOES(1);
+        glLoadIdentity();
+        glTranslatef(0.5f, 0.0f, 0.0f);
+        glMatrixMode(GL_MODELVIEW);
+        glEnableClientState(GL_WEIGHT_ARRAY_OES);
+        glEnableClientState(GL_MATRIX_INDEX_ARRAY_OES);
+        glVertexPointer(2, GL_FLOAT, 0, skinVerts);
+        glWeightPointerOES(2, GL_FLOAT, 0, weights);
+        glMatrixIndexPointerOES(2, GL_UNSIGNED_BYTE, 0, indices);
+        glColor4ub(0, 220, 110, 255);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, elemIdx);
+        CHECK_RGB_AT(4, 4, 0, 220, 110);
+        CHECK_RGB_AT(0, 0, 0, 0, 0);
+        glDisableClientState(GL_WEIGHT_ARRAY_OES);
+        glDisableClientState(GL_MATRIX_INDEX_ARRAY_OES);
+        glDisable(GL_MATRIX_PALETTE_OES);
+    }
+
+    glDeleteTextures(2, tex);
+    CHECK(glGetError() == GL_NO_ERROR);
+    egliSetCurrentContext(NULL);
+    oglDestroyContext(ctx);
+}
+
+static void test_gl_texture_layout_specialization(void)
+{
+#if GERBERA_ARMV6_JIT
+    static const struct { int w, h, s, t, filter; } cases[] = {
+        {1, 1, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST},
+        {2, 2, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST},
+        {1, 4, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST},
+        {4, 1, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST},
+        {1, 4, GR_WRAPMODE_MIRRORED_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST},
+        {1, 4, GR_WRAPMODE_REPEAT, GR_WRAPMODE_MIRRORED_REPEAT, GL_NEAREST},
+        {1, 4, GR_WRAPMODE_CLAMP_TO_EDGE, GR_WRAPMODE_REPEAT, GL_NEAREST},
+        {1, 1, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST_MIPMAP_NEAREST},
+        {4, 4, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_LINEAR},
+        {1, 1, GR_WRAPMODE_REPEAT, GR_WRAPMODE_REPEAT, GL_NEAREST}
+    };
+    const GLfloat vertices[] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    const GLfloat coords[] = {-2, -2, 3, -2, -2, 3, 3, 3};
+    unsigned char texels[4 * 4 * 4], seen[128] = {0};
+    RGBA8SurfaceFixture surface;
+    oglContext_s *ctx = oglCreateContext(NULL, NULL);
+    Gerbera_s *state;
+    _grTexture *texture;
+    void *firstCode = NULL, *secondCode = NULL, *previousCode = NULL;
+    unsigned int previousLayout = 0;
+    GLuint names[2];
+    unsigned int i;
+    int w, h;
+
+    CHECK(ctx != NULL);
+    if (ctx == NULL) return;
+    state = ctx->gerbera;
+    bind_rgba8_surface(ctx, &surface, 8, 8);
+    glViewport(0, 0, 8, 8);
+    glDisable(GL_DITHER);
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, vertices);
+    glTexCoordPointer(2, GL_FLOAT, 0, coords);
+    glGenTextures(2, names);
+    glBindTexture(GL_TEXTURE_2D, names[0]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    for (i = 0; i < sizeof(texels); i += 4)
+    {
+        texels[i] = 32; texels[i + 1] = 96; texels[i + 2] = 160; texels[i + 3] = 255;
+    }
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    {
+        unsigned int layout;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, cases[i].filter);
+        grSetTextureWrapMode(state->textureUnit[0].texture, GR_TEXCOORD_S, cases[i].s);
+        grSetTextureWrapMode(state->textureUnit[0].texture, GR_TEXCOORD_T, cases[i].t);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cases[i].w, cases[i].h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, texels);
+        texture = state->textureUnit[0].texture;
+        if (i != 0 && grGetPixelTextureLayout(state) != state->pixelTextureLayout)
+        {
+            /* A shared context may consume the texture's dirty bit. */
+            grUpdateTexture(texture);
+            state->pixelPipelineDirty = 0;
+        }
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        layout = grGetPixelTextureLayout(state);
+        CHECK(state->pixelTextureLayout == layout);
+        CHECK((layout != 0) == (cases[i].filter == GL_NEAREST && cases[i].s != GR_WRAPMODE_CLAMP_TO_EDGE));
+        if (i != 0 && layout != previousLayout)
+            CHECK((void *)state->pixelPipelineCode != previousCode);
+        if (i == 0) firstCode = (void *)state->pixelPipelineCode;
+        if (i == 1) secondCode = (void *)state->pixelPipelineCode;
+        previousCode = (void *)state->pixelPipelineCode;
+        previousLayout = layout;
+        CHECK_RGB_AT(3, 3, 32, 96, 160);
+        CHECK(glGetError() == GL_NO_ERROR);
+    }
+    CHECK((void *)state->pixelPipelineCode == firstCode);
+    texture = state->textureUnit[0].texture;
+    for (w = 0; w <= 10; ++w)
+        for (h = 0; h <= 10; ++h)
+        {
+            unsigned int key;
+            texture->mipmap[0].log2Dim[0] = w;
+            texture->mipmap[0].log2Dim[1] = h;
+            key = grGetPixelTextureLayout(state);
+            CHECK(key > 0 && key < 128 && !seen[key]);
+            seen[key] = 1;
+        }
+    texture->mipmap[0].log2Dim[0] = 11;
+    CHECK(grGetPixelTextureLayout(state) == 0);
+    texture->mipmap[0].log2Dim[0] = texture->mipmap[0].log2Dim[1] = 0;
+    glBindTexture(GL_TEXTURE_2D, names[1]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    CHECK((void *)state->pixelPipelineCode == secondCode);
+    glBindTexture(GL_TEXTURE_2D, names[0]);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    CHECK((void *)state->pixelPipelineCode == firstCode);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, names[1]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    glEnable(GL_TEXTURE_2D);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    CHECK(state->pixelTextureLayout == 0);
+    glDisable(GL_TEXTURE_2D);
+    glActiveTexture(GL_TEXTURE0);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    CHECK((void *)state->pixelPipelineCode == firstCode);
+    glDeleteTextures(2, names);
+    CHECK(glGetError() == GL_NO_ERROR);
+    egliSetCurrentContext(NULL);
+    oglDestroyContext(ctx);
+#endif
+}
+
+static void test_gl_common_transform_clipping(void)
+{
+    oglContext_s *ctx = oglCreateContext(NULL, NULL);
+    RGBA8SurfaceFixture surface;
+    unsigned int expected[16 * 16];
+    static const unsigned short triangles[] = {0, 1, 2, 2, 1, 3, 0, 1, 2};
+    static const unsigned short lines[] = {0, 1, 2, 1, 1, 3};
+    static const unsigned char colors[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255},
+                                              {0, 0, 255, 255}, {255, 255, 255, 255}};
+    float vertices[4][4] = {{-.9f, -.8f, 0, 1}, {.9f, -.8f, 0, 1},
+                            {-.9f, .8f, 0, 1}, {.9f, .8f, 0, 1}};
+    float matrix[16] = {.713213f, 0, 0, 0, 0, .612197f, 0, 0,
+                        0, 0, 256.12345f, 0, 0, 0, 0, 1};
+    int plane, mode, i;
+    CHECK(ctx != NULL);
+    if (!ctx) return;
+    bind_rgba8_surface(ctx, &surface, 16, 16);
+    glViewport(0, 0, 16, 16);
+    glDisable(GL_DITHER);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(colors[0]), colors);
+    glVertexPointer(4, GL_FLOAT, sizeof(vertices[0]), vertices);
+    glColor4f(.7f, .3f, .9f, 1);
+    glClearColor(0, 0, 0, 0);
+    for (plane = 0; plane < 2; ++plane)
+        for (mode = 0; mode < 2; ++mode)
+        {
+            GLenum primitive = mode ? GL_LINES : GL_TRIANGLES;
+            const unsigned short *indices = mode ? lines : triangles;
+            int count = mode ? 6 : 9, fast = 0, colored = 0;
+            matrix[14] = (plane ? 1.000000119f : -1.000000119f) - matrix[10];
+            for (i = 0; i < 4; ++i)
+                vertices[i][2] = 1.0f + (i == 1 ? 0.0000013f : -0.0000017f) * (plane ? 1 : -1);
+            glLoadMatrixf(matrix);
+            glDrawElements(primitive, count, GL_UNSIGNED_SHORT, indices);
+            CHECK(ctx->gerbera->commonTransform.eligible);
+            for (i = 0; i < 4; ++i)
+            {
+                _IFVector4 input;
+                _IVector4 output;
+                int bits[4];
+                memcpy(bits, vertices[i], sizeof(bits));
+                IFVector4_setfv(&input, bits, 4);
+                fast += IVertexTransform_mulfv4Common(&output, &ctx->gerbera->commonTransform, &input);
+            }
+            CHECK(fast > 0);
+            ctx->gerbera->commonTransform.eligible = 0;
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawElements(primitive, count, GL_UNSIGNED_SHORT, indices);
+            memcpy(expected, surface.color, sizeof(expected));
+            for (i = 0; i < 16 * 16; ++i) colored += expected[i] != 0;
+            CHECK(colored > 0);
+            ctx->gerbera->commonTransform.eligible = 1;
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawElements(primitive, count, GL_UNSIGNED_SHORT, indices);
+            CHECK(memcmp(expected, surface.color, sizeof(expected)) == 0);
+            CHECK(glGetError() == GL_NO_ERROR);
+        }
+    egliSetCurrentContext(NULL);
+    oglDestroyContext(ctx);
+}
+
 int main(void)
 {
+    test_gl_common_transform_clipping();
+    test_gl_texture_layout_specialization();
+    test_gl_white_modulate_and_skinning();
     test_error_and_descriptor();
     test_matrix_stack();
     test_tex_manager();

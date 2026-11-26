@@ -107,6 +107,14 @@ static void test_64(void)
     CHECK_EQ(hgMul64(3, 4), 12);
     CHECK_EQ(hgMul64(-3, 4), -12);
     CHECK_EQ(hgMul64h(0x7FFFFFFF, 4), 1);  /* 0x1FFFFFFFC >> 32 */
+    /* Signed high products truncate downward; they must not round to nearest. */
+    CHECK_EQ(hgMul64h(0x7FFFFFFF, 2), 0);
+    CHECK_EQ(hgMul64h(-1, 1), -1);
+    CHECK_EQ(hgMul64h(-1, -1), 0);
+    CHECK_EQ(hgMul64h(-0x7FFFFFFF - 1, 1), -1);
+    CHECK_EQ(hgMul64h(0x7FFFFFFF, 0x7FFFFFFF), 0x3FFFFFFF);
+    CHECK_EQ(hgMul64h(-0x7FFFFFFF - 1, -0x7FFFFFFF - 1), 0x40000000);
+    CHECK_EQ(hgMul64h(-0x7FFFFFFF - 1, 0x7FFFFFFF), -0x40000000);
     CHECK_EQ(hgMulu64h(0xFFFFFFFFu, 2u), 1u);
     CHECK_EQ(hgMulu64h(0x80000000u, 2u), 1u);
     CHECK_EQ(hgMadd64(10, 3, 4), 22);

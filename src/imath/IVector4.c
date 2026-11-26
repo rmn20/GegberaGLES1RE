@@ -415,7 +415,11 @@ void IVector4_viewportTransform(int *pD, _IVector4 *pS, int *pScale, int *pOffse
         imAssert("hgInRange32(xyShift, 0, 31)", "imApi.inl", 0x56Du);
     if (pS->m[3] != 0)
     {
-        HGint64 rr = imRcpu((unsigned int)pS->m[3] + ((unsigned int)pS->m[3] >> 27));
+        unsigned int w = (unsigned int)pS->m[3];
+        /* Preserve the reciprocal estimator's bias and truncation for the
+         * common normalized affine W. This is not exact division by W. */
+        HGint64 rr = w == IUNITSCALAR_ONE
+            ? (HGint64)0x7fffffef00000002ULL : imRcpu(w + (w >> 27));
         unsigned int recip = (unsigned int)(rr >> 32);   /* high: mantissa */
         unsigned int rsh = (unsigned int)rr;             /* low: shift     */
         int sx, sy, sz;

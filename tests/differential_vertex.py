@@ -174,14 +174,20 @@ def check_stages(suite):
                 put(pool, 8, 64, 64)
                 put(pool, VERTEX_OFFSET, -1)
                 sequence = bytes((0, 1, 2, 3, 32, 33, 34, 35, 0, 32, 3, 1, INVALID_INDEX))
+            skew = 0
+            if operation == 9:  # unsigned byte color does not require word alignment
+                control[0] = (20, 4, 5)[case % 3]
+                skew = case % 4
+                data = b"\x5a" * skew + b"".join(data[i:i + control[0]] for i in range(0, len(data), 20))
             native_pool = host_buffer(bytes(pool))
-            adapter(operation, host_buffer(words(*control)), host_buffer(data), native_pool,
+            native_array = host_buffer(data)
+            adapter(operation, host_buffer(words(*control)), ctypes.byref(native_array, skew), native_pool,
                     host_buffer(sequence), native_transform)
             oracle = suite.oracle
             oracle.reset()
             original_pool = oracle.alloc(len(pool), bytes(pool))
             original_array = oracle.alloc(len(data), data)
-            state = state_bytes(suite, control, original_array, original_pool, original_transform)
+            state = state_bytes(suite, control, original_array + skew, original_pool, original_transform)
             state_pointer = oracle.alloc(len(state), bytes(state))
             oracle.watch(original_pool, len(pool), 'complete vertex buffer and cache')
             oracle.watch(original_array, len(data), 'input array')

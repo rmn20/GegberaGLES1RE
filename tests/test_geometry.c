@@ -128,6 +128,33 @@ static void test_transformed_user_clip_plane(void)
     }
 }
 
+static void test_identity_float_texcoords(void)
+{
+    static const unsigned int fractions[] = {0, 1, 0x3FFFFF, 0x7FFFFE, 0x7FFFFF};
+    _IMatrix4x4 matrix;
+    _ITCTransform transform;
+    unsigned int sign, exponent, fraction;
+
+    IMatrix4x4_identity(&matrix);
+    ITCTransform_copy(&transform, &matrix);
+    for (sign = 0; sign < 2; ++sign)
+        for (exponent = 0; exponent < 256; ++exponent)
+            for (fraction = 0; fraction < sizeof(fractions) / sizeof(fractions[0]); ++fraction)
+            {
+                int input[3], scalar[2], expected[2], actual[2];
+                input[0] = (int)((sign << 31) | (exponent << 23) | fractions[fraction]);
+                input[1] = (int)((unsigned int)input[0] ^ 0x80000000u);
+                scalar[0] = IScalar_iftos(input[0]);
+                scalar[1] = IScalar_iftos(input[1]);
+                ITCTransform_mulfv2(expected, &transform, scalar);
+                ITCTransform_mulfv(actual, &transform, input, 2);
+                CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+                /* Output may overlap the second input coordinate. */
+                ITCTransform_mulfv(input + 1, &transform, input, 2);
+                CHECK(memcmp(input + 1, expected, sizeof(expected)) == 0);
+            }
+}
+
 static void test_texture_transforms(void)
 {
     _IMatrix4x4 matrix;
@@ -269,14 +296,154 @@ static void test_signed_vertex_inputs(void)
     free(state.renderStack);
 }
 
+static void test_short3_transforms(void)
+{
+    static const float matrices[][16] = {
+        {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1},
+        {-2, 0, 0, 0, 0, .5f, 0, 0, 0, 0, 1.5f, 0, .5f, -.25f, 2, 1},
+        {1, .25f, .125f, .125f, -.5f, 1, -.25f, -.125f,
+         .25f, -.125f, 1, .25f, .5f, -.25f, .125f, 1},
+        {1.25f, 0, 0, 0, 0, 1.5f, 0, 0, 0, 0, -1.25f, -1, 0, 0, -2.25f, 0}
+    };
+    /* Two-byte alignment and an interleaved stride are legal for GL_SHORT. */
+    short positions[][4] = {{7, -32768, -1, 32767}, {7, 0, 0, 0},
+                            {7, -2, 3, -4}, {7, 1, -1, 1}, {7, 32767, -32768, -32768}};
+    int fixed[5][3];
+    Gerbera_s state;
+    unsigned int i, j, k;
+
+    memset(&state, 0, sizeof(state));
+    state.vertexArray[0].size = 3;
+    for (i = 0; i < 5; ++i)
+        for (j = 0; j < 3; ++j)
+            fixed[i][j] = (int)positions[i][j + 1] * 65536;
+    for (k = 0; k < sizeof(matrices) / sizeof(matrices[0]); ++k)
+    {
+        _IMatrix4x4 matrix;
+        int bits[16];
+        memcpy(bits, matrices[k], sizeof(bits));
+        IMatrix4x4_setfv(&matrix, bits);
+        IVertexTransform_copy(&state.objectToClipTransform, &matrix);
+        for (i = 0; i < 5; ++i)
+        {
+            _grVertex shortVertex, fixedVertex;
+            memset(&shortVertex, 0xA5, sizeof(shortVertex));
+            shortVertex.index = (int)i;
+            shortVertex.stateMask = 0;
+            fixedVertex = shortVertex;
+            state.vertexArray[0].type = GR_DATATYPE_INT16;
+            state.vertexArray[0].stride = sizeof(positions[0]);
+            state.vertexArray[0].data = &positions[0][1];
+            grTransformVertex(&state, &shortVertex);
+            state.vertexArray[0].type = GR_DATATYPE_FIXED;
+            state.vertexArray[0].stride = sizeof(fixed[0]);
+            state.vertexArray[0].data = fixed;
+            grTransformVertex(&state, &fixedVertex);
+            CHECK(memcmp(&shortVertex, &fixedVertex, sizeof(shortVertex)) == 0);
+        }
+    }
+}
+
+static void test_float_transform_cache(void)
+{
+    Gerbera_s state;
+    _IMatrix4x4 identity, matrix;
+    int position[4] = {0, 0, 0, 0};
+    unsigned int draw, index;
+
+    memset(&state, 0, sizeof(state));
+    IMatrix4x4_identity(&identity);
+    grSetMatrix(&state, GR_MATRIXMODE_PROJECTION, &identity);
+    grSetRectangle(&state.renderScissor, 0, 64, 0, 64);
+    grSetVertexArray(&state, GR_VERTEXARRAY_POSITION, GR_DATATYPE_FLOAT, 4,
+                     sizeof(position), position, 0, position);
+    grSetCapability(&state, GR_CAPABILITY_VERTEX_ARRAY, 1);
+    for (draw = 0; draw < 4; ++draw)
+    {
+        int bits[16];
+        for (index = 0; index < 16; ++index)
+            bits[index] = IScalar_immediate((float)((int)(index + draw) % 7 - 3) * .25f);
+        IMatrix4x4_setfv(&matrix, bits);
+        grSetMatrix(&state, GR_MATRIXMODE_MODELVIEW, &matrix);
+        CHECK(grSetupCulling(&state, GR_PRIMITIVETYPE_TRIANGLE) == GR_COMMAND_RENDER);
+        {
+            _ICommonVertexTransform common;
+            IVertexTransform_prepareCommon(&common, &state.objectToClipTransform);
+            CHECK(memcmp(&common, &state.commonTransform, sizeof(common)) == 0);
+        }
+        state.commonTransform.eligible = 0;
+        CHECK(state.floatTransformMisses == 0);
+        CHECK(state.floatTransformPlan[0].inputExponent == ~0u);
+        CHECK(state.floatTransformPlan[1].inputExponent == ~0u);
+        for (index = 0; index < 32; ++index)
+        {
+            _grVertex cached, direct;
+            unsigned int exponent = draw & 1 ? 110 + index : 126 + (index & 1);
+            position[0] = (int)((exponent << 23) | (index * 7919));
+            position[1] = position[0] ^ (int)0x80000000u;
+            position[2] = index & 3 ? IScalar_one() : 0;
+            position[3] = draw & 2 ? IScalar_immediate(2.0f) : IScalar_one();
+            memset(&cached, 0, sizeof(cached));
+            direct = cached;
+            state.renderStackAllocated = 1;
+            grTransformVertex(&state, &cached);
+            state.renderStackAllocated = 0;
+            grTransformVertex(&state, &direct);
+            CHECK(memcmp(&cached, &direct, sizeof(cached)) == 0);
+        }
+        CHECK(state.floatTransformMisses == (draw & 1 ? GR_FLOAT_TRANSFORM_MISS_LIMIT : 0u));
+    }
+}
+
+static void test_precise_clipper_restores_cache(void)
+{
+    Gerbera_s state;
+    _IMatrix4x4 matrix;
+    _grVertex *buffer, saved[3];
+    float positions[3][3] = {{0.125f, 0.25f, 0}, {-0.5f, 0.125f, 0}, {0.25f, -0.5f, 0}};
+    int bits[16] = {0};
+    int i;
+    memset(&state, 0, sizeof(state));
+    state.renderStack = calloc(1, 1332 + 256 * sizeof(_grVertex));
+    CHECK(state.renderStack != NULL);
+    if (!state.renderStack) return;
+    state.renderStackAllocated = 1;
+    buffer = (_grVertex *)((unsigned char *)state.renderStack + 1332);
+    bits[0] = bits[5] = bits[10] = bits[15] = IScalar_one();
+    bits[14] = IScalar_immediate(2.0f);
+    IMatrix4x4_setfv(&matrix, bits);
+    IVertexTransform_copy(&state.objectToClipTransform, &matrix);
+    IVertexTransform_prepareCommon(&state.commonTransform, &state.objectToClipTransform);
+    grSetVertexArray(&state, GR_VERTEXARRAY_POSITION, GR_DATATYPE_FLOAT, 3,
+                     sizeof(positions[0]), positions, 0, positions);
+    for (i = 0; i < 3; ++i)
+    {
+        buffer[i].index = i;
+        grTransformVertex(&state, &buffer[i]);
+        CHECK(buffer[i].stateMask & GR_VERTEXMASK_APPROXIMATE_POSITION);
+    }
+    memcpy(saved, buffer, sizeof(saved));
+    grClipPrimitive(&state, grSetIndices(0, 1, 2), 3);
+    CHECK(memcmp(saved, buffer, sizeof(saved)) == 0);
+    grClipPrimitive(&state, grSetIndices(0, 1, 1), 2);
+    CHECK(memcmp(saved, buffer, sizeof(saved)) == 0);
+    grClipPrimitive(&state, grSetIndices(0, 0, 0), 1);
+    CHECK(memcmp(saved, buffer, sizeof(saved)) == 0);
+    free(state.renderStack);
+}
+
 int main(void)
 {
     test_partial_light_update();
     test_normalize_lighting();
     test_transformed_user_clip_plane();
     test_texture_transforms();
+    test_identity_float_texcoords();
     test_bound_normal_array();
     test_signed_vertex_inputs();
+    test_short3_transforms();
+    test_float_transform_cache();
+    test_precise_clipper_restores_cache();
     printf("geometry: %d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

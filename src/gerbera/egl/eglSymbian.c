@@ -51,6 +51,25 @@ static const struct Info s_validColors[6] =
     { 4, 4, 4, 0, EGL_SYMBIAN_ECOLOR4K   }
 };
 
+static eglNativePixmap_s *egliSurfaceBitmap(eglSurface_s *surface)
+{
+    if (surface == NULL)
+        return NULL;
+    if (surface->type == EGL_SURFACE_WINDOW)
+        return ((eglWindowSurface *)surface)->backBufferBitmap;
+    if (surface->type == EGL_SURFACE_PIXMAP)
+        return ((eglPixmapSurface *)surface)->nativePixmap;
+    return NULL;
+}
+
+/* Cache window dimensions until a native synchronization or presentation
+ * boundary. Bitmap heap addresses are reacquired on every lock. */
+void egliInvalidateWindowSurface(eglSurface_s *surface)
+{
+    if (surface != NULL && surface->type == EGL_SURFACE_WINDOW)
+        ((eglWindowSurface *)surface)->sizeValidated = 0;
+}
+
 #ifdef __SYMBIAN32__
 
 /* ===========================================================================
@@ -428,6 +447,7 @@ int egliSurfaceResized(eglSurface_s *surface)
 
     if (surface->type == EGL_SURFACE_WINDOW)
     {
+        egliInvalidateWindowSurface(surface);
         /* Native ARM 0x8B1C updates dimensions only. The lock path acquires the
          * address and stride first, retaining the old stride for one lock. */
         egliGetNativeWindowSize((eglWindowSurface *)surface,
@@ -458,6 +478,7 @@ void egliSwapWindowSurface(eglWindowSurface *winSurface)
         return;
     }
 
+    egliInvalidateWindowSurface(&winSurface->surface);
     win = winSurface->nativeWindow;
     gc = winSurface->windowGc;
     bmp = winSurface->backBufferBitmap;
@@ -595,21 +616,36 @@ int egliUpdateSurfaceRenderTarget(eglSurface_s *surface)
     return changed;
 }
 
-int grLockSurface(int op)
+int grLockSurfaceState(void *tlsState, int op)
 {
-    eglState_s *state;
+    eglState_s *state = (eglState_s *)tlsState;
     eglSurface_s *surf;
     eglNativePixmap_s *bmp;
     int sizeChanged;
     int addrChanged;
     int locked = 0;
 
-    state = egliGetState();
     if (state == NULL || state->currentDrawSurface == NULL || state->currentReadSurface == NULL)
         return 0;
 
     surf = (op == GR_SURFACE_DRAW) ? state->currentDrawSurface : state->currentReadSurface;
-    bmp = eglGetActiveBitmap(op);
+    bmp = egliSurfaceBitmap(surf);
+    if (surf->type == EGL_SURFACE_WINDOW && ((eglWindowSurface *)surf)->sizeValidated)
+    {
+        if (bmp != NULL)
+        {
+            void *address;
+            sym_CFbsBitmap_LockHeap(bmp, 0);
+            locked = 1;
+            address = sym_CFbsBitmap_DataAddress(bmp);
+            addrChanged = address != surf->colorBuffer;
+            surf->colorBuffer = address;
+            if (addrChanged && state->currentESContext != NULL)
+                eglUpdateSurfaces(state->currentESContext,
+                                  state->currentDrawSurface, state->currentReadSurface);
+        }
+        return locked;
+    }
     sizeChanged = egliCheckSurfaceSize(surf);
 
     if (sizeChanged != 0 && surf->type == EGL_SURFACE_WINDOW)
@@ -641,12 +677,19 @@ int grLockSurface(int op)
                           state->currentReadSurface);
     }
 
+    if (!sizeChanged && surf->type == EGL_SURFACE_WINDOW)
+        ((eglWindowSurface *)surf)->sizeValidated = 1;
     return locked;
 }
 
-int grReleaseSurface(int op)
+int grReleaseSurfaceState(void *tlsState, int op)
 {
-    eglNativePixmap_s *bmp = eglGetActiveBitmap(op);
+    eglState_s *state = (eglState_s *)tlsState;
+    eglNativePixmap_s *bmp;
+
+    if (state == NULL || state->currentDrawSurface == NULL || state->currentReadSurface == NULL)
+        return 0;
+    bmp = egliSurfaceBitmap(op == GR_SURFACE_DRAW ? state->currentDrawSurface : state->currentReadSurface);
 
     if (bmp != NULL)
     {
@@ -1038,6 +1081,8 @@ int egliSurfaceResized(eglSurface_s *surface)
         int bytesPerPixel;
         int displayMode;
 
+        egliInvalidateWindowSurface(surface);
+
         if (winSurf->backBufferBitmap != NULL)
         {
             egliDestroyBackBufferPixmap(winSurf->backBufferBitmap);
@@ -1084,6 +1129,7 @@ void egliSwapWindowSurface(eglWindowSurface *winSurface)
     if (winSurface == NULL || winSurface->nativeWindow == NULL)
         return;
 
+    egliInvalidateWindowSurface(&winSurface->surface);
     win = winSurface->nativeWindow;
     back = winSurface->backBufferBitmap;
     ++win->swapCount;
@@ -1246,22 +1292,21 @@ int egliUpdateSurfaceRenderTarget(eglSurface_s *surface)
     return 0;
 }
 
-int grLockSurface(int op)
+int grLockSurfaceState(void *tlsState, int op)
 {
-    eglState_s *state;
+    eglState_s *state = (eglState_s *)tlsState;
     eglSurface_s *surf;
     eglNativePixmap_s *bmp;
 
     EGL_ASSERT_AT("eglSymbian.inl", 482, "op == GR_SURFACE_DRAW || op == GR_SURFACE_READ",
                   op == GR_SURFACE_DRAW || op == GR_SURFACE_READ);
 
-    state = egliGetState();
     if (state == NULL || state->currentDrawSurface == NULL || state->currentReadSurface == NULL)
         return 0;
 
     surf = (op == GR_SURFACE_DRAW) ? state->currentDrawSurface : state->currentReadSurface;
     egliCheckSurfaceSize(surf);
-    bmp = eglGetActiveBitmap(op);
+    bmp = egliSurfaceBitmap(surf);
     if (bmp != NULL)
     {
         ++bmp->locked;
@@ -1271,14 +1316,16 @@ int grLockSurface(int op)
     return 0;
 }
 
-int grReleaseSurface(int op)
+int grReleaseSurfaceState(void *tlsState, int op)
 {
+    eglState_s *state = (eglState_s *)tlsState;
     eglNativePixmap_s *bmp;
 
     EGL_ASSERT_AT("eglSymbian.inl", 518, "op == GR_SURFACE_DRAW || op == GR_SURFACE_READ",
                   op == GR_SURFACE_DRAW || op == GR_SURFACE_READ);
 
-    bmp = eglGetActiveBitmap(op);
+    bmp = state == NULL ? NULL :
+        egliSurfaceBitmap(op == GR_SURFACE_DRAW ? state->currentDrawSurface : state->currentReadSurface);
     if (bmp != NULL)
     {
         if (bmp->locked > 0)
@@ -1289,6 +1336,16 @@ int grReleaseSurface(int op)
 }
 
 #endif /* __SYMBIAN32__ */
+
+int grLockSurface(int op)
+{
+    return grLockSurfaceState(egliGetState(), op);
+}
+
+int grReleaseSurface(int op)
+{
+    return grReleaseSurfaceState(egliGetState(), op);
+}
 
 /* --- Symbian Config & Pixel Offset Fixups ---------------------------------- */
 

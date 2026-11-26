@@ -206,6 +206,9 @@ int grSplitEdge(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
  * which edges split in splitBits), then either recurse into the children
  * picked by the split-count tables or draw the (now affine) piece. */
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 static void grTessellateTriangle(Gerbera_s *state, _grClipTriangle *tri,
                                  unsigned int origIndices, int level)
 {

@@ -424,6 +424,8 @@ EGLAPI EGLBoolean EGLAPIENTRY eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EG
     {
         EGL_ASSERT_AT("eglApi.inl", 344, "drawSurface && readSurface",
                       drawSurface != NULL && readSurface != NULL);
+        egliInvalidateWindowSurface(drawSurface);
+        egliInvalidateWindowSurface(readSurface);
         firstBind = (context->hasBeenBound == 0);
         if (eglUpdateSurfaces(context->esContext, drawSurface, readSurface) == 0)
         {

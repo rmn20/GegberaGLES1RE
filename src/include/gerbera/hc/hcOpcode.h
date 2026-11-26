@@ -5,13 +5,13 @@
  *           bits 10-20 = dst register, bits 21-31 = src0 register
  *   instr1: src1 register (bits 0-10) or immediate value (full word)
  *
- * The opcode table HC_opcodeDecls[55] encodes per-opcode metadata:
+ * The opcode table HC_opcodeDecls[HCOP_MAX] encodes per-opcode metadata:
  *   bits 0-2: argument count
  *   bits 3-4: type (0=ALUOP, 1=MEMOP, 2=BRANCH)
  *   bit 5: commutative
  *   bits 6-7: dst flags (0=NORMAL, 1=AS_SRC, 2=AS_LABEL, 3=NOT_AVAILABLE)
  *
- * Enum names and values pinned verbatim from embedded CodeView LF_ENUMERATE
+ * The first 55 enum names and values are pinned from CodeView LF_ENUMERATE
  * records in docs/libGLES_CM.dll (0x158e0b..0x15fc1b).
  */
 #ifndef GERBERA_HC_OPCODE_H
@@ -86,7 +86,20 @@ typedef enum HCOP_e
     HCOP_CBNEQ = 52,
     HCOP_EOP   = 53,
     HCOP_LABEL = 54,
-    HCOP_MAX   = 55
+    /* Internal ARM lowering; not bytecode instructions. */
+    HCOP_UQADD8 = 55,
+    HCOP_UQSUB8 = 56,
+    HCOP_UXTB16 = 57,
+    HCOP_UXTAB16_ROR8 = 58,
+    HCOP_UXTB_ROR = 59,
+    /* The packed blend pseudo-ops lower before allocation. */
+    HCOP_PACKED_ALPHA_A = 60,
+    HCOP_PACKED_ALPHA_B = 61,
+    HCOP_UQADD8_RGB = 62,
+    HCOP_UQSUB8_RGB = 63,
+    HCOP_PACKED_ALPHA_RGB_A = 64,
+    HCOP_PACKED_ALPHA_RGB_B = 65,
+    HCOP_MAX   = 66
 } HCOP_e;
 
 /* opcode types (HC_opcodeDecls bits 3-4) */
@@ -114,7 +127,7 @@ typedef enum HCOP_DST_e
 #define HC_MAX_REG_INDEX 2048
 
 /* --- opcode table --------------------------------------------------------- */
-extern const unsigned char HC_opcodeDecls[55];
+extern const unsigned char HC_opcodeDecls[HCOP_MAX];
 
 /* --- instruction generation (hcOpcode.c) ---------------------------------- */
 HCInstr_s HC_genOp0(int op);

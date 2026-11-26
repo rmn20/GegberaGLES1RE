@@ -4,6 +4,7 @@
  * Assert sites keep the original grrBlit.inl file/line strings.
  */
 #include <stdlib.h>
+#include <string.h>
 #include "gerbera/grState.h"
 #include "gerbera/grRGBA.h"
 #include "hg/hgInt32.h"
@@ -301,6 +302,138 @@ void *grrComputeImageAddress(grMemoryImage_s *image, int x, int y)
     return (unsigned char *)image->data + image->stride * y + image->bytesPerPixel * x;
 }
 
+typedef struct grBlitByteLayout_s
+{
+    int r, g, b, a;
+    int hasAlpha;
+} grBlitByteLayout_s;
+
+static int grrByteColorLayout(const grMemoryImage_s *image, grBlitByteLayout_s *layout)
+{
+    const unsigned short endian = 1;
+    int littleEndian = *(const unsigned char *)&endian;
+    if (image->useDescriptor == 1)
+    {
+        const _grSurfaceDescriptor *d = &image->descriptor;
+        unsigned int used;
+        if (image->bytesPerPixel != 4 || d->colorBytes != 4 ||
+            d->rgbaSizes[0] != 8 || d->rgbaSizes[1] != 8 || d->rgbaSizes[2] != 8 ||
+            (d->rgbaSizes[3] != 0 && d->rgbaSizes[3] != 8) ||
+            ((d->rgbaOffsets[0] | d->rgbaOffsets[1] | d->rgbaOffsets[2]) & 7) ||
+            d->rgbaOffsets[0] > 24 || d->rgbaOffsets[1] > 24 || d->rgbaOffsets[2] > 24)
+            return 0;
+        layout->r = littleEndian ? d->rgbaOffsets[0] / 8 : 3 - d->rgbaOffsets[0] / 8;
+        layout->g = littleEndian ? d->rgbaOffsets[1] / 8 : 3 - d->rgbaOffsets[1] / 8;
+        layout->b = littleEndian ? d->rgbaOffsets[2] / 8 : 3 - d->rgbaOffsets[2] / 8;
+        used = (1u << layout->r) | (1u << layout->g) | (1u << layout->b);
+        if (layout->r == layout->g || layout->r == layout->b || layout->g == layout->b)
+            return 0;
+        layout->hasAlpha = d->rgbaSizes[3] != 0;
+        if (layout->hasAlpha)
+        {
+            if ((d->rgbaOffsets[3] & 7) || d->rgbaOffsets[3] > 24)
+                return 0;
+            layout->a = littleEndian ? d->rgbaOffsets[3] / 8 : 3 - d->rgbaOffsets[3] / 8;
+            if (used & (1u << layout->a))
+                return 0;
+        }
+        else
+        {
+            /* Packing RGB into a four-byte descriptor clears its unused byte. */
+            layout->a = 6 - layout->r - layout->g - layout->b;
+        }
+        return 1;
+    }
+    if (image->useDescriptor != 0 || image->dataType != GR_DATATYPE_UINT8)
+        return 0;
+    switch (image->imageFormat)
+    {
+    case GR_IMAGEFORMAT_RGB:
+    case GR_IMAGEFORMAT_RGBA:
+        layout->r = 0; layout->g = 1; layout->b = 2;
+        break;
+    case GR_IMAGEFORMAT_BGR:
+    case GR_IMAGEFORMAT_BGRA:
+        layout->r = 2; layout->g = 1; layout->b = 0;
+        break;
+    default:
+        return 0;
+    }
+    layout->hasAlpha = image->imageFormat == GR_IMAGEFORMAT_RGBA ||
+                       image->imageFormat == GR_IMAGEFORMAT_BGRA;
+    layout->a = layout->hasAlpha ? 3 : -1;
+    return image->bytesPerPixel == 3 + layout->hasAlpha;
+}
+
+static int grrIsRGB565Image(const grMemoryImage_s *image)
+{
+    const _grSurfaceDescriptor *d = &image->descriptor;
+    return image->useDescriptor == 1 && image->bytesPerPixel == 2 && d->colorBytes == 2 &&
+           d->rgbaSizes[0] == 5 && d->rgbaSizes[1] == 6 && d->rgbaSizes[2] == 5 &&
+           d->rgbaSizes[3] == 0 && d->rgbaOffsets[0] == 11 &&
+           d->rgbaOffsets[1] == 5 && d->rgbaOffsets[2] == 0;
+}
+
+static int grrCopyByteColorSpan(grMemoryImage_s *dstImage, grMemoryImage_s *srcImage,
+                               unsigned char *dst, const unsigned char *src, int length)
+{
+    grBlitByteLayout_s s, d;
+    int srcBytes = grrByteColorLayout(srcImage, &s);
+    int dstBytes = grrByteColorLayout(dstImage, &d);
+    const unsigned short endian = 1;
+    int low = *(const unsigned char *)&endian ? 0 : 1;
+    int high = 1 - low;
+    int srcStride = srcImage->bytesPerPixel;
+    int dstStride = dstImage->bytesPerPixel;
+
+    if (srcBytes && dstBytes)
+    {
+        do
+        {
+            unsigned int r = src[s.r], g = src[s.g], b = src[s.b];
+            unsigned int a = s.hasAlpha ? src[s.a] : 255;
+            dst[d.r] = (unsigned char)r;
+            dst[d.g] = (unsigned char)g;
+            dst[d.b] = (unsigned char)b;
+            if (d.a >= 0)
+                dst[d.a] = d.hasAlpha ? (unsigned char)a : 0;
+            src += srcStride;
+            dst += dstStride;
+        } while (--length);
+        return 1;
+    }
+    if (dstBytes && grrIsRGB565Image(srcImage))
+    {
+        do
+        {
+            unsigned int packed = src[low] | ((unsigned int)src[high] << 8);
+            unsigned int r = packed >> 11, g = (packed >> 5) & 63, b = packed & 31;
+            dst[d.r] = (unsigned char)((r << 3) | (r >> 2));
+            dst[d.g] = (unsigned char)((g << 2) | (g >> 4));
+            dst[d.b] = (unsigned char)((b << 3) | (b >> 2));
+            if (d.a >= 0)
+                dst[d.a] = d.hasAlpha ? 255 : 0;
+            src += 2;
+            dst += dstStride;
+        } while (--length);
+        return 1;
+    }
+    if (srcBytes && grrIsRGB565Image(dstImage))
+    {
+        do
+        {
+            unsigned int packed = ((unsigned int)(src[s.r] >> 3) << 11) |
+                                  ((unsigned int)(src[s.g] >> 2) << 5) | (src[s.b] >> 3);
+            dst[low] = (unsigned char)packed;
+            dst[high] = (unsigned char)(packed >> 8);
+            src += srcStride;
+            dst += 2;
+        } while (--length);
+        return 1;
+    }
+    return 0;
+}
+
 void grrCopyColorSpan(grMemoryImage_s *dstImage, grMemoryImage_s *srcImage,
                       int xDst, int yDst, int xSrc, int ySrc, int length, void *workMemory)
 {
@@ -346,6 +479,9 @@ void grrCopyColorSpan(grMemoryImage_s *dstImage, grMemoryImage_s *srcImage,
         return;
     }
 
+    if (grrCopyByteColorSpan(dstImage, srcImage, dst, src, length))
+        return;
+
     do
     {
         unsigned int color;
@@ -358,10 +494,15 @@ void grrCopyColorSpan(grMemoryImage_s *dstImage, grMemoryImage_s *srcImage,
             if (srcImage->bytesPerPixel == 1)
                 color = grUnpackColor(*src, &srcImage->descriptor);
             else if (srcImage->bytesPerPixel == 2)
-                color = grUnpackColor(*(const unsigned short *)src, &srcImage->descriptor);
+            {
+                unsigned short srcPacked;
+                memcpy(&srcPacked, src, sizeof(srcPacked));
+                color = grUnpackColor(srcPacked, &srcImage->descriptor);
+            }
             else
             {
-                unsigned int srcPacked = *(const unsigned int *)src;
+                unsigned int srcPacked;
+                memcpy(&srcPacked, src, sizeof(srcPacked));
                 if (srcImage->bytesPerPixel != 4 &&
                     grAssert("srcImage->bytesPerPixel == 4", "grrBlit.inl", 415) != 0)
                     grDie(0);
@@ -388,10 +529,13 @@ void grrCopyColorSpan(grMemoryImage_s *dstImage, grMemoryImage_s *srcImage,
             if (dstImage->bytesPerPixel == 1)
                 *dst = (unsigned char)dstPacked;
             else if (dstImage->bytesPerPixel == 2)
-                *(unsigned short *)dst = (unsigned short)dstPacked;
+            {
+                unsigned short value = (unsigned short)dstPacked;
+                memcpy(dst, &value, sizeof(value));
+            }
             else
             {
-                *(unsigned int *)dst = dstPacked;
+                memcpy(dst, &dstPacked, sizeof(dstPacked));
                 if (dstImage->bytesPerPixel != 4 &&
                     grAssert("dstImage->bytesPerPixel == 4", "grrBlit.inl", 442) != 0)
                     grDie(0);

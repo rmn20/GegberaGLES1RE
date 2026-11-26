@@ -470,7 +470,7 @@ int grClipper(Gerbera_s *state, unsigned char *outputFan, unsigned int indices)
  * cache indices, rechecks the scissor over the produced fan, then hands the
  * fan triangles (or the degenerate line record) to the rasterizer. */
 
-void grClipPrimitive(Gerbera_s *state, unsigned int origIndices, int numVertices)
+static void clipPrimitive(Gerbera_s *state, unsigned int origIndices, int numVertices)
 {
     unsigned char fan[GR_MAX_CLIPPER_VERTICES];
     _grVertex *vertexBuffer = GR_CLIP_VERTEX_BUFFER(state);
@@ -602,4 +602,47 @@ void grClipPrimitive(Gerbera_s *state, unsigned int origIndices, int numVertices
         tri.side = 0;
         grrDrawClippedLine(state, &tri, origIndices);
     }
+}
+
+void grClipPrimitive(Gerbera_s *state, unsigned int origIndices, int numVertices)
+{
+    _grVertex *buffer = GR_CLIP_VERTEX_BUFFER(state);
+    _grVertex *vertices[3];
+    _grVertex saved[3];
+    unsigned int approximate = 0;
+    int count = 0, i, j;
+
+    for (i = 0; i < numVertices; ++i)
+    {
+        _grVertex *vertex = &buffer[grUnpackIndex(origIndices, i)];
+        approximate |= vertex->stateMask & GR_VERTEXMASK_APPROXIMATE_POSITION;
+        for (j = 0; j < count && vertices[j] != vertex; ++j) {}
+        if (j == count) vertices[count++] = vertex;
+    }
+    if (!approximate)
+    {
+        clipPrimitive(state, origIndices, numVertices);
+        return;
+    }
+
+    /* Near-parallel plane intersections can amplify endpoint errors. Restore
+     * the cache after the precise draw: other queued areas use its positions. */
+    for (i = 0; i < count; ++i)
+    {
+        _grVertex *vertex = vertices[i];
+        saved[i] = *vertex;
+        if (vertex->stateMask & GR_VERTEXMASK_APPROXIMATE_POSITION)
+        {
+            const _grVertexArray *array = &state->vertexArray[0];
+            int *source = (int *)((unsigned char *)array->data + array->stride * vertex->index);
+            _IFVector4 position;
+            IFVector4_setfv(&position, source, array->size);
+            IVertexTransform_mulfv4(&vertex->clipPosition, &state->objectToClipTransform, &position);
+            vertex->stateMask &= ~(GR_VERTEXMASK_APPROXIMATE_POSITION | GR_VERTEXMASK_VIEWPORT_TRANSFORMED);
+            grComputeVertexClipCodes(state, vertex);
+        }
+    }
+    clipPrimitive(state, origIndices, numVertices);
+    for (i = 0; i < count; ++i)
+        *vertices[i] = saved[i];
 }

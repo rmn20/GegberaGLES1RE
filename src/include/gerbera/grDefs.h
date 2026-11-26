@@ -204,7 +204,7 @@ unsigned int grUnpackColor(unsigned int color, _grSurfaceDescriptor *desc);
 unsigned int grDitherColor(unsigned int color, _grSurfaceDescriptor *desc, int x, int y);
 
 /* --- alignment / bool validation (grSmall.c) ----------------------------- */
-int grIsAligned(void *ptr, int alignment);
+int grIsAligned(const void *ptr, int alignment);
 int grIsValidBool(int v);
 
 HG_EXTERN_C_END

@@ -91,15 +91,30 @@ __aeabi_uidivmod:
     .global __aeabi_idiv
     .hidden __aeabi_idiv
     .type __aeabi_idiv, %function
+__aeabi_idiv:
+    orrs    ip, r0, r1
+    bpl     __aeabi_uidiv
+    push    {r4, lr}
+    eor     r4, r0, r1
+    cmp     r0, #0
+    rsbmi   r0, r0, #0
+    cmp     r1, #0
+    rsbmi   r1, r1, #0
+    bl      __aeabi_uidiv
+    cmp     r4, #0
+    rsbmi   r0, r0, #0
+    pop     {r4, pc}
+    .size __aeabi_idiv, . - __aeabi_idiv
+
     .global __aeabi_idivmod
     .hidden __aeabi_idivmod
     .type __aeabi_idivmod, %function
-__aeabi_idiv:
 __aeabi_idivmod:
+    orrs    ip, r0, r1
+    bpl     __aeabi_uidivmod
     push    {r4, r5, r6, lr}
     eor     r4, r0, r1              /* bit 31 of r4 = sign of quotient      */
-    mov     r5, r0                  /* bit 31 of r5 = sign of remainder     */
-    cmp     r0, #0
+    movs    r5, r0                  /* bit 31 of r5 = sign of remainder     */
     rsbmi   r0, r0, #0
     cmp     r1, #0
     rsbmi   r1, r1, #0

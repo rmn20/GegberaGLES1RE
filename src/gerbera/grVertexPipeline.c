@@ -93,7 +93,9 @@ int grUpdateLights(Gerbera_s *state)
     _grLight *pLight;
     _grLight **pDir;
     _grLight **pPos;
+#if HG_ASSERT_ENABLED
     _XColor3 c;
+#endif
     _XColor3 tmp;
     int recompute;
 
@@ -184,6 +186,7 @@ int grUpdateLights(Gerbera_s *state)
             }
             state->lightColorDirtyMask &= ~(unsigned int)(unsigned char)activeMask;
         }
+#if HG_ASSERT_ENABLED
         for (i = 0; i < 8; ++i)
         {
             if (grGetCapability(state, GR_CAPABILITY_LIGHT0 + i) != 0)
@@ -198,6 +201,7 @@ int grUpdateLights(Gerbera_s *state)
                     grDie(0);
             }
         }
+#endif
     }
     else
     {
@@ -218,6 +222,7 @@ int grUpdateLights(Gerbera_s *state)
             }
             state->lightColorDirtyMask &= ~(unsigned int)(unsigned char)activeMask;
         }
+#if HG_ASSERT_ENABLED
         for (i = 0; i < 8; ++i)
         {
             if (grGetCapability(state, GR_CAPABILITY_LIGHT0 + i) != 0)
@@ -232,6 +237,7 @@ int grUpdateLights(Gerbera_s *state)
                     grDie(0);
             }
         }
+#endif
     }
     if (state->ambientLightSumDirty != 0 || (directionalMask & colorDirtyMask) != 0 || directionalMask != state->ambientLightSumMask)
     {
@@ -240,6 +246,7 @@ int grUpdateLights(Gerbera_s *state)
         state->ambientLightSumMask = (unsigned char)directionalMask;
         state->ambientLightSumDirty = 0;
     }
+#if HG_ASSERT_ENABLED
     c = state->ambientLightSum;
     grUpdateAmbientLightSum(state);
     if (!(c.r == state->ambientLightSum.r) && grAssert("c->r == state->ambientLightSum->r", "grVertexPipeline.inl", 685) != 0)
@@ -248,12 +255,14 @@ int grUpdateLights(Gerbera_s *state)
         grDie(0);
     if (!(c.b == state->ambientLightSum.b) && grAssert("c->b == state->ambientLightSum->b", "grVertexPipeline.inl", 685) != 0)
         grDie(0);
+#endif
     if (recompute != 0)
     {
         XColor3_mul(&tmp, &state->ambientLightSum, &state->material.colors[0]);
         XColor3_add(&state->baseColor, &tmp, &state->material.colors[3]);
         state->baseColorDirty = 0;
     }
+#if HG_ASSERT_ENABLED
     XColor3_mul(&tmp, &state->ambientLightSum, &state->material.colors[0]);
     XColor3_add(&tmp, &tmp, &state->material.colors[3]);
     if (!(tmp.r == state->baseColor.r) && grAssert("c->r == state->baseColor->r", "grVertexPipeline.inl", 702) != 0)
@@ -262,6 +271,7 @@ int grUpdateLights(Gerbera_s *state)
         grDie(0);
     if (!(tmp.b == state->baseColor.b) && grAssert("c->b == state->baseColor->b", "grVertexPipeline.inl", 702) != 0)
         grDie(0);
+#endif
     return state->l_positional[0] != NULL;
 }
 
@@ -524,16 +534,26 @@ void grFetchVertexColorFastUINT8(Gerbera_s *state, unsigned char *vertexList)
     unsigned char *ptr = (unsigned char *)colorArray->data;
     int stride = colorArray->stride;
     _grVertex *vertexBuffer;
-    _grVertex *vertex;
-    unsigned char *vertexLista;
+    unsigned int slot;
 
     GR_FETCH_CHECK(vertexList, 1336);
     vertexBuffer = GR_VERTEX_BUFFER(state);
-    vertexLista = vertexList + 1;
-    vertex = &vertexBuffer[*vertexList];
+    slot = *vertexList++;
     do
     {
-        unsigned char *p = &ptr[stride * vertex->index];
+        _grVertex *vertex = &vertexBuffer[slot];
+        const unsigned char *p = &ptr[stride * vertex->index];
+#if defined(__GNUC__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        /* Pack the two u16 pairs once and reuse RG for both sides. The
+         * source may be unaligned or interleaved: keep byte reads. */
+        unsigned int rg = ((unsigned int)p[0] << 8) | ((unsigned int)p[1] << 24);
+        unsigned int ba = ((unsigned int)p[2] << 8) | ((unsigned int)p[3] << 24);
+        __builtin_memcpy(&vertex->color.final[0][0], &rg, sizeof(rg));
+        __builtin_memcpy(&vertex->color.final[0][2], &ba, sizeof(ba));
+        __builtin_memcpy(&vertex->color.final[1][0], &rg, sizeof(rg));
+        /* Back alpha is the fog field and must not be overwritten. */
+        vertex->color.final[1][2] = (unsigned short)ba;
+#else
         unsigned short r = (unsigned short)(p[0] << 8);
         unsigned short g = (unsigned short)(p[1] << 8);
         unsigned short b = (unsigned short)(p[2] << 8);
@@ -546,8 +566,9 @@ void grFetchVertexColorFastUINT8(Gerbera_s *state, unsigned char *vertexList)
         vertex->color.final[1][1] = g;
         vertex->color.final[1][2] = b;
         vertex->color.final[0][3] = a;
-        vertex = &vertexBuffer[*vertexLista];
-    } while (*vertexLista++ != 0xFF);
+#endif
+        slot = *vertexList++;
+    } while (slot != 0xff);
 }
 
 void grFetchVertexColorFastFLOAT(Gerbera_s *state, unsigned char *vertexList)
@@ -1356,6 +1377,15 @@ unsigned int grFetchWeightAndIndex(Gerbera_s *state, int *weights, int vertexInd
 
 void grTransformVertex(Gerbera_s *state, _grVertex *vertex)
 {
+    grTransformVertexPreloaded(state, vertex, 0);
+}
+
+/* Keep 64-bit matrix products close to their consumers to limit ARM register spills. */
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("no-schedule-insns")))
+#endif
+static void grTransformVertexGeneral(Gerbera_s *state, _grVertex *vertex, int weightsPreloaded)
+{
     _grVertexArray *array = &state->vertexArray[0];
     unsigned char *src;
     int ok = 1;
@@ -1434,13 +1464,23 @@ void grTransformVertex(Gerbera_s *state, _grVertex *vertex)
         state->vertexArray[3].data != NULL &&
         state->vertexArray[4].data != NULL)
     {
-        int weights[4];
+        int localWeights[4];
+        int *weights;
         unsigned int weightIndices;
         int count;
         int j;
         _IFVector4 tmp[4];
 
-        weightIndices = grFetchWeightAndIndex(state, weights, vertex->index);
+        if (weightsPreloaded != 0)
+        {
+            weights = vertex->weights;
+            weightIndices = vertex->weightIndices;
+        }
+        else
+        {
+            weightIndices = grFetchWeightAndIndex(state, localWeights, vertex->index);
+            weights = localWeights;
+        }
         count = hgMin32(state->vertexArray[3].size, state->vertexArray[4].size);
         count = hgMin32(count, 4);
         if (grGetVertexPositionState(vertex) != GR_POSITION_OBJECT_SPACE_FLOAT)
@@ -1485,11 +1525,111 @@ void grTransformVertex(Gerbera_s *state, _grVertex *vertex)
     }
     else
     {
-        IVertexTransform_mulfv4(&vertex->clipPosition,
-                                &state->objectToClipTransform,
-                                vertex->position.objectSpaceFloat);
+        _IFVector4 *position = vertex->position.objectSpaceFloat;
+        if (state->renderStackAllocated && !state->enabledUserClipPlaneIndices &&
+            IVertexTransform_mulfv4Common(&vertex->clipPosition, &state->commonTransform, position))
+        {
+            vertex->stateMask |= GR_VERTEXMASK_APPROXIMATE_POSITION;
+            goto transformed;
+        }
+        /* Shared exponent patterns reuse alignment work; stop caching after
+         * consecutive misses in a draw with little exponent locality. */
+        if (state->renderStackAllocated && state->floatTransformMisses < GR_FLOAT_TRANSFORM_MISS_LIMIT &&
+            state->objectToClipTransform.cl != 0x80200802u)
+        {
+            unsigned int recent = state->floatTransformRecent;
+            _IFVertexTransformPlan *plan = &state->floatTransformPlan[recent];
+            if (plan->inputExponent != position->e)
+            {
+                recent ^= 1;
+                plan = &state->floatTransformPlan[recent];
+                state->floatTransformRecent = recent;
+                if (plan->inputExponent != position->e)
+                {
+                    ++state->floatTransformMisses;
+                    IVertexTransform_prepareFloat(plan, &state->objectToClipTransform, position->e);
+                }
+                else
+                    state->floatTransformMisses = 0;
+            }
+            else
+                state->floatTransformMisses = 0;
+            IVertexTransform_mulfv4Prepared(&vertex->clipPosition,
+                                            &state->objectToClipTransform, position, plan);
+        }
+        else
+            IVertexTransform_mulfv4(&vertex->clipPosition,
+                                    &state->objectToClipTransform, position);
     }
+transformed:
     grComputeVertexClipCodes(state, vertex);
+}
+
+/* Three-component short positions have an implicit W of one. */
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && __ARM_ARCH >= 6
+__attribute__((optimize("no-schedule-insns")))
+#endif
+static void grTransformVertexShort3(Gerbera_s *state, _grVertex *vertex)
+{
+    _grVertexArray *array = &state->vertexArray[0];
+    const short *src;
+    int *position = (int *)&vertex->position;
+
+    GR_VP_CHECK(state && vertex, 230);
+    GR_VP_CHECK(array->data, 231);
+    GR_VP_CHECK(!(vertex->stateMask & GR_VERTEXMASK_TRANSFORMED), 232);
+    src = (const short *)((const unsigned char *)array->data + array->stride * vertex->index);
+    GR_VP_CHECK(grIsAligned(src, 2), 270);
+    vertex->stateMask |= GR_VERTEXMASK_TRANSFORMED;
+    position[0] = (int)src[0] * 65536;
+    position[1] = (int)src[1] * 65536;
+    position[2] = (int)src[2] * 65536;
+    position[3] = 65536;
+    grSetVertexPositionState(vertex, GR_POSITION_OBJECT_SPACE_FIXED);
+    IVertexTransform_mulxv4(&vertex->clipPosition, &state->objectToClipTransform, position);
+    grComputeVertexClipCodes(state, vertex);
+}
+
+void grTransformVertexPreloaded(Gerbera_s *state, _grVertex *vertex, int weightsPreloaded)
+{
+    if (state->vertexArray[0].type == GR_DATATYPE_INT16 &&
+        state->vertexArray[0].size == 3 &&
+        grTestCapability(state, GR_CAPABILITY_MATRIX_PALETTE) == 0)
+        grTransformVertexShort3(state, vertex);
+    else
+        grTransformVertexGeneral(state, vertex, weightsPreloaded);
+}
+
+/* Compute the directional terms without changing the light's position,
+ * attenuation or halfway vector. Keep ld/ls as observable scratch output. */
+static inline void grDirectionalLightTerms(_grLight *l, int shininess, int *eyeNormal, int nSides)
+{
+    unsigned int mask = (unsigned int)l->lightMask;
+    int ndotL = 0, specDot = 0;
+
+    if ((mask & 0xC) != 0)
+    {
+        int signDiffuse;
+        ndotL = XNormal3_dot(l->nVP, eyeNormal);
+        signDiffuse = XScalar_signBit(ndotL);
+        if ((signDiffuse == 0 || nSides != 0) && (mask & 8) != 0)
+        {
+            int halfDot = XNormal3_dot(l->halfway, eyeNormal);
+            if (XScalar_signBit(halfDot) == signDiffuse)
+            {
+                if (XScalar_zcmpne(shininess) != 0)
+                {
+                    specDot = XScalar_abs(halfDot);
+                    if (XScalar_cmpne(shininess, 0x200000) != 0)
+                        specDot = XScalar_pow(specDot, shininess);
+                }
+                else
+                    specDot = 0x200000;
+            }
+        }
+    }
+    l->ld = ndotL;
+    l->ls = specDot;
 }
 
 /* --- light (decompile 28554-28693; assert lines 774/781/799/807) -------------
@@ -1501,6 +1641,12 @@ void grTransformVertex(Gerbera_s *state, _grVertex *vertex)
 
 void light(_grLight **lights, int shininess, _IVector3 *pos, int *eyeNormal, int nSides, int bDirectional)
 {
+    if (bDirectional != 0)
+    {
+        for (; *lights != NULL; ++lights)
+            grDirectionalLightTerms(*lights, shininess, eyeNormal, nSides);
+        return;
+    }
     for (; *lights != NULL; ++lights)
     {
         _grLight *l = *lights;
@@ -1512,8 +1658,6 @@ void light(_grLight **lights, int shininess, _IVector3 *pos, int *eyeNormal, int
         int lvec;
         int signDiffuse;
 
-        if (bDirectional != 0)
-            goto colorStage;
         l->la = 0;
         if ((mask & 0xE) == 0)
             continue;
@@ -1568,24 +1712,20 @@ void light(_grLight **lights, int shininess, _IVector3 *pos, int *eyeNormal, int
                     grDie(0);
                 l->la = atten;
             }
-        colorStage:
             if ((mask & 0xC) != 0)
             {
                 ndotL = XNormal3_dot(l->nVP, eyeNormal);
                 signDiffuse = XScalar_signBit(ndotL);
                 if (signDiffuse == 0 || nSides != 0)
                 {
-                    if ((mask & 4) != 0 && bDirectional == 0)
+                    if ((mask & 4) != 0)
                         ndotL = XScalar_mul_sat(atten, ndotL);
                     if ((mask & 8) != 0)
                     {
-                        if (bDirectional == 0)
-                        {
-                            /* halfway = normalize(L + view(0,0,1)): the view
-                             * offset is folded into nVP[2] itself */
-                            l->nVP[2] = XScalar_add(l->nVP[2], 0x200000);
-                            XNormal3_normalize(l->halfway, l->nVP);
-                        }
+                        /* halfway = normalize(L + view(0,0,1)): the view
+                         * offset is folded into nVP[2] itself */
+                        l->nVP[2] = XScalar_add(l->nVP[2], 0x200000);
+                        XNormal3_normalize(l->halfway, l->nVP);
                         {
                             int halfDot = XNormal3_dot(l->halfway, eyeNormal);
 
@@ -1596,8 +1736,7 @@ void light(_grLight **lights, int shininess, _IVector3 *pos, int *eyeNormal, int
                                     specDot = XScalar_abs(halfDot);
                                     if (XScalar_cmpne(shininess, 0x200000) != 0)
                                         specDot = XScalar_pow(specDot, shininess);
-                                    if (bDirectional == 0)
-                                        specDot = XScalar_mulu_sat(atten, specDot);
+                                    specDot = XScalar_mulu_sat(atten, specDot);
                                 }
                                 else
                                 {
@@ -1665,6 +1804,32 @@ void grLightVertex(Gerbera_s *state, _grVertex *v)
         XNormalTransform_mulNormal(eyeNormal, &state->normalsToEyeTransform, eyeNormal, normalize);
     }
     shininess = state->material.shininess;
+    /* One-sided, directional-only lighting can consume the terms in
+     * light-list order as they are computed. Keep the same accumulation
+     * and vertex stores, including the aliased final back-color fields. */
+    if (nSides == 0 && state->l_positional[0] == NULL &&
+        grTestCapability(state, GR_CAPABILITY_COLOR_MATERIAL) == 0 &&
+        grGetVertexPositionState(v) != GR_POSITION_EYE_SPACE_CARTESIAN)
+    {
+        XColor3Acc_set(accFront, &state->baseColor);
+        for (iter = state->l_directional; *iter != NULL; ++iter)
+        {
+            l = *iter;
+            grDirectionalLightTerms(l, shininess, eyeNormal, 0);
+            if (XScalar_zcmplt(l->ld) == 0)
+            {
+                if (XScalar_zcmpgt(l->ld) != 0)
+                    XColor3Acc_madd(accFront, accFront, &l->premul_colors[1], l->ld);
+                if (XScalar_zcmpgt(l->ls) != 0)
+                    XColor3Acc_madd(accFront, accFront, &l->premul_colors[2], l->ls);
+            }
+        }
+        v->color.final[0][3] = (unsigned short)(state->material.alpha & 0xFF00u);
+        XColor3Acc_toRGB(&v->color.final[0][0], accFront);
+        v->color.input.rgb[0].b = v->color.input.rgb[0].r;
+        v->color.final[1][2] = v->color.final[0][2];
+        return;
+    }
     light(state->l_directional, shininess, NULL, eyeNormal, nSides, 1);
     if (grGetVertexPositionState(v) == GR_POSITION_EYE_SPACE_CARTESIAN)
     {
@@ -2026,6 +2191,7 @@ int grSetupCulling(Gerbera_s *state, int primitiveType)
         IMatrix4x4_mul(&tmp, &state->matrix[GR_MATRIXMODE_PROJECTION],
                        &state->matrix[GR_MATRIXMODE_MODELVIEW]);
         IVertexTransform_copy(&state->objectToClipTransform, &tmp);
+        IVertexTransform_prepareCommon(&state->commonTransform, &state->objectToClipTransform);
         if (grIsMatrixDirty(state, GR_MATRIXMODE_MODELVIEW) != 0)
         {
             IVertexTransform_copy(&state->modelviewTransform,
@@ -2075,5 +2241,10 @@ int grSetupCulling(Gerbera_s *state, int primitiveType)
             }
         }
     }
+    /* Plans belong to this draw's object-to-clip transform. */
+    state->floatTransformRecent = 0;
+    state->floatTransformMisses = 0;
+    state->floatTransformPlan[0].inputExponent = ~0u;
+    state->floatTransformPlan[1].inputExponent = ~0u;
     return GR_COMMAND_RENDER;
 }

@@ -11,13 +11,20 @@
 #include "hg/hgMemory.h"
 #include "imath/imApi.h"
 
-oglContext_s *oglGetContext(void)
+oglContext_s *oglGetContextAndState(eglState_s **outState)
 {
     eglState_s *state = egliGetState();
+    if (outState != NULL)
+        *outState = state;
     if (state != NULL)
         return state->currentESContext;
     eglSetError(0x3001); /* EGL_NOT_INITIALIZED */
     return NULL;
+}
+
+oglContext_s *oglGetContext(void)
+{
+    return oglGetContextAndState(NULL);
 }
 
 oglMatrixStack_s *oglInitMatrixStack(oglContext_s *context, int depth)

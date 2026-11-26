@@ -210,6 +210,244 @@ static void test_ivector4(void);
 static void test_ifvector4(void);
 static void test_inormal3(void);
 static void test_imatrix(void);
+static void test_affine_unit_rows(void)
+{
+    static const float inputs[] = {0.f, -0.25000003f, 1.f, -1.f, 1e-20f, -1e20f};
+    unsigned int i, n = sizeof(inputs) / sizeof(inputs[0]);
+    int row, c, bits[16] = {0};
+    _IMatrix4x4 mat;
+    _IVertexTransform fast, scalar;
+
+    for (row = 0; row < 3; ++row)
+    {
+        memset(bits, 0, sizeof(bits));
+        for (c = 0; c < 4; ++c) bits[5 * c] = FIN(1.f);
+        /* Keep the tested row a unit row without taking the identity path. */
+        bits[12 + (row + 1) % 3] = FIN(0.125f);
+        IMatrix4x4_setfv(&mat, bits);
+        IVertexTransform_copy(&fast, &mat);
+        scalar = fast;
+        /* Keep the affine-W bit; disable the first three unit-row classes
+         * to exercise the original dot path with the exact same operands. */
+        scalar.cl = (scalar.cl & 0xff000000u) | 0x00010101u;
+        for (i = 0; i < n; ++i)
+        {
+            _IFVector4 input;
+            _IVector4 fused, normal;
+            int xyzw[4];
+            for (c = 0; c < 4; ++c) xyzw[c] = FIN(inputs[(i + c) % n]);
+            IFVector4_setfv(&input, xyzw, 4);
+            IVertexTransform_mulfv4(&fused, &fast, &input);
+            IVertexTransform_mulfv4(&normal, &scalar, &input);
+            CHECK(memcmp(&fused, &normal, sizeof(fused)) == 0);
+        }
+    }
+}
+
+static void test_float_transform_plans(void)
+{
+    static const unsigned int exponents[] = {0, 1, 31, 63, 95, 126, 127, 128, 160, 192, 223};
+    unsigned int rng = 0x193ac827u;
+    unsigned int sample, component, variant;
+    for (sample = 0; sample < 256; ++sample)
+    {
+        _IMatrix4x4 matrix;
+        _IVertexTransform transform;
+        _IFVertexTransformPlan plan;
+        _IFVector4 input;
+        int bits[16];
+        for (component = 0; component < 16; ++component)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            bits[component] = (int)((rng & 0x807fffffu) | ((112u + (rng >> 25)) << 23));
+            if (sample % 4 == 0 && component % 5 != 0) bits[component] = 0;
+            if (sample % 4 == 1 && component % 4 == 3)
+                bits[component] = component == 15 ? FIN(1.0f) : 0;
+        }
+        if (sample == 0)
+            IMatrix4x4_identity(&matrix);
+        else
+            IMatrix4x4_setfv(&matrix, bits);
+        IVertexTransform_copy(&transform, &matrix);
+        input.e = 0;
+        for (component = 0; component < 4; ++component)
+            input.e |= exponents[(sample + component * 3) % 11] << (component * 8);
+        IVertexTransform_prepareFloat(&plan, &transform, input.e);
+        for (variant = 0; variant < 8; ++variant)
+        {
+            _IVector4 expected, actual;
+            _IFVector4 alias;
+            for (component = 0; component < 4; ++component)
+            {
+                rng = rng * 1664525u + 1013904223u;
+                input.m[component] = (int)(0x20000000u | (rng & 0x1fffffffu));
+                if (rng & 0x80000000u) input.m[component] = -input.m[component];
+                if (((input.e >> (component * 8)) & 255u) == 0) input.m[component] = 0;
+            }
+            IVertexTransform_mulfv4(&expected, &transform, &input);
+            IVertexTransform_mulfv4Prepared(&actual, &transform, &input, &plan);
+            CHECK(memcmp(&expected, &actual, sizeof(actual)) == 0);
+            alias = input;
+            IVertexTransform_mulfv4Prepared((_IVector4 *)&alias, &transform, &alias, &plan);
+            CHECK(memcmp(&expected, &alias, sizeof(expected)) == 0);
+        }
+    }
+    /* Cancellation must clear the row exponent even when the cached plan
+     * was prepared from the largest finite input exponent. */
+    for (sample = 0; sample < 2; ++sample)
+    {
+        _IMatrix4x4 matrix;
+        _IVertexTransform transform;
+        _IFVertexTransformPlan plan;
+        _IFVector4 input;
+        _IVector4 actual, expected;
+        int bits[16];
+        for (component = 0; component < 16; ++component)
+            bits[component] = component < 8 ? FIN(1.0f) : FIN(-1.0f);
+        IMatrix4x4_setfv(&matrix, bits);
+        IVertexTransform_copy(&transform, &matrix);
+        input.e = sample ? 0xfefefefeu : 0x01010101u;
+        for (component = 0; component < 4; ++component)
+            input.m[component] = 0x20000000;
+        IVertexTransform_prepareFloat(&plan, &transform, input.e);
+        IVertexTransform_mulfv4(&expected, &transform, &input);
+        IVertexTransform_mulfv4Prepared(&actual, &transform, &input, &plan);
+        CHECK(memcmp(&expected, &actual, sizeof(actual)) == 0);
+        CHECK(actual.e == 0);
+        CHECK((actual.m[0] | actual.m[1] | actual.m[2] | actual.m[3]) == 0);
+    }
+}
+
+static int check_common_transform(_IVertexTransform *transform, _ICommonVertexTransform *plan,
+                                  _IFVector4 *input)
+{
+    _IVector4 expected, actual, untouched;
+    _IFVector4 alias;
+    unsigned int inputExponent = 0;
+    int component, accepted, scale;
+    memset(&actual, 0xa5, sizeof(actual));
+    untouched = actual;
+    accepted = IVertexTransform_mulfv4Common(&actual, plan, input);
+    if (!accepted)
+    {
+        CHECK(memcmp(&actual, &untouched, sizeof(actual)) == 0);
+        return 0;
+    }
+    IVertexTransform_mulfv4(&expected, transform, input);
+    CHECK_EQ(IVector4_clip(&actual, 2), IVector4_clip(&expected, 2));
+    CHECK(IVector4_isValid(&actual));
+    for (component = 0; component < 4; ++component)
+    {
+        unsigned int exponent = (input->e >> (8 * component)) & 255u;
+        if (exponent > inputExponent) inputExponent = exponent;
+    }
+    scale = plan->exponent + (int)inputExponent - 124;
+    for (component = 0; component < 4; ++component)
+        CHECK(fabs(ldexp(expected.m[component], (int)expected.e - scale) -
+                   ldexp(actual.m[component], (int)actual.e - scale)) < IM_COMMON_TRANSFORM_ERROR);
+    for (component = 0; component < 2; ++component)
+        CHECK(fabs((double)actual.m[component] / actual.m[3] -
+                   (double)expected.m[component] / expected.m[3]) <
+              40.0 / (IM_COMMON_TRANSFORM_MIN_W - IM_COMMON_TRANSFORM_ERROR));
+    alias = *input;
+    CHECK(IVertexTransform_mulfv4Common((_IVector4 *)&alias, plan, &alias));
+    CHECK(memcmp(&alias, &actual, sizeof(actual)) == 0);
+    return 1;
+}
+
+static void test_common_scale_transforms(void)
+{
+    _IMatrix4x4 matrix;
+    _IVertexTransform transform;
+    _ICommonVertexTransform plan;
+    _IFVector4 input;
+    unsigned int rng = 0x9ead0283u, sample, component;
+    int accepted = 0, matrixBits[16], inputBits[4];
+    for (sample = 0; sample < 4096; ++sample)
+    {
+        unsigned int base = sample < 1024 ? 127 : 17 + sample % 238;
+        for (component = 0; component < 16; ++component)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            matrixBits[component] = (int)((rng & 0x807fffffu) | ((base - (rng >> 28)) << 23));
+            if (sample % 3 == 0 && component % 5) matrixBits[component] = 0;
+        }
+        IMatrix4x4_setfv(&matrix, matrixBits);
+        IVertexTransform_copy(&transform, &matrix);
+        IVertexTransform_prepareCommon(&plan, &transform);
+        for (component = 0; component < 4; ++component)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            inputBits[component] = (int)((rng & 0x807fffffu) | ((127 - (rng >> 28)) << 23));
+        }
+        IFVector4_setfv(&input, inputBits, 4);
+        accepted += check_common_transform(&transform, &plan, &input);
+    }
+    CHECK(accepted > 200);
+
+    /* Every float exponent, including subnormal and non-finite encodings. */
+    for (sample = 0; sample < 256; ++sample)
+    {
+        for (component = 0; component < 16; ++component)
+            matrixBits[component] = component % 5 == 0 ? FIN(0.75f) : FIN(0.0625f);
+        IMatrix4x4_setfv(&matrix, matrixBits);
+        IVertexTransform_copy(&transform, &matrix);
+        IVertexTransform_prepareCommon(&plan, &transform);
+        for (component = 0; component < 4; ++component)
+            inputBits[component] = (int)((sample << 23) | (component * 0x190003u));
+        IFVector4_setfv(&input, inputBits, 4);
+        check_common_transform(&transform, &plan, &input);
+        inputBits[0] ^= (int)0x80000000u;
+        IFVector4_setfv(&input, inputBits, 4);
+        check_common_transform(&transform, &plan, &input);
+    }
+
+    /* Clip boundaries, cancellation and ineligible matrices preserve the fallback. */
+    memset(matrixBits, 0, sizeof(matrixBits));
+    matrixBits[0] = matrixBits[5] = matrixBits[10] = FIN(0.5f);
+    matrixBits[15] = FIN(1.0f);
+    IMatrix4x4_setfv(&matrix, matrixBits);
+    IVertexTransform_copy(&transform, &matrix);
+    IVertexTransform_prepareCommon(&plan, &transform);
+    inputBits[0] = FIN(0.5f); inputBits[1] = FIN(0.25f);
+    inputBits[2] = FIN(0.75f); inputBits[3] = FIN(1.0f);
+    IFVector4_setfv(&input, inputBits, 4);
+    CHECK(check_common_transform(&transform, &plan, &input));
+    for (component = 0; component < 3; ++component)
+    {
+        int saved = inputBits[component];
+        inputBits[component] = FIN(2.0f);
+        IFVector4_setfv(&input, inputBits, 4);
+        CHECK(!check_common_transform(&transform, &plan, &input));
+        inputBits[component] = saved;
+    }
+    inputBits[0] = FIN(8.0f);
+    IFVector4_setfv(&input, inputBits, 4);
+    CHECK(!check_common_transform(&transform, &plan, &input));
+    inputBits[0] = FIN(0.5f); inputBits[3] = FIN(-1.0f);
+    IFVector4_setfv(&input, inputBits, 4);
+    CHECK(!check_common_transform(&transform, &plan, &input));
+    inputBits[3] = 0x7f800000;
+    IFVector4_setfv(&input, inputBits, 4);
+    CHECK(!check_common_transform(&transform, &plan, &input));
+    inputBits[3] = 0x7fc12345;
+    IFVector4_setfv(&input, inputBits, 4);
+    CHECK(!check_common_transform(&transform, &plan, &input));
+    inputBits[3] = FIN(1.0f);
+    matrixBits[3] = FIN(-2.0f);
+    IMatrix4x4_setfv(&matrix, matrixBits);
+    IVertexTransform_copy(&transform, &matrix);
+    IVertexTransform_prepareCommon(&plan, &transform);
+    IFVector4_setfv(&input, inputBits, 4);
+    CHECK(!check_common_transform(&transform, &plan, &input));
+    matrixBits[3] = FIN(0x1p40f);
+    IMatrix4x4_setfv(&matrix, matrixBits);
+    IVertexTransform_copy(&transform, &matrix);
+    IVertexTransform_prepareCommon(&plan, &transform);
+    CHECK(!plan.eligible);
+    CHECK(!check_common_transform(&transform, &plan, &input));
+}
+
 static void test_attenuate(void);
 
 int main(void)
@@ -229,6 +467,9 @@ int main(void)
     test_inormal3();
     test_imatrix();
     test_attenuate();
+    test_affine_unit_rows();
+    test_float_transform_plans();
+    test_common_scale_transforms();
 
     printf("imath tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
@@ -387,6 +628,22 @@ static void test_ivector4(void)
         CHECK_EQ(out[0], 320 << 16);
         CHECK_EQ(out[1], 240 << 16);
         CHECK_EQ(out[2], 5 << 16);
+    }
+    /* Unit W must keep the biased reciprocal, including at pixel ties. */
+    {
+        int out[3], scale[3] = {81920, -61440, 0x1fffffff};
+        int offset[3] = {81920, 61440, 0x1fffffff};
+        HGint64 rr = imRcpu(0x20000004u);
+        int recip = hgGet64h(rr), step = hgGet64l(rr) - 1;
+        IVector4_set(&c, 127u, 0x10000000, -0x10000000, 0x0fffffff, IUNITSCALAR_ONE);
+        IVector4_viewportTransform(out, &c, scale, offset, 8);
+        for (int k = 0; k < 2; ++k)
+        {
+            int v = hgLsl64h_0_31(hgMul64(c.m[k], recip), step);
+            CHECK_EQ(out[k], (offset[k] + hgMul64h(v, scale[k])) * 256);
+        }
+        int z = hgMul64h(c.m[2] * 2, recip);
+        CHECK_EQ(out[2], offset[2] + hgLsl64h_0_31(hgMul64(z, scale[2]), 3));
     }
     /* fixClipSpacePosition: w <= 0 path */
     {

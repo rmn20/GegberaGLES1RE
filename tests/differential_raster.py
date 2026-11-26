@@ -703,6 +703,9 @@ def compare_pixel_span(suite, signature, code, mode, inputs=None, gradients=None
     stack = oracle.alloc(16384)
     pipe = stack + 64  # HCARMBackend scratch space before pixel parameters.
     spans = oracle.alloc(8, words([4 << 16, 1 | (2 << 16)]))
+    if signature[45]:
+        kernel = (C.c_uint32 * 4).in_dll(getattr(lib, "library", lib), "g_orderedDitherKernel")
+        oracle.write(pipe + 128, words([oracle.alloc(16, bytes(kernel))]))
     for unit in range(2):
         texture_record = signature[56 + 44 * unit:100 + 44 * unit]
         if not texture_record[16]:

@@ -475,6 +475,7 @@ static void test_window_and_pixmap_surfaces(void)
     uint32_t *pixmapPixels;
     uint32_t *copyTargetPixels;
     eglNativeWindow_s nativeWin;
+    eglWindowSurface *externalWindow;
     eglNativePixmap_s nativePix;
     eglNativePixmap_s copyTarget;
 
@@ -529,13 +530,28 @@ static void test_window_and_pixmap_surfaces(void)
     winCtx = eglCreateContext(dpy, winCfg, EGL_NO_CONTEXT, NULL);
     CHECK(winCtx != EGL_NO_CONTEXT);
     CHECK(eglMakeCurrent(dpy, winSurf, winSurf, winCtx) == EGL_TRUE);
+    externalWindow = (eglWindowSurface *)egliGetState()->currentDrawSurface;
+    {
+        eglWindowSurface *window = (eglWindowSurface *)egliGetState()->currentDrawSurface;
+        window->sizeValidated = 1;
+        CHECK(eglWaitNative(EGL_CORE_NATIVE_ENGINE) == EGL_TRUE);
+        CHECK(window->sizeValidated == 0);
+        window->sizeValidated = 1;
+        CHECK(eglMakeCurrent(dpy, winSurf, winSurf, winCtx) == EGL_TRUE);
+        CHECK(window->sizeValidated == 0);
+        window->sizeValidated = 1;
+        glViewport(0, 0, 64, 48);
+        CHECK(window->sizeValidated == 0 && window->ownWindow == 0);
+    }
     CHECK(eglSwapInterval(dpy, 1) == EGL_TRUE);
     CHECK(eglWaitNative(EGL_CORE_NATIVE_ENGINE) == EGL_TRUE);
 
     /* Clear window to magenta (R=255, G=0, B=255, A=255 -> BGRA 0xFFFF00FF) and swap */
     glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    ((eglWindowSurface *)egliGetState()->currentDrawSurface)->sizeValidated = 1;
     CHECK(eglSwapBuffers(dpy, winSurf) == EGL_TRUE);
+    CHECK(((eglWindowSurface *)egliGetState()->currentDrawSurface)->sizeValidated == 0);
     CHECK(nativeWin.swapCount == 1);
     CHECK(frontPixels[0] == 0xFFFF00FFu);
     CHECK(frontPixels[64 * 48 - 1] == 0xFFFF00FFu);
@@ -553,6 +569,29 @@ static void test_window_and_pixmap_surfaces(void)
     CHECK(nativeWin.swapCount == 2);
     CHECK(frontPixels[0] == 0xFF00FFFFu);
     CHECK(frontPixels[96 * 80 - 1] == 0xFF00FFFFu);
+
+    {
+        int boundary;
+        for (boundary = 0; boundary < 3; ++boundary)
+        {
+            nativeWin.width = 80 + 4 * boundary;
+            externalWindow->sizeValidated = 1;
+            if (boundary == 0)
+                CHECK(eglWaitNative(EGL_CORE_NATIVE_ENGINE) == EGL_TRUE);
+            else if (boundary == 1)
+                CHECK(eglMakeCurrent(dpy, winSurf, winSurf, winCtx) == EGL_TRUE);
+            else
+                CHECK(eglSwapBuffers(dpy, winSurf) == EGL_TRUE);
+            CHECK(!externalWindow->sizeValidated);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glFinish();
+            CHECK(eglQuerySurface(dpy, winSurf, EGL_WIDTH, &w) == EGL_TRUE && w == nativeWin.width);
+        }
+        nativeWin.width = 96;
+        glViewport(0, 0, 96, 80);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+    }
 
     /* Copy window surface to matching native pixmap via eglCopyBuffers */
     copyTargetPixels = (uint32_t *)calloc(96 * 80, sizeof(uint32_t));
@@ -627,8 +666,11 @@ static void test_window_and_pixmap_surfaces(void)
     CHECK(pixmapPixels[32 * 32 - 1] == 0xFFFFFF00u);
     CHECK(nativePix.locked == 0);
 
-    /* Leave pixCtx & pixSurf bound and test eglTerminate full teardown! */
+    /* Cached size metadata does not confer ownership of an external window. */
+    externalWindow->sizeValidated = 1;
+    CHECK(externalWindow->ownWindow == 0);
     CHECK(eglTerminate(dpy) == EGL_TRUE);
+    CHECK(nativeWin.width == 96 && nativeWin.height == 80 && nativeWin.frontBuffer == frontPixels);
     CHECK(eglGetCurrentContext() == EGL_NO_CONTEXT);
     CHECK_EGL(eglQueryString(dpy, EGL_VERSION), NULL, EGL_NOT_INITIALIZED);
 

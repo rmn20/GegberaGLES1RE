@@ -23,14 +23,7 @@ fi
 
 mkdir -p "${OUT_DIR}/texpacks" "${OUT_DIR}/include/GLES" "${OUT_DIR}/include/EGL"
 
-LIB_SRCS="$(python3 - "${REPO_ROOT}/Makefile" <<'PY'
-import sys
-txt = open(sys.argv[1]).read().replace("\\\n", " ")
-for line in txt.splitlines():
-    if line.startswith("LIB_SRC :="):
-        print(" ".join(line.split()[2:]))
-PY
-)"
+LIB_SRCS="$(make -s -C "${REPO_ROOT}" library-sources)"
 
 echo "[1/4] Building Win32 Release libGLES_CM.dll (-O3 -DNDEBUG -DHG_NO_ASSERTS)..."
 (

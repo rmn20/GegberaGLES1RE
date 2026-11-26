@@ -907,6 +907,8 @@ EGLAPI EGLBoolean EGLAPIENTRY eglWaitNative(EGLint engine)
         return EGL_FALSE;
     }
 
+    egliInvalidateWindowSurface(state->currentDrawSurface);
+    egliInvalidateWindowSurface(state->currentReadSurface);
     return EGL_TRUE;
 }
 

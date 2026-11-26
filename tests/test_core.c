@@ -142,6 +142,8 @@ static void test_hcarmbackend(void);
 static void test_hcdatastructs_and_emulator(void);
 static void test_hccompiler(void);
 static void test_gradients(void);
+static void test_depth_span_rejection(void);
+static void test_early_depth_gradients(void);
 static void test_grr_texture_and_blit(void);
 static void test_pixel_sampling(void);
 static void test_gerbera_lifecycle_and_api_small(void);
@@ -175,6 +177,8 @@ int main(void)
     test_queueprimitive();
     test_fetchprimitives();
     test_gradients();
+    test_depth_span_rejection();
+    test_early_depth_gradients();
     test_scanconvert();
     test_interpolate();
     test_linepoint();
@@ -2185,6 +2189,142 @@ static void test_fetchprimitives(void)
     st.compilationFailed = 0;
 }
 
+static void test_depth_span_rejection(void)
+{
+    _grPixelPipe pipe = {0};
+    unsigned short depth[4][16];
+    unsigned int spans[4] = { 4u << 16, 4u << 16, 4u << 16, 4u << 16 };
+    unsigned int random = 1136u;
+    int i, sample, rejected = 0;
+
+    pipe.depthRow = depth;
+    pipe.checked.depthBufferStride = sizeof(depth[0]);
+    pipe.scanlineInfo = spans;
+    pipe.numScanlines = 1;
+    pipe.reference[0] = 100 << 14;
+    for (i = 0; i < 4; ++i) depth[0][i] = 99;
+    CHECK(grDepthSpansOccluded(&pipe, 0));
+    depth[0][3] = 100;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    CHECK(grDepthSpansOccluded(&pipe, 1));
+    depth[0][3] = 101;
+    CHECK(!grDepthSpansOccluded(&pipe, 1));
+    pipe.reference[0] = 0;
+    pipe.xAdder[0] = -1;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.reference[0] = 0x3FFFFFFF;
+    pipe.xAdder[0] = 1;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.reference[0] = 0;
+    pipe.xAdder[0] = INT32_MIN;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.depthRow = (unsigned char *)depth + 1;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.depthRow = depth;
+    pipe.checked.depthBufferStride = 31;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.checked.depthBufferStride = -32;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.checked.depthBufferStride = 0;
+    CHECK(!grDepthSpansOccluded(&pipe, 0));
+    pipe.checked.depthBufferStride = sizeof(depth[0]);
+
+    for (sample = 0; sample < 1024; ++sample)
+    {
+        unsigned int ref;
+        int strict = sample & 1, allHidden = 1, y;
+        random = random * 1664525u + 1013904223u;
+        pipe.reference[0] = (int)(random & 0x3FFFFFFFu);
+        random = random * 1664525u + 1013904223u;
+        pipe.xAdder[0] = (int)(random & 65535u) - 32768;
+        pipe.yAdder[0] = (int)(random >> 16) - 32768;
+        pipe.numScanlines = 4;
+        ref = (unsigned int)pipe.reference[0];
+        for (y = 0; y < 4; ++y, ref += (unsigned int)pipe.yAdder[0])
+        {
+            unsigned int x = (random >> (2 * y)) & 3u, count = 1u + ((random >> (3 * y)) & 7u), j;
+            spans[y] = x | (count << 16);
+            for (j = 0; j < count; ++j)
+            {
+                unsigned int z = (ref + (unsigned int)pipe.xAdder[0] * (x + j)) >> 14;
+                unsigned short old = sample % 3 == 0 ? 0 : sample % 3 == 1 ? UINT16_MAX : (unsigned short)z;
+                depth[y][x + j] = old;
+                if (strict ? z < old : z <= old) allHidden = 0;
+            }
+        }
+        i = grDepthSpansOccluded(&pipe, strict);
+        CHECK(!i || allHidden);
+        rejected += i;
+    }
+    CHECK(rejected > 300);
+}
+
+static void test_early_depth_gradients(void)
+{
+    Gerbera_s state = {0};
+    _grPixelPipe pipe = {0};
+    _grVertex *vertices;
+    _grClipTriangle triangle;
+    TEST_RENDER_STACK(stack);
+    unsigned short depth[4][16];
+    unsigned int spans[4] = {3u | (4u << 16), 3u | (4u << 16),
+                             3u | (4u << 16), 3u | (4u << 16)};
+    int expected[3 * GR_GRADIENT_MAX];
+    unsigned int random = 1136;
+    int sample, i;
+
+    memset(stack, 0, sizeof(stackStorage.bytes));
+    state.renderStack = stack;
+    state.pixelPipeline = &pipe;
+    state.primitiveType = GR_PRIMITIVETYPE_TRIANGLE;
+    vertices = (_grVertex *)(stack + 1332);
+    vertices[0].screenPosition[0] = vertices[0].screenPosition[1] = 2 << 12;
+    vertices[1].screenPosition[0] = 14 << 12;
+    vertices[1].screenPosition[1] = 2 << 12;
+    vertices[2].screenPosition[0] = 2 << 12;
+    vertices[2].screenPosition[1] = 14 << 12;
+    triangle.indices = grSetIndices(0, 1, 2);
+    triangle.area = grRoundTriangleArea(grComputeTriangleArea(vertices, triangle.indices));
+    pipe.depthRow = depth;
+    pipe.checked.depthBufferStride = sizeof(depth[0]);
+    pipe.scanlineInfo = spans;
+    pipe.numScanlines = 4;
+    pipe.yStart = 3;
+
+    for (sample = 0; sample < 256; ++sample)
+    {
+        triangle.side = sample & 1;
+        state.depthFunc = sample & 2 ? GR_FUNC_LESS : GR_FUNC_LEQUAL;
+        state.capabilities[GR_CAPABILITY_SMOOTH_SHADING] = (sample >> 2) & 1;
+        for (i = 0; i < 3; ++i)
+        {
+            int side, component;
+            random = random * 1664525u + 1013904223u;
+            vertices[i].screenPosition[2] = (100 + (int)(random >> 24)) << 14;
+            for (side = 0; side < 2; ++side)
+                for (component = 0; component < 4; ++component)
+                    vertices[i].color.final[side][component] = (unsigned short)(random >> (component * 3));
+        }
+        memset(pipe.reference, 0x5A, sizeof(expected));
+        grSetupTriangleGradients(&state, &triangle, 1, 0x3Fu);
+        memcpy(expected, pipe.reference, sizeof(expected));
+        memset(depth, 0xFF, sizeof(depth));
+        memset(pipe.reference, 0x5A, sizeof(expected));
+        CHECK(grSetupTriangleGradientsVisible(&state, &triangle, 1, 0x3Fu, 1));
+        CHECK(memcmp(expected, pipe.reference, sizeof(expected)) == 0);
+
+        memset(depth, 0, sizeof(depth));
+        memset(pipe.reference, 0x5A, sizeof(expected));
+        CHECK(!grSetupTriangleGradientsVisible(&state, &triangle, 1, 0x3Fu, 1));
+        CHECK(pipe.reference[GR_GRADIENT_DEPTH] == expected[GR_GRADIENT_DEPTH]);
+        CHECK(pipe.xAdder[GR_GRADIENT_DEPTH] == expected[GR_GRADIENT_MAX]);
+        CHECK(pipe.yAdder[GR_GRADIENT_DEPTH] == expected[2 * GR_GRADIENT_MAX]);
+        for (i = GR_GRADIENT_FOG; i <= GR_GRADIENT_COLOR_A; ++i)
+            CHECK(pipe.reference[i] == 0x5A5A5A5A && pipe.xAdder[i] == 0x5A5A5A5A &&
+                  pipe.yAdder[i] == 0x5A5A5A5A);
+    }
+}
+
 static void test_gradients(void)
 {
     Gerbera_s st;
@@ -2512,6 +2652,33 @@ static void test_scanconvert(void)
     memset(st, 0, sizeof(*st));
     CHECK(grDivsu(100, 7) == 14);
     CHECK(grDivsu(0, 5) == 0);
+    {
+        static const int numerators[] = {
+            0, 1, -1, 16384, -16384, 0x7FFFFFFF, (int)0x80000000u
+        };
+        unsigned int random = 1136;
+        int denominator, n;
+        for (denominator = 1; denominator <= 8192; ++denominator)
+        {
+            for (n = 0; n < (int)(sizeof(numerators) / sizeof(numerators[0])); ++n)
+                CHECK(grDivideEdgeSlope(st, numerators[n], denominator) ==
+                      numerators[n] / denominator);
+            CHECK(grDivideEdgeSlope(st, denominator - 1, denominator) == 0);
+            CHECK(grDivideEdgeSlope(st, denominator, denominator) == 1);
+            CHECK(grDivideEdgeSlope(st, denominator + 1, denominator) ==
+                  (denominator + 1) / denominator);
+        }
+        for (n = 0; n < 16384; ++n)
+        {
+            int numerator, pass;
+            random = random * 1664525u + 1013904223u;
+            numerator = (int)random;
+            random = random * 1664525u + 1013904223u;
+            denominator = (int)(random & 0x7FFFFFFFu) | 1;
+            for (pass = 0; pass < 2; ++pass)
+                CHECK(grDivideEdgeSlope(st, numerator, denominator) == numerator / denominator);
+        }
+    }
 
     /* direct scanline emission without X scissoring */
     memset(pairs, 0, sizeof(pairs));
@@ -2599,8 +2766,8 @@ static void test_scanconvert(void)
     CHECK(words[11] == (17u | (1u << 16)));
     grSetRectangle(&st->renderScissor, 0, 64, 0, 64);
 
-    /* A flat top above the scissor leaves the unused top edge poisoned;
-     * advancing it must not introduce signed-overflow UB. */
+    /* A flat top above the scissor has no short top edge; clipping must
+     * skip that unused half and still advance the bottom edges. */
     {
         _grRasterPoint flat[3] = {
             { 0, -2 * 4096 }, { 8 * 4096, -2 * 4096 }, { 4 * 4096, 2 * 4096 }
@@ -2609,6 +2776,22 @@ static void test_scanconvert(void)
         CHECK(pp->yStart == 0);
         CHECK(pp->scanlineInfo[0] == (2u | (3u << 16)));
         CHECK(pp->scanlineInfo[1] == (3u | (1u << 16)));
+    }
+
+    {
+        _grRasterPoint empty[][3] = {
+            { { 0, 256 }, { 8 * 4096, 512 }, { 4 * 4096, 768 } },
+            { { 0, -3 * 4096 }, { 8 * 4096, -4096 }, { 4 * 4096, 0 } },
+            { { 0, 64 * 4096 }, { 8 * 4096, 65 * 4096 }, { 4 * 4096, 66 * 4096 } }
+        };
+        unsigned char saved[sizeof(*pp)];
+        memcpy(saved, pp, sizeof(saved));
+        for (i = 0; i < (int)(sizeof(empty) / sizeof(empty[0])); ++i)
+        {
+            CHECK(grScanConvertTriangle(st, &empty[i][0], &empty[i][1],
+                                         &empty[i][2], 8) == 0);
+            CHECK(memcmp(pp, saved, sizeof(saved)) == 0);
+        }
     }
 
     /* end-to-end grDrawClippedTriangle through the y-sort: rows, row
@@ -2628,17 +2811,18 @@ static void test_scanconvert(void)
     tri.area = 512;
     tri.side = 0;
     pp->mutableParams[0] = 123;
+    pp->mutableParams[1] = 123;
     pp->mutableParams[32] = 123;
     pp->mutableParams[40] = 123;
     pp->mutableParams[42] = 123;
     grDrawClippedTriangle(st, &tri, grSetIndices(0, 1, 2), 8);
     CHECK(pp->yStart == 12);
     CHECK(pp->numScanlines == 16);
-    CHECK(pp->mutableParams[1] == -623195394);
+    CHECK(pp->mutableParams[1] == (HG_ASSERT_ENABLED ? -623195394 : 123));
     CHECK(pp->mutableParams[0] == 123);             /* mask bit 0 clear */
     CHECK(pp->mutableParams[32] == 123);            /* mask byte 4 == 0 */
     CHECK(pp->mutableParams[40] == 123);            /* byte 5 bit 0 clear */
-    CHECK(pp->mutableParams[42] == -623195394);
+    CHECK(pp->mutableParams[42] == (HG_ASSERT_ENABLED ? -623195394 : 123));
     CHECK(pp->colorRow == colorBuf + 128 * 12);
     CHECK(pp->depthRow == depthBuf + 256 * 12);
     CHECK(pp->stencilRow == stencilBuf + 64 * 12);
@@ -5674,6 +5858,8 @@ static void test_gerbera_lifecycle_and_api_small(void)
 
     st = grCreateGerbera(minWork, workMem, NULL, 0);
     CHECK(st != NULL);
+    CHECK(st->pipelineCache->entryCount == GR_PIPELINE_CACHE_ENTRIES);
+    CHECK(st->pipelineCache->arenaSize == GR_PIPELINE_CACHE_BYTES);
     CHECK(st->scratchMemory != NULL && st->scratchMemorySize == 30720);
     CHECK(grTestCapability(st, GR_CAPABILITY_SMOOTH_SHADING) == 1);
 

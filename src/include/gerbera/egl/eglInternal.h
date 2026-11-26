@@ -180,6 +180,7 @@ typedef struct eglWindowSurface
     int                ownWindow;
     eglNativePixmap_s *backBufferBitmap;
     void              *windowGc;
+    int                sizeValidated;
 } eglWindowSurface;
 
 /* --- Shared config tables (eglUtil.c) -------------------------------------- */
@@ -248,6 +249,7 @@ int                egliBlitToPixmap(eglSurface_s *surface, eglNativePixmap_s *ta
 void               egliWindowSurfaceDestroy(eglWindowSurface *winSurface);
 void               egliPixmapSurfaceDestroy(eglPixmapSurface *pixSurface);
 int                egliSurfaceResized(eglSurface_s *surface);
+void               egliInvalidateWindowSurface(eglSurface_s *surface);
 void               egliFixConfig(eglConfig *config);
 void               egliFixPixelOffsets(oglSurfaceDescriptor *desc, const eglSurface_s *surface);
 int                egliCompareConfigs(const TEGLCachedConfig *config1, const TEGLCachedConfig *config2);

@@ -1269,7 +1269,7 @@ Gerbera_s *grCreateGerbera(int workMemorySize, unsigned char *workMemory,
     unsigned int magic0 = 0xDEADBEEFu;
     unsigned int magic1 = 0xC001D00Eu;
     int stateBytes = ((int)sizeof(Gerbera_s) + 7) & ~7;
-    int entryBytes = 32 * (((int)sizeof(_grCacheEntry) + 7) & ~7);
+    int entryBytes = GR_PIPELINE_CACHE_ENTRIES * (((int)sizeof(_grCacheEntry) + 7) & ~7);
     Gerbera_s *state;
     _grCacheEntry *entries;
     grExecutable_s *exec;
@@ -1298,19 +1298,14 @@ Gerbera_s *grCreateGerbera(int workMemorySize, unsigned char *workMemory,
     grStackAllocate(&state->allocator, stateBytes);
     entries = (_grCacheEntry *)grStackAllocate(&state->allocator, entryBytes);
 
-#if defined(__arm__) || defined(__SYMBIAN32__)
-    /* The ARM driver allocates 24576 bytes (0x6000) for this code arena. */
-    exec = eglAllocExecutable(0x6000u);
-#else
-    exec = eglAllocExecutable(0x3000u);
-#endif
+    exec = eglAllocExecutable(GR_PIPELINE_CACHE_BYTES);
     state->pipelineCacheExecutable = exec;
     if (exec == NULL)
         return NULL;
 
     state->pipelineCache = &state->pipelineCacheStorage;
     grCacheInit(state->pipelineCache, eglGetExecutableData(exec), entries,
-                eglGetExecutableSize(exec), 32);
+                eglGetExecutableSize(exec), GR_PIPELINE_CACHE_ENTRIES);
 
     state->setjmpConfigStorage.longjmp = eglHCWrapLongjmp;
     state->setjmpConfigStorage.setjmpWrap = eglHCWrapSetjmp;

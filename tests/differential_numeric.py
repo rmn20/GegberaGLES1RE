@@ -307,6 +307,12 @@ def check_matrices(suite, address_map=None):
     functions["IMatrix4x4_det2h"].argtypes = [pointer] + [ctypes.c_int32] * 4
     functions["IVertexTransform_copy"].argtypes = [pointer, pointer]
     functions["IVertexTransform_zmulxv4"].argtypes = [pointer, pointer]
+    prepare_float = suite.lib.IVertexTransform_prepareFloat
+    prepare_float.argtypes = [pointer, pointer, ctypes.c_uint32]
+    prepare_float.restype = None
+    prepared_float = suite.lib.IVertexTransform_mulfv4Prepared
+    prepared_float.argtypes = [pointer, pointer, pointer, pointer]
+    prepared_float.restype = None
     for name in ("IMatrix4x4_getfv", "IMatrix4x4_transpose", "IVertexTransform_zmulfv4"):
         functions[name].argtypes = [pointer, pointer]
     functions["IMatrix4x4_inversetranspose"].argtypes = [pointer, pointer, ctypes.c_int32]
@@ -442,8 +448,14 @@ def check_matrices(suite, address_map=None):
             compare_output(suite, "IMatrix4x4_mulfv4", entries["IMatrix4x4_mulfv4"][0],
                            [recovered, vector], 20)
             for name in ("IVertexTransform_mulfv4", "IVertexTransform_mulfv4s"):
-                compare_output(suite, name, entries[name][0], [fields, vector], 20,
-                               original_arguments=[canonical, vector])
+                expected = compare_output(suite, name, entries[name][0], [fields, vector], 20,
+                                          original_arguments=[canonical, vector])
+                if name == "IVertexTransform_mulfv4":
+                    plan, output = host_buffer(b"", 36), host_buffer(b"", 20)
+                    prepare_float(plan, native_transform, struct.unpack_from("<I", vector)[0])
+                    prepared_float(output, native_transform, host_buffer(vector), plan)
+                    suite.compare(name, {"matrix": matrix, "position": position, "prepared": True},
+                                  bytes(output)[:20], expected)
             native_vector = host_buffer(vector)
             expected = functions["IVertexTransform_zmulfv4"](native_transform, native_vector) & MASK32
             suite.oracle.reset()

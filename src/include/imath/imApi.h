@@ -51,6 +51,34 @@ typedef struct _IVertexTransform
     HGuint32 cl;
 } _IVertexTransform;
 
+/* Dot-product alignment for one transform and one packed input exponent. */
+typedef struct _IFVertexTransformPlan
+{
+    HGuint32 inputExponent;
+    HGuint32 shift[4];
+    HGint32 exponent[4];
+} _IFVertexTransformPlan;
+
+/* Shared matrix scale for bounded-error float position transforms. */
+typedef struct _ICommonVertexTransform
+{
+    HGint32 m[4][4];
+    HGint32 exponent;
+    HGuint32 eligible;
+} _ICommonVertexTransform;
+
+enum
+{
+    IM_COMMON_TRANSFORM_SPREAD = 16,
+    IM_COMMON_TRANSFORM_MIN_W = 1 << 17,
+    IM_COMMON_TRANSFORM_CLIP_MARGIN = 32,
+    IM_COMMON_TRANSFORM_ERROR = 8
+};
+
+void IVertexTransform_prepareCommon(_ICommonVertexTransform *plan, const _IVertexTransform *transform);
+/* Input must come from IFVector4_setfv. Zero leaves out unchanged for the precise fallback. */
+int IVertexTransform_mulfv4Common(_IVector4 *out, const _ICommonVertexTransform *plan, const _IFVector4 *in);
+
 /* imath assert: same semantics as in the reference build - prints through
  * grAssert and dies.  Call sites keep the original file/line strings. */
 void imAssert(const char *expr, const char *file, unsigned int line);
@@ -281,6 +309,9 @@ int  IMatrix4x4_inversetranspose(_XNormalTransform *pD, _IMatrix4x4 *matrix, int
 void IVertexTransform_copy(_IVertexTransform *pD, _IMatrix4x4 *pM);
 void IVertexTransform_mulxv4(_IVector4 *pD, _IVertexTransform *pT, int *pB);
 void IVertexTransform_mulfv4(_IVector4 *pD, _IVertexTransform *pT, _IFVector4 *pS);
+void IVertexTransform_prepareFloat(_IFVertexTransformPlan *plan, _IVertexTransform *t, unsigned int exponent);
+void IVertexTransform_mulfv4Prepared(_IVector4 *d, _IVertexTransform *t, _IFVector4 *s,
+                                    const _IFVertexTransformPlan *plan);
 void IVertexTransform_mulxv4s(_IFVector4 *pD, _IVertexTransform *pT, int *pB);
 void IVertexTransform_mulfv4s(_IFVector4 *pD, _IVertexTransform *pT, _IFVector4 *pB);
 int  IVertexTransform_zmulfv4(_IVertexTransform *pT, _IFVector4 *pS);

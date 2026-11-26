@@ -271,18 +271,13 @@ int hgEq64(HGint64 a, HGint64 b)
 HGint64 hgLsl64(HGint64 a, int sh)
 {
     HG_ASSERT_AT("hgInt64Native.inl", 1016, sh >= 0 && sh <= 63);
-    if ((sh & 0x20) == 0)
-        return (HGint64)((HGuint64)a << (sh & 31));
-    /* shift by >= 32: low word vanishes, high word = low word << (sh & 31) */
-    return hgSet64((int)((HGuint32)a << (sh & 31)), 0);
+    return (HGint64)((HGuint64)a << (sh & 63));
 }
 
 int hgLsl64h(HGint64 a, int sh)
 {
     HG_ASSERT_AT("hgInt64Native.inl", 1104, sh >= 0 && sh <= 63);
-    if ((sh & 0x20) != 0)
-        return (int)((HGuint32)a << (sh & 31));
-    return (int)(((HGuint64)a << sh) >> 32);
+    return (int)(((HGuint64)a << (sh & 63)) >> 32);
 }
 
 int hgLsl64h_0_31(HGint64 a, int sh)
@@ -294,17 +289,13 @@ int hgLsl64h_0_31(HGint64 a, int sh)
 HGint64 hgLsr64(HGint64 a, int sh)
 {
     HG_ASSERT_AT("hgInt64Native.inl", 1194, sh >= 0 && sh <= 63);
-    if ((sh & 0x20) != 0)
-        return (HGint64)(HGuint32)((HGuint64)a >> 32 >> (sh & 31));
-    return (HGint64)((HGuint64)a >> (sh & 31));
+    return (HGint64)((HGuint64)a >> (sh & 63));
 }
 
 HGint64 hgAsr64(HGint64 a, int sh)
 {
     HG_ASSERT_AT("hgInt64Native.inl", 1393, sh >= 0 && sh <= 63);
-    if ((sh & 0x20) != 0)
-        return hgGet64h(a) >> (sh & 31);
-    return a >> (sh & 31);
+    return a >> (sh & 63);
 }
 
 HGint64 hgAsr64_0_31(HGint64 a, int sh)
@@ -340,7 +331,14 @@ HGuint64 hgMulu64(HGuint32 a, HGuint32 b)
 
 int hgMul64h(int a, int b)
 {
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && \
+    defined(__ARM_ARCH) && __ARM_ARCH >= 6 && !defined(__thumb__)
+    int result;
+    __asm__("smmul %0, %1, %2" : "=r"(result) : "r"(a), "r"(b));
+    return result;
+#else
     return (int)(((HGint64)a * (HGint64)b) >> 32);
+#endif
 }
 
 HGuint32 hgMulu64h(HGuint32 a, HGuint32 b)
@@ -350,16 +348,7 @@ HGuint32 hgMulu64h(HGuint32 a, HGuint32 b)
 
 HGint64 hgMul64x32(HGint64 a, int b)
 {
-    /* a * b in two halves, avoiding 64x64 multiply (DLL 22624: hgMulu64's
-     * FULL 64-bit product is kept - its high word carries the partial-product
-     * carry into the result high word) */
-    HGuint32 low  = (HGuint32)hgGet64l(a);
-    HGuint64 lowP = hgMulu64(low, (HGuint32)b);
-    HGint64  res  = hgToSigned64(lowP);
-    HGuint32 highP = (HGuint32)b * (HGuint32)hgGet64h(a);
-    HGuint32 mid = (HGuint32)hgGet64h(res) + highP;
-    mid -= (HGuint32)(b >> 31) & low;  /* sign correction */
-    return hgSet64((int)mid, hgGet64l(res));
+    return (HGint64)((HGuint64)a * (HGuint64)(HGint64)b);
 }
 
 HGint64 hgMadd64(HGint64 a, int b, int c)

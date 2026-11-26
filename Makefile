@@ -9,7 +9,7 @@ LIB_DIRS := src/hg src/imath src/gerbera src/gerbera/hc \
 LIB_SRC := $(foreach dir,$(LIB_DIRS),$(wildcard $(dir)/*.c))
 LIB_OBJ := $(LIB_SRC:%.c=$(BUILD)/%.o)
 
-TEST_NAMES := hg imath geometry core opengl egl symbian_surface symbian_state egl_threads
+TEST_NAMES := hg imath geometry core blit opengl egl symbian_surface symbian_state egl_threads
 TEST_OBJ := $(addprefix $(BUILD)/tests/test_,$(addsuffix .o,$(TEST_NAMES)))
 TEST_BINS := $(addprefix $(BUILD)/test_,$(TEST_NAMES))
 SYMBIAN_TEST_FLAGS := -DNDEBUG -ffunction-sections -fdata-sections -Wno-attributes -idirafter symbian/include
@@ -20,7 +20,7 @@ else
 TEST_GC_LDFLAGS := -Wl,--gc-sections
 endif
 
-.PHONY: all test check differential differential-build differential-harness-check differential-coverage symbian-entry-check native-dispatch-check library-sources win32 symbian clean
+.PHONY: all test check differential differential-build differential-harness-check differential-coverage symbian-entry-check native-dispatch-check arm-jit-check library-sources win32 symbian clean
 all: $(BUILD)/libgerbera.a
 
 library-sources:
@@ -34,6 +34,10 @@ symbian:
 
 symbian-entry-check: differential-build
 	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_symbian_entry.py
+
+.PHONY: arm-division-check
+arm-division-check: differential-build
+	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_arm_division.py
 
 $(BUILD)/%.o: %.c Makefile
 	@mkdir -p $(dir $@)
@@ -92,6 +96,14 @@ check: test differential
 # Cross-target dispatch ABI checks; requires Clang, ld.lld and Unicorn.
 native-dispatch-check: differential-build
 	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_native_dispatch.py
+
+arm-jit-check:
+	@set -e; for mode in 0 1; do \
+	    dir=$(BUILD)/arm-jit-$$mode; armv5=; \
+	    if [ "$$mode" = 0 ]; then armv5=--armv5; fi; \
+	    $(MAKE) BUILD=$$dir CFLAGS='$(CFLAGS) -DGERBERA_ARMV6_JIT='$$mode differential-build; \
+	    $(PYTHON) tests/test_arm_jit.py --library $$dir/differential/libgerbera_diff.so $$armv5; \
+	done
 
 # Optional recovered-C coverage, measured during the same binary comparisons.
 COVERAGE_CC ?= clang

@@ -150,6 +150,42 @@ int emulator_evalALUOp(HCOP_e op, unsigned int s0, unsigned int s1)
             HC_assertFail("s1 < 32", "hcEmulator.c", 129, NULL);
         res = (int)(s0 >> s1);
         break;
+    case HCOP_UQADD8:
+    case HCOP_UQSUB8:
+    case HCOP_PACKED_ALPHA_A:
+    case HCOP_PACKED_ALPHA_B:
+    case HCOP_UQADD8_RGB:
+    case HCOP_UQSUB8_RGB:
+    case HCOP_PACKED_ALPHA_RGB_A:
+    case HCOP_PACKED_ALPHA_RGB_B:
+    {
+        unsigned int shift, result = 0;
+        unsigned int alpha = (op == HCOP_PACKED_ALPHA_A || op == HCOP_PACKED_ALPHA_RGB_A ? s0 : s1) >> 24;
+        unsigned int bits = op >= HCOP_UQADD8_RGB ? 24u : 32u;
+        for (shift = 0; shift < bits; shift += 8)
+        {
+            unsigned int a = (s0 >> shift) & 255u, b = (s1 >> shift) & 255u;
+            unsigned int v;
+            if (op == HCOP_UQADD8 || op == HCOP_UQADD8_RGB) v = a + b < 255u ? a + b : 255u;
+            else if (op == HCOP_UQSUB8 || op == HCOP_UQSUB8_RGB) v = a > b ? a - b : 0;
+            else v = ((a * (alpha + 1)) >> 8) + ((b * (256 - alpha)) >> 8);
+            result |= v << shift;
+        }
+        res = (int)result;
+        break;
+    }
+    case HCOP_UXTB_ROR:
+        res = (int)(emu_ror32(s0, s1) & 255u);
+        break;
+    case HCOP_UXTB16:
+        res = (int)(emu_ror32(s0, s1) & 0x00FF00FFu);
+        break;
+    case HCOP_UXTAB16_ROR8:
+    {
+        unsigned int pair = (s1 >> 8) & 0x00FF00FFu;
+        res = (int)(((s0 + pair) & 0xFFFFu) | ((s0 & 0xFFFF0000u) + (pair & 0xFFFF0000u)));
+        break;
+    }
     case HCOP_MAXS:
         res = ((int)s0 <= (int)s1) ? (int)s1 : (int)s0;
         break;

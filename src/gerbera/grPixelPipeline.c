@@ -9,6 +9,7 @@
 #include "gerbera/grState.h"
 #include "gerbera/grDefs.h"
 #include "gerbera/grRGBA.h"
+#include "gerbera/grARMPixel.h"
 #include "gerbera/hc/hcCompiler.h"
 #include "hg/hgFill.h"
 #include "hg/hgInt32.h"
@@ -1678,12 +1679,139 @@ void grEvaluatePixelPipeline(Gerbera_s *state, _grSignature *signature)
         (unsigned char)grGetRectGradients(state);
 }
 
+#if GERBERA_ARMV6_JIT
+static int grSpanPackedRGB(const unsigned char *sizes)
+{
+    return (sizes[0] == 5 && sizes[1] == 6 && sizes[2] == 5 && sizes[3] == 0) ||
+        (sizes[0] == 8 && sizes[1] == 8 && sizes[2] == 8 && (sizes[3] == 0 || sizes[3] == 8));
+}
+
+#endif
+
+static unsigned int grPixelPipelineOptimizationMask(const _grSignature *sig)
+{
+#if GERBERA_ARMV6_JIT
+    const unsigned char *tex = sig->texture[0];
+    unsigned int mask = HC_OPT_ALL;
+    int modulate = !sig->flatShading && tex[24] == GR_TEXENVCOMBSRC_PREVIOUS &&
+        tex[28] == GR_TEXENVCOMBSRC_TEXTURE && tex[30] == GR_TEXENVCOMBOPERAND_SRC_COLOR &&
+        tex[36] == GR_TEXENVCOMBFUNC_MODULATE;
+    if (sig->writeColor && !sig->screenRectGradients && modulate &&
+        !sig->blendEnabled && !sig->logicOpEnabled && !sig->applyColorWriteMask &&
+        !sig->alphaTest && !sig->stencilTest &&
+        (!sig->depthTest || sig->descriptor.depthBytes == 2) &&
+        tex[16] && tex[17] && !sig->texture[1][16] && !tex[19] && !tex[20] &&
+        tex[21] == GR_WRAPMODE_REPEAT && tex[22] == GR_WRAPMODE_REPEAT &&
+        tex[26] == GR_TEXENVCOMBOPERAND_SRC_COLOR && !tex[38] && !tex[39])
+    {
+        if ((sig->depthTest && sig->descriptor.colorBytes == 2) ||
+            (!sig->dither && (sig->fogEnabled || sig->descriptor.rgbaSizes[3] != 0) &&
+             grSpanPackedRGB(sig->descriptor.rgbaSizes) && grSpanPackedRGB(tex + 4)))
+            mask |= HC_OPT_SPAN_GRADIENTS;
+        if (sig->depthTest && sig->descriptor.colorBytes == 2 &&
+            !sig->fogEnabled && !sig->constantDepth &&
+            !sig->depthClampMin && !sig->depthClampMax &&
+            (sig->depthFunc == GR_FUNC_LESS || sig->depthFunc == GR_FUNC_LEQUAL))
+            mask |= HC_OPT_SPAN_GRADIENTS | HC_OPT_DEPTH_REJECT_RUNS;
+    }
+    return mask;
+#else
+    return HC_OPT_ALL;
+#endif
+}
+
+static void grEvaluateEffectivePixelPipeline(Gerbera_s *state, _grSignature *signature)
+{
+    if (state->constWhiteModulate != 0)
+    {
+        int savedMode = state->textureUnit[0].texEnvMode;
+        state->textureUnit[0].texEnvMode = GR_TEXENVMODE_REPLACE;
+        grEvaluatePixelPipeline(state, signature);
+        state->textureUnit[0].texEnvMode = savedMode;
+    }
+    else
+    {
+        grEvaluatePixelPipeline(state, signature);
+    }
+}
+
+/* The compressed descriptor occupies 313 bits. Its seven high padding bits
+ * distinguish fixed base-level texture dimensions from the generic program. */
+enum
+{
+    GR_TEXTURE_LAYOUT_DIM_COUNT = 11,
+    GR_TEXTURE_LAYOUT_KEY_BITS = 7,
+    GR_TEXTURE_LAYOUT_KEY_SHIFT = 32 - GR_TEXTURE_LAYOUT_KEY_BITS,
+    GR_TEXTURE_LAYOUT_KEY_MASK = (1 << GR_TEXTURE_LAYOUT_KEY_BITS) - 1
+};
+
+unsigned int grGetPixelTextureLayout(const Gerbera_s *state)
+{
+#if GERBERA_ARMV6_JIT
+    const _grTexture *texture;
+    int width, height;
+    if (state == NULL) return 0;
+    texture = state->textureUnit[0].texture;
+    if (!state->useTexUnit[0] || state->useTexUnit[1] || texture == NULL ||
+        (texture->filterMask[GR_FILTERTYPE_MAG] & GR_FILTERMASK_FILTER) ||
+        (texture->filterMask[GR_FILTERTYPE_MIN] & GR_FILTERMASK_FILTER) ||
+        (texture->wrapMode[0] != GR_WRAPMODE_REPEAT && texture->wrapMode[0] != GR_WRAPMODE_MIRRORED_REPEAT) ||
+        (texture->wrapMode[1] != GR_WRAPMODE_REPEAT && texture->wrapMode[1] != GR_WRAPMODE_MIRRORED_REPEAT) ||
+        (texture->filterMask[GR_FILTERTYPE_MIN] & GR_FILTERMASK_USE_MIPMAPS))
+        return 0;
+    width = texture->mipmap[0].log2Dim[0];
+    height = texture->mipmap[0].log2Dim[1];
+    if ((unsigned int)width >= GR_TEXTURE_LAYOUT_DIM_COUNT ||
+        (unsigned int)height >= GR_TEXTURE_LAYOUT_DIM_COUNT)
+        return 0;
+    return (1u + GR_TEXTURE_LAYOUT_DIM_COUNT * (unsigned int)width + (unsigned int)height) |
+        ((texture->wrapMode[0] == GR_WRAPMODE_MIRRORED_REPEAT) << GR_TEXTURE_LAYOUT_KEY_BITS) |
+        ((texture->wrapMode[1] == GR_WRAPMODE_MIRRORED_REPEAT) << (GR_TEXTURE_LAYOUT_KEY_BITS + 1));
+#else
+    (void)state;
+    return 0;
+#endif
+}
+
+static unsigned int grCompressEffectiveSignature(Gerbera_s *state,
+                                                  _grCacheSignature *compressed,
+                                                  _grSignature *signature)
+{
+    unsigned int layout = grGetPixelTextureLayout(state);
+    unsigned int last;
+    grCompressSignature(compressed, signature);
+    memcpy(&last, compressed->bytes + 36, sizeof(last));
+    last |= (layout & GR_TEXTURE_LAYOUT_KEY_MASK) << GR_TEXTURE_LAYOUT_KEY_SHIFT;
+    memcpy(compressed->bytes + 36, &last, sizeof(last));
+    return layout;
+}
+
+static void grSpecializeTextureLayout(HCInstr_s *program, unsigned int layout,
+                                      const _grSignature *signature)
+{
+    /* Byte offsets in the 32-bit HC parameter block, independent of host ABI. */
+    enum { TEX_S_MASK = 16, TEX_T_MASK = 20, TEX_S_SHIFT = 24,
+           TEX_T_SHIFT = 28, TEX_WIDTH_LOG2 = 32 };
+    layout &= GR_TEXTURE_LAYOUT_KEY_MASK;
+    if (layout != 0)
+    {
+        int width = (int)((layout - 1) / GR_TEXTURE_LAYOUT_DIM_COUNT);
+        int height = (int)((layout - 1) % GR_TEXTURE_LAYOUT_DIM_COUNT);
+        int sShift = signature->texture[0][21] == GR_WRAPMODE_REPEAT ? 32 : 31;
+        int tShift = signature->texture[0][22] == GR_WRAPMODE_REPEAT ? 32 : 31;
+        HC_setConstantParameter(program, TEX_S_MASK, (1 << width) - 1);
+        HC_setConstantParameter(program, TEX_T_MASK, (1 << height) - 1);
+        HC_setConstantParameter(program, TEX_S_SHIFT, width ? sShift - width : 0);
+        HC_setConstantParameter(program, TEX_T_SHIFT, height ? tShift - height : 0);
+        HC_setConstantParameter(program, TEX_WIDTH_LOG2, width);
+    }
+}
+
 /* --- grEnsureValidPixelPipeline (grPixelPipeline.inl 1080; DLL 37112-37279) ----
  * Evaluates + compresses the signature, looks the program up in the
  * pipeline cache and, on a hit, publishes the entry's gradient mask. On a
- * miss it grows the scratch memory, runs the HC program generator
- * (grExecuteProgram) and the bytecode compiler (HC_compile, backend from
- * grGetBackend) and inserts the result. An allocation or compilation failure
+ * miss it emits supported ARM scanlines directly or runs the HC program
+ * generator and compiler, then inserts the result. An allocation or compilation failure
  * leaves compilationFailed set and returns without publishing a program. */
 
 void grEnsureValidPixelPipeline(Gerbera_s *state)
@@ -1693,11 +1821,12 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
     unsigned char paramMask[16];
     void *entry;
     unsigned int gradientMask = 0;
+    unsigned int textureLayout;
     unsigned int magic0 = GR_STACK_CHECK_MAGIC0;
     unsigned int magic1 = GR_STACK_CHECK_MAGIC1;
 
-    grEvaluatePixelPipeline(state, &signature);
-    grCompressSignature(&compressed, &signature);
+    grEvaluateEffectivePixelPipeline(state, &signature);
+    textureLayout = grCompressEffectiveSignature(state, &compressed, &signature);
     entry = grCacheFind(state->pipelineCache, &compressed, &gradientMask);
     if (entry == NULL)
     {
@@ -1705,6 +1834,7 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
         void *code = NULL;
         int lengthInBytes;
         int g;
+        int direct = 0;
 
         state->compilationFailed = 1;
         if (state->scratchMemory == NULL)
@@ -1726,7 +1856,19 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
             }
         }
 
-        for (;;)
+        if (backend == HCARMBackend_create())
+        {
+            lengthInBytes = grCompileARMPixelPipeline(state->scratchMemory, state->scratchMemorySize,
+                                                      &signature, textureLayout, &gradientMask);
+            if (lengthInBytes > 0)
+            {
+                code = state->scratchMemory;
+                state->compilationFailed = 0;
+                direct = 1;
+            }
+        }
+
+        while (!direct)
         {
             char *scratch = (char *)state->scratchMemory;
             int scratchSize = state->scratchMemorySize;
@@ -1745,6 +1887,7 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
                          "grPixelPipeline.inl", 1125) != 0)
                 grDie(0);
 
+            grSpecializeTextureLayout(hcTmpCode, textureLayout, &signature);
             lengthInBytes = HC_compile(
                 scratch,
                 scratchSize,
@@ -1752,7 +1895,7 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
                 &code,
                 hcTmpCode,
                 backend,
-                0x3FFu,
+                grPixelPipelineOptimizationMask(&signature),
                 paramMask,
                 (unsigned char *)g_mutableParamsMask,
                 78);
@@ -1779,9 +1922,12 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
             grAssert("lengthInBytes > 0", "grPixelPipeline.inl", 1153) != 0)
             grDie(0);
 
-        gradientMask = 0;
-        for (g = 0; g < 10; ++g)
-            gradientMask += (unsigned int)(grIsGradientUsed(paramMask, g) << g);
+        if (!direct)
+        {
+            gradientMask = 0;
+            for (g = 0; g < 10; ++g)
+                gradientMask += (unsigned int)(grIsGradientUsed(paramMask, g) << g);
+        }
 
         entry = grCacheInsert(state->pipelineCache, &compressed,
                               gradientMask, code, lengthInBytes);
@@ -1798,6 +1944,7 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
         state->numActiveGradients = index;
         state->activeGradientMask = (int)gradientMask;
         state->pixelPipelineCode = (grPixelPipelineCode_fn)entry;
+        state->pixelTextureLayout = textureLayout;
     }
     if ((magic0 != (unsigned int)GR_STACK_CHECK_MAGIC0 ||
          magic1 != (unsigned int)GR_STACK_CHECK_MAGIC1) &&
@@ -1814,6 +1961,7 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
 
 void grCheckPixelPipeConsistency(Gerbera_s *state)
 {
+#if HG_ASSERT_ENABLED
     unsigned int magic0 = GR_STACK_CHECK_MAGIC0;
     unsigned int magic1 = GR_STACK_CHECK_MAGIC1;
 
@@ -1826,8 +1974,8 @@ void grCheckPixelPipeConsistency(Gerbera_s *state)
         unsigned int gradientMask = 0;
         void *code;
 
-        grEvaluatePixelPipeline(state, &signature);
-        grCompressSignature(&compressed, &signature);
+        grEvaluateEffectivePixelPipeline(state, &signature);
+        grCompressEffectiveSignature(state, &compressed, &signature);
         code = grCacheFind(state->pipelineCache, &compressed, &gradientMask);
         if ((void *)code != (void *)state->pixelPipelineCode &&
             grAssert("pixelPipelineCode == state->pixelPipelineCode",
@@ -1845,4 +1993,7 @@ void grCheckPixelPipeConsistency(Gerbera_s *state)
             "__grMemoryCheck[0]==GR_STACK_CHECK_MAGIC0 && __grMemoryCheck[1]==GR_STACK_CHECK_MAGIC1",
             "grPixelPipeline.inl", 1239) != 0)
         grDie(0);
+#else
+    (void)state;
+#endif
 }

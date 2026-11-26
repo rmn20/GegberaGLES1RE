@@ -25,11 +25,12 @@ int grSubpixelTrunc(int i);   /* grClipper.c (grUtil.h; DLL 004214A0) */
     ((_grVertex *)((unsigned char *)(state)->renderStack + 1332))
 
 #define GR_PIXEL_PIPE(state) ((_grPixelPipe *)(state)->pixelPipeline)
-#define GR_VERTEX_BUFFER(state) \
-    ((_grVertex *)((unsigned char *)(state)->renderStack + 1332))
 
 /* --- grSetupGradient (grRasterizer.inl 500; DLL 25988-26026) ---------------- */
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
                      int reference)
 {
@@ -118,8 +119,8 @@ void grComputeDeltas(_grGradientInfo *info, int gradient, int g01, int g02)
  * unit, coord 1..0 (T then S) - gradient index = coord + 2*texIndex + 6.
  */
 
-void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
-                              int flatShadeIndex, unsigned int gradientMask)
+int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
+                              int flatShadeIndex, unsigned int gradientMask, int rejectDepth)
 {
     int ok = 1;
 
@@ -181,6 +182,31 @@ void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
         info.v0sx = v0sx;
         info.v0sy = v0sy;
 
+        /* depth gradient (+ depth offset when the polygon-offset capability
+         * for the current primitive class is on) */
+        if ((gradientMask & 1) != 0)
+        {
+            int d0 = v0->screenPosition[2];
+            int d1 = v1->screenPosition[2];
+            int d2 = v2->screenPosition[2];
+
+            grSetupGradient(&info, GR_GRADIENT_DEPTH, d1 - d0, d2 - d0, d0);
+            if (grIsDepthOffsetEnabled(state, state->primitiveType) != 0)
+                grComputeDepthOffset(state);
+        }
+        /* Test the exact depth plane before preparing shading attributes.
+         * References remain relative to the origin for the draw's row advance. */
+        if (rejectDepth && (gradientMask & (1u << GR_GRADIENT_DEPTH)))
+        {
+            int reference = pixelPipe->reference[GR_GRADIENT_DEPTH];
+            int hidden;
+            pixelPipe->reference[GR_GRADIENT_DEPTH] = (int)((unsigned int)reference +
+                (unsigned int)pixelPipe->yAdder[GR_GRADIENT_DEPTH] * (unsigned int)pixelPipe->yStart);
+            hidden = grDepthSpansOccluded(pixelPipe, state->depthFunc == GR_FUNC_LESS);
+            pixelPipe->reference[GR_GRADIENT_DEPTH] = reference;
+            if (hidden) return 0;
+        }
+
         /* texcoord gradients (texIndex 1..0) */
         for (texIndex = GR_GRADIENT_FOG; texIndex >= GR_GRADIENT_DEPTH; --texIndex)
         {
@@ -221,19 +247,6 @@ void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
                 pairs[1][1] = preShift[1];
                 grSetupTextureUnit(state, texIndex, pairs, v0sx, v0sy);
             }
-        }
-
-        /* depth gradient (+ depth offset when the polygon-offset capability
-         * for the current primitive class is on) */
-        if ((gradientMask & 1) != 0)
-        {
-            int d0 = v0->screenPosition[2];
-            int d1 = v1->screenPosition[2];
-            int d2 = v2->screenPosition[2];
-
-            grSetupGradient(&info, GR_GRADIENT_DEPTH, d1 - d0, d2 - d0, d0);
-            if (grIsDepthOffsetEnabled(state, state->primitiveType) != 0)
-                grComputeDepthOffset(state);
         }
 
         /* fog gradient (fog rides the back-alpha slot, record +54) */
@@ -304,6 +317,13 @@ void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
             }
         }
     }
+    return 1;
+}
+
+void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
+                              int flatShadeIndex, unsigned int gradientMask)
+{
+    (void)grSetupTriangleGradientsVisible(state, tri, flatShadeIndex, gradientMask, 0);
 }
 
 /* --- grDivsu (grScanConvert.inl 29; DLL 24922-24932) ------------------------- */
@@ -314,6 +334,43 @@ int grDivsu(int a, int b)
         grDie(0);
     return a / b;
 }
+
+#if defined(__GNUC__) && defined(__arm__)
+__attribute__((always_inline))
+#endif
+static inline int grDivideEdgeSlopeCached(Gerbera_s *state, int numerator, int denominator)
+{
+    unsigned int divisor, magnitude, reciprocal, quotient, slot;
+
+    if (denominator <= 0)
+        return grDivsu(numerator, denominator);
+    divisor = (unsigned int)denominator;
+    slot = (divisor ^ (divisor >> 6)) & (GR_EDGE_SLOPE_CACHE_SIZE - 1u);
+    reciprocal = state->edgeSlopeCache[slot].reciprocal;
+    if (state->edgeSlopeCache[slot].divisor != divisor)
+    {
+        reciprocal = 0xFFFFFFFFu / divisor;
+        state->edgeSlopeCache[slot].divisor = divisor;
+        state->edgeSlopeCache[slot].reciprocal = reciprocal;
+    }
+    magnitude = numerator < 0 ? 0u - (unsigned int)numerator
+                              : (unsigned int)numerator;
+    /* The high word of n * floor((2^32-1)/d) is n/d or one less. */
+    quotient = hgMulu64h(magnitude, reciprocal);
+    quotient += magnitude - quotient * divisor >= divisor;
+    return numerator < 0 ? (int)(0u - quotient) : (int)quotient;
+}
+
+int grDivideEdgeSlope(Gerbera_s *state, int numerator, int denominator)
+{
+    return grDivideEdgeSlopeCached(state, numerator, denominator);
+}
+
+#if defined(__arm__) && !defined(__ARM_FEATURE_IDIV)
+#define GR_DIVIDE_EDGE(state, a, b) grDivideEdgeSlopeCached(state, a, b)
+#else
+#define GR_DIVIDE_EDGE(state, a, b) grDivsu(a, b)
+#endif
 
 /* --- grScanConvertWithXScissoring (grScanConvert.inl 55; DLL 24935-25025) -----
  * Emits one u32 per scanline (left | numPixels << 16) for the top half and
@@ -469,6 +526,9 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
                           int emptyBits)
 {
     _grRect *scissor = &state->renderScissor;
+    if ((p0->y >> 12) >= (p2->y >> 12) ||
+        (p2->y >> 12) <= scissor->y0 || (p0->y >> 12) >= scissor->y1)
+        return 0;
     int d10x = (p1->x - p0->x) >> emptyBits;   /* 12.4 pixel deltas */
     int d10y = (p1->y - p0->y) >> emptyBits;
     int d20x = (p2->x - p0->x) >> emptyBits;
@@ -493,7 +553,7 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
     int fracV0y = 4095 - (p0->y & 0xFFF);      /* distance to the next
                                                 * scanline (0.12, -1 LSB) */
     int fracV1y = 4095 - (p1->y & 0xFFF);
-    int slope02 = grDivsu(imLsl32OF(d20x, 14), d20y);  /* long-edge slope,
+    int slope02 = GR_DIVIDE_EDGE(state, imLsl32OF(d20x, 14), d20y);  /* long-edge slope,
                                                 * 2.14 per scanline */
     int longAtV0 = 4 * p0->x + (int)(((long long)fracV0y * slope02) >> 12);
     int longAtV1 = longAtV0 + slope02 * (v1yT - v0yT);  /* UNCLAMPED middle
@@ -531,7 +591,6 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         grAssert("!(v2sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 257) != 0)
         grDie(0);
 
-    memset(edges, 0xCC, sizeof(edges));
     edges[0].xStart[side] = (int)longAtV0;     /* long edge, top half */
     edges[0].xAdder[side] = slope02;
     edges[1].xStart[side] = longAtV1;          /* long edge, bottom half
@@ -540,7 +599,7 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
     side ^= 1;
     if (topHeight > 0)
     {
-        int slope01 = grDivsu(imLsl32OF(d10x, 14), d10y);
+        int slope01 = GR_DIVIDE_EDGE(state, imLsl32OF(d10x, 14), d10y);
 
         edges[0].xStart[side] =
             4 * p0->x + (int)(((long long)fracV0y * slope01) >> 12);
@@ -548,33 +607,39 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
     }
     if (btmHeight > 0)
     {
-        int slope12 = grDivsu(imLsl32OF(d21x, 14), d21y);
+        int slope12 = GR_DIVIDE_EDGE(state, imLsl32OF(d21x, 14), d21y);
 
         edges[1].xStart[side] =
             4 * p1->x + (int)(((long long)fracV1y * slope12) >> 12);
         edges[1].xAdder[side] = slope12;
     }
 
-    /* the top vertex above the scissor: advance both top edges and shrink
-     * the top half; the middle vertex above it: advance both bottom edges */
+    /* Clip the heights before advancing edges: an empty half has no short
+     * edge initialized and will not be read by the scan converter. */
     if (v0yTop < scissor->y0)
     {
         int advance = scissor->y0 - v0yTop;
 
         topHeight = hgMaxZero32(topHeight - advance);
-        edges[0].xStart[0] = (int)((unsigned int)edges[0].xStart[0]
-            + (unsigned int)edges[0].xAdder[0] * (unsigned int)advance);
-        edges[0].xStart[1] = (int)((unsigned int)edges[0].xStart[1]
-            + (unsigned int)edges[0].xAdder[1] * (unsigned int)advance);
+        if (topHeight > 0)
+        {
+            edges[0].xStart[0] = (int)((unsigned int)edges[0].xStart[0]
+                + (unsigned int)edges[0].xAdder[0] * (unsigned int)advance);
+            edges[0].xStart[1] = (int)((unsigned int)edges[0].xStart[1]
+                + (unsigned int)edges[0].xAdder[1] * (unsigned int)advance);
+        }
         if (v1yTop < scissor->y0)
         {
             int advanceMid = scissor->y0 - v1yTop;
 
             btmHeight = hgMaxZero32(btmHeight - advanceMid);
-            edges[1].xStart[0] = (int)((unsigned int)edges[1].xStart[0]
-                + (unsigned int)edges[1].xAdder[0] * (unsigned int)advanceMid);
-            edges[1].xStart[1] = (int)((unsigned int)edges[1].xStart[1]
-                + (unsigned int)edges[1].xAdder[1] * (unsigned int)advanceMid);
+            if (btmHeight > 0)
+            {
+                edges[1].xStart[0] = (int)((unsigned int)edges[1].xStart[0]
+                    + (unsigned int)edges[1].xAdder[0] * (unsigned int)advanceMid);
+                edges[1].xStart[1] = (int)((unsigned int)edges[1].xStart[1]
+                    + (unsigned int)edges[1].xAdder[1] * (unsigned int)advanceMid);
+            }
         }
     }
     total = btmHeight + topHeight;
@@ -1017,6 +1082,9 @@ void grDrawClippedPoint(Gerbera_s *state, _grClipTriangle *tri,
 
 /* --- grSetupTextureUnit (grRasterizer.inl 69; DLL 25345-25526) ------------- */
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, int v0sy)
 {
     _grPixelPipe *pipe = GR_PIXEL_PIPE(state);
@@ -1028,7 +1096,6 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
     int linear;
     _grMipLevel *mipmap;
     _grPixelPipeTextureUnit *tex;
-    int halfTexel;
     int i;
 
     if (hgInRange32(texIndex, 0, GR_MAX_TEXTURE_UNITS - 1) == 0 &&
@@ -1088,7 +1155,6 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
     linear = (filterByte & GR_FILTERMASK_FILTER) != 0;
     mipmap = &texture->mipmap[mipLevel];
     tex = &pipe->textureUnit[texIndex];
-    halfTexel = linear ? 0x100000 : 0;
 
     if (mipmap->pixels == NULL &&
         grAssert("mipmap->pixels", "grRasterizer.inl", 152) != 0)
@@ -1107,18 +1173,18 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
             int gradIdx = i + 6 + 2 * texIndex;
             if (mipmap->log2Dim[i] != 0)
             {
-                int relShift = mipmap->log2Dim[i] - g0[i][1];
-                int bias = halfTexel;
+                int bias = 0;
                 int xAdd = pipe->xAdder[gradIdx];
                 int yAdd = pipe->yAdder[gradIdx];
                 int ref;
                 int lsh = 0;
                 int baseShift = 0;
 
-                if (relShift >= 0)
-                    bias >>= relShift;
-                else
-                    bias <<= -relShift;
+                if (linear)
+                {
+                    int relShift = mipmap->log2Dim[i] - g0[i][1];
+                    bias = (int)(relShift >= 0 ? 0x100000u >> relShift : 0x100000u << -relShift);
+                }
 
                 ref = (int)((unsigned int)g0[i][0] +
                     (unsigned int)grComputeGradientReference(v0sx, v0sy, xAdd, yAdd) -

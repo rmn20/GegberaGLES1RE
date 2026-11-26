@@ -8,7 +8,7 @@
 #endif
 
 /* grIsAligned - verbatim (docs/libGLES_CM.dll.c:13072-13075, 3 TU copies) */
-int grIsAligned(void *ptr, int alignment)
+int grIsAligned(const void *ptr, int alignment)
 {
     return ((uintptr_t)(alignment - 1) & (uintptr_t)ptr) == 0;
 }
@@ -77,6 +77,47 @@ const unsigned char g_mutableParamsMask[12] =
     0xFE, 0xFF, 0xFE, 0xFF, 0x00, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00
 };
 
+/* A row is hidden when its nearest interpolated depth is behind every
+ * stored sample. Validate the endpoint range before using that bound. */
+int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess)
+{
+    enum { GR_DEPTH16_FRACTION_BITS = 14 };
+    const unsigned int maxDepth = ((unsigned int)UINT16_MAX << GR_DEPTH16_FRACTION_BITS) |
+                                  ((1u << GR_DEPTH16_FRACTION_BITS) - 1u);
+    const unsigned int *scan = pipe->scanlineInfo;
+    const unsigned char *row = (const unsigned char *)pipe->depthRow;
+    unsigned int reference = (unsigned int)pipe->reference[GR_GRADIENT_DEPTH];
+    int dx = pipe->xAdder[GR_GRADIENT_DEPTH];
+    int i;
+
+    if (pipe->numScanlines <= 0 || row == NULL || pipe->checked.depthBufferStride <= 0 ||
+        (((uintptr_t)row | (unsigned int)pipe->checked.depthBufferStride) & 1u))
+        return 0;
+    for (i = 0; i < pipe->numScanlines; ++i)
+    {
+        unsigned int span = scan[i], count = span >> 16;
+        if (count != 0)
+        {
+            unsigned int x = span & 65535u;
+            unsigned int first = reference + (unsigned int)dx * x;
+            int64_t last = (int64_t)first + (int64_t)dx * (count - 1u);
+            unsigned int nearest;
+            const unsigned short *depth = (const unsigned short *)row + x;
+            if (first > maxDepth || last < 0 || last > maxDepth)
+                return 0;
+            nearest = (first < (unsigned int)last ? first : (unsigned int)last) >> GR_DEPTH16_FRACTION_BITS;
+            if (strictLess) ++nearest;
+            do
+            {
+                if (*depth++ >= nearest) return 0;
+            } while (--count != 0);
+        }
+        row += pipe->checked.depthBufferStride;
+        reference += (unsigned int)pipe->yAdder[GR_GRADIENT_DEPTH];
+    }
+    return 1;
+}
+
 /* --- grDrawClippedTriangle (grSmall.c 254; DLL 26251-26388) ------------------
  * y-sorts the triangle's three vertex records, scan-converts them, then per
  * draw: sets the color/depth/stencil row pointers for the first scanline,
@@ -89,6 +130,9 @@ const unsigned char g_mutableParamsMask[12] =
 #define GR_STACK_CHECK_MAGIC1 (-1073628482)
 #define GR_MUTABLE_PARAM_COUNT 78
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                            unsigned int origIndices, int emptyBits)
 {
@@ -133,8 +177,6 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
         _grPixelPipe *pixelPipe = state->pixelPipeline;
         int yStart = pixelPipe->yStart;
 
-        activeGradientMask = (unsigned int)state->activeGradientMask;
-        grSetupTriangleGradients(state, tri, flatShadeIndex, activeGradientMask);
         for (i = 0; i < 3; ++i)
         {
             unsigned short stateMask =
@@ -149,10 +191,27 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                          "grRasterizer.inl", 854) != 0)
                 grDie(0);
         }
-        pixelPipe->colorRow = (void *)((char *)state->drawSurface.buffers[0].data +
-                                       state->drawSurface.buffers[0].stride * yStart);
+        activeGradientMask = (unsigned int)state->activeGradientMask;
         pixelPipe->depthRow = (void *)((char *)state->drawSurface.buffers[1].data +
                                        state->drawSurface.buffers[1].stride * yStart);
+#if GERBERA_ARMV6_JIT
+        int rejectDepth = state->primitiveType == GR_PRIMITIVETYPE_TRIANGLE &&
+            state->capabilities[GR_CAPABILITY_DEPTH_TEST] &&
+            !state->capabilities[GR_CAPABILITY_STENCIL_TEST] &&
+            !(state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_FILL] |
+              state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_LINE] |
+              state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_POINT]) &&
+            state->viewportScale.normal[2] != 0 && (activeGradientMask & 1u) &&
+            state->drawSurface.depthBytes == 2 &&
+            (state->depthFunc == GR_FUNC_LESS || state->depthFunc == GR_FUNC_LEQUAL);
+        if (!grSetupTriangleGradientsVisible(state, tri, flatShadeIndex, activeGradientMask, rejectDepth))
+            goto done;
+#else
+        grSetupTriangleGradients(state, tri, flatShadeIndex, activeGradientMask);
+#endif
+
+        pixelPipe->colorRow = (void *)((char *)state->drawSurface.buffers[0].data +
+                                       state->drawSurface.buffers[0].stride * yStart);
         pixelPipe->stencilRow = (void *)((char *)state->drawSurface.buffers[2].data +
                                          state->drawSurface.buffers[2].stride * yStart);
         for (i = state->numActiveGradients - 1; i >= 0; --i)
@@ -163,6 +222,10 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                                           (unsigned int)pixelPipe->yAdder[g] * (unsigned int)yStart);
         }
         grExecutePixelPipeline(state);
+#if GERBERA_ARMV6_JIT
+done:
+        (void)0;
+#endif
 #if HG_ASSERT_ENABLED
         for (i = 0; i < GR_MUTABLE_PARAM_COUNT; ++i)
         {
@@ -241,15 +304,13 @@ int grGetRectGradients(Gerbera_s *state)
     return state->screenRectGradients;
 }
 
-/* --- grGetMinWorkMemorySize / grGetMinSharedMemorySize (grSmall.c) ---------
- * On 32-bit x86/ARM, sizeof(Gerbera_s) == 7664 and 32 * sizeof(_grCacheEntry)
- * == 2048, totaling 9712. On 64-bit hosted builds pointers widen the structs,
- * so the aligned struct sizes are used (which evaluate to 9712 on 32-bit). */
+/* Work memory holds the aligned context and its pipeline-cache entries.
+ * Retain the original minimum when those structures fit in less space. */
 
 int grGetMinWorkMemorySize(void)
 {
     int stateBytes = ((int)sizeof(Gerbera_s) + 7) & ~7;
-    int entryBytes = 32 * (((int)sizeof(_grCacheEntry) + 7) & ~7);
+    int entryBytes = GR_PIPELINE_CACHE_ENTRIES * (((int)sizeof(_grCacheEntry) + 7) & ~7);
 
     return hgMax32(9712, stateBytes + entryBytes);
 }
