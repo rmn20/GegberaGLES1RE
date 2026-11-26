@@ -100,10 +100,13 @@ int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess)
         {
             unsigned int x = span & 65535u;
             unsigned int first = reference + (unsigned int)dx * x;
-            int64_t last = (int64_t)first + (int64_t)dx * (count - 1u);
+            int64_t last;
             unsigned int nearest;
             const unsigned short *depth = (const unsigned short *)row + x;
-            if (first > maxDepth || last < 0 || last > maxDepth)
+            if (first > maxDepth)
+                return 0;
+            last = (int64_t)first + (int64_t)dx * (int)(count - 1u);
+            if ((uint64_t)last > (uint64_t)maxDepth)
                 return 0;
             nearest = (first < (unsigned int)last ? first : (unsigned int)last) >> GR_DEPTH16_FRACTION_BITS;
             if (strictLess) ++nearest;
@@ -203,7 +206,7 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
               state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_POINT]) &&
             state->viewportScale.normal[2] != 0 && (activeGradientMask & 1u) &&
             state->drawSurface.depthBytes == 2 &&
-            (state->depthFunc == GR_FUNC_LESS || state->depthFunc == GR_FUNC_LEQUAL);
+            ((state->depthFunc & ~2) == GR_FUNC_LESS);
         if (!grSetupTriangleGradientsVisible(state, tri, flatShadeIndex, activeGradientMask, rejectDepth))
             goto done;
 #else
@@ -214,12 +217,21 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                                        state->drawSurface.buffers[0].stride * yStart);
         pixelPipe->stencilRow = (void *)((char *)state->drawSurface.buffers[2].data +
                                          state->drawSurface.buffers[2].stride * yStart);
-        for (i = state->numActiveGradients - 1; i >= 0; --i)
+        if (yStart != 0)
         {
-            int g = state->activeGradientIndex[i];
+            int n = state->numActiveGradients;
+#if defined(__GNUC__) && !defined(__clang__)
+            #pragma GCC unroll 1
+#endif
+            for (i = n - 1; i >= 0; --i)
+            {
+                int g = state->activeGradientIndex[i];
+                int ya = pixelPipe->yAdder[g];
 
-            pixelPipe->reference[g] = (int)((unsigned int)pixelPipe->reference[g] +
-                                          (unsigned int)pixelPipe->yAdder[g] * (unsigned int)yStart);
+                if (ya != 0)
+                    pixelPipe->reference[g] = (int)((unsigned int)pixelPipe->reference[g] +
+                                                  (unsigned int)ya * (unsigned int)yStart);
+            }
         }
         grExecutePixelPipeline(state);
 #if GERBERA_ARMV6_JIT

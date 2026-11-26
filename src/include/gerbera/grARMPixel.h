@@ -11,6 +11,11 @@ extern "C" {
 int grCompileARMPixelPipeline(void *output, int capacity, const _grSignature *signature,
                               unsigned int textureLayout, unsigned int *gradientMask);
 
+/* Extended compiler that also emits direct ARMv6 loops for fog and alpha test. */
+int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *signature,
+                                unsigned int textureLayout, unsigned int *gradientMask,
+                                int allowExtended);
+
 #ifdef __cplusplus
 }
 #endif

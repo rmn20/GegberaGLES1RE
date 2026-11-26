@@ -61,7 +61,7 @@ void grTexCoordDivByQ(int *output, int *coords)
     else
     {
         unsigned int absq = (unsigned int)hgAbs32(q);
-        HGint64 rr = imRcpu(absq);
+        HGint64 rr = imRcpu_inline(absq);
         int rcp = (int)(rr >> 32);          /* high: reciprocal mantissa */
         int shift = (int)(rr & 0xFFFFFFFFu); /* low: shift */
         int sh = shift - 9;

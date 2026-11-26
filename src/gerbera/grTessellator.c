@@ -50,7 +50,7 @@ int grFracDiv(int a, int b)
         grDie(0);
     if (a > b && grAssert("a <= b", "grTessellator.inl", 50) != 0)
         grDie(0);
-    reciprocal = imRcpu(b);
+    reciprocal = imRcpu_inline(b);
     u = hgMulu64((unsigned int)a, (unsigned int)(reciprocal >> 32));
     s = hgToSigned64(u);
     return hgLsl64h(s, (int)reciprocal) / 2;
@@ -117,9 +117,8 @@ int grClassifyTriangle(Gerbera_s *state, _grVertex *vertexCache,
     if (grSubpixelTrunc(yMin) >= scissor->y1)
         return GR_TRIANGLESTATUS_DISCARD;
     if (wMin == wMax)
-        wMaxBoosted = wMax;
-    else
-        wMaxBoosted = hgMax32(wMax, wMin + (wMin >> 4));
+        return (wMin <= 0) ? GR_TRIANGLESTATUS_NONAFFINE : GR_TRIANGLESTATUS_AFFINE;
+    wMaxBoosted = hgMax32(wMax, wMin + (wMin >> 4));
     smallSq = hgLsl64h(hgMul64(4096 - extent, 4096 - extent), 10);
     bigSq = hgLsl64h(hgMul64(extent + 4096, extent + 4096), 10);
     return hgLessThan64(hgMul64(wMaxBoosted, smallSq),
@@ -149,7 +148,12 @@ int grSplitEdge(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
     }
     w0 = v0->normal[2];
     w1 = v1->normal[2];
-    if (w0 <= w1)
+    if (w0 == w1)
+    {
+        if (w1 > 0 && forceSplit == 0)
+            return 0;
+    }
+    else if (w0 < w1)
     {
         int wt = w0;
 
@@ -188,7 +192,9 @@ int grSplitEdge(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
     if (w1 + v0->normal[2] != 0)
         fdw2 = grFracDiv(v0->normal[2], w1 + v0->normal[2]);
     factor1 = hgMax32(2 * t17 - 0x20000000, 0);
-    t = IUnitScalar_lerp(0x10000000, fdw2, factor1);
+    t = (factor1 != 0)
+      ? (0x10000000 + hgLsl64h_0_31(hgMul64(factor1, fdw2 - 0x10000000), 3))
+      : 0x10000000;
     dst->normal[2] = grLerp(v0->normal[2], w1, fdw2);
     grLerpClipFactor((_grClipVertex *)&dst->normal[0],
                      (_grClipVertex *)&v0->normal[0],
@@ -206,14 +212,16 @@ int grSplitEdge(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
  * which edges split in splitBits), then either recurse into the children
  * picked by the split-count tables or draw the (now affine) piece. */
 
-#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
-__attribute__((optimize("O3")))
-#endif
 static void grTessellateTriangle(Gerbera_s *state, _grClipTriangle *tri,
-                                 unsigned int origIndices, int level)
+                                 unsigned int origIndices, int level);
+
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void grTessellateTriangleSubdivide(Gerbera_s *state, _grClipTriangle *tri,
+                                          unsigned int origIndices, int level)
 {
     _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
-    int classify = grClassifyTriangle(state, vertexBuffer, tri->indices);
     int splitBits[3];
     int numSplits = 0;
     int forceSplit = 0;
@@ -222,46 +230,41 @@ static void grTessellateTriangle(Gerbera_s *state, _grClipTriangle *tri,
     splitBits[0] = 0;
     splitBits[1] = 0;
     splitBits[2] = 0;
-    if (classify == GR_TRIANGLESTATUS_DISCARD)
-        return;
-    if (classify == GR_TRIANGLESTATUS_NONAFFINE)
+    for (j = 2; j >= 0; --j)
     {
-        for (j = 2; j >= 0; --j)
+        int dstIndex = j + 3 * level + 68;
+        _grVertex *dst = vertexBuffer + dstIndex;
+        _grVertex *va = vertexBuffer + grUnpackIndex(tri->indices, j);
+        _grVertex *vb = vertexBuffer +
+            grUnpackIndex(tri->indices, g_tessNextLut[j]);
+        int split = grSplitEdge(dst, va, vb, forceSplit);
+
+        splitBits[j] = forceSplit | split;
+        numSplits += splitBits[j];
+        if (splitBits[j] != 0)
         {
-            int dstIndex = j + 3 * level + 68;
-            _grVertex *dst = vertexBuffer + dstIndex;
-            _grVertex *va = vertexBuffer + grUnpackIndex(tri->indices, j);
-            _grVertex *vb = vertexBuffer +
-                grUnpackIndex(tri->indices, g_tessNextLut[j]);
-            int split = grSplitEdge(dst, va, vb, forceSplit);
+            int emptyBits = 7 - level;
+            int x = dst->screenPosition[0];
+            int y = dst->screenPosition[1];
 
-            splitBits[j] = forceSplit | split;
-            numSplits += splitBits[j];
-            if (splitBits[j] != 0)
-            {
-                int emptyBits = 7 - level;
-                int x = dst->screenPosition[0];
-                int y = dst->screenPosition[1];
-
-                if (((1 << emptyBits) - 1) & x &&
-                    grAssert("!(x & ((1<<emptyBits)-1))",
-                             "grTessellator.inl", 336) != 0)
-                    grDie(0);
-                if (((1 << emptyBits) - 1) & y &&
-                    grAssert("!(y & ((1<<emptyBits)-1))",
-                             "grTessellator.inl", 337) != 0)
-                    grDie(0);
-                dst->index = -1;
-                dst->stateMask = 79;
-                grInterpolateVertexGradients(state, dst, origIndices,
-                                             tri->side);
-            }
+            if (((1 << emptyBits) - 1) & x &&
+                grAssert("!(x & ((1<<emptyBits)-1))",
+                         "grTessellator.inl", 336) != 0)
+                grDie(0);
+            if (((1 << emptyBits) - 1) & y &&
+                grAssert("!(y & ((1<<emptyBits)-1))",
+                         "grTessellator.inl", 337) != 0)
+                grDie(0);
+            dst->index = -1;
+            dst->stateMask = 79;
+            grInterpolateVertexGradients(state, dst, origIndices,
+                                         tri->side);
         }
-        forceSplit = 1;
-        if (hgInRange32(numSplits, 0, 3) == 0 &&
-            grAssert("hgInRange32(numSplits, 0, 3)", "grTessellator.inl", 350) != 0)
-            grDie(0);
     }
+    forceSplit = 1;
+    if (hgInRange32(numSplits, 0, 3) == 0 &&
+        grAssert("hgInRange32(numSplits, 0, 3)", "grTessellator.inl", 350) != 0)
+        grDie(0);
     if (numSplits != 0 && level != 7)
     {
         int base = 3 * level + 68;
@@ -355,6 +358,30 @@ static void grTessellateTriangle(Gerbera_s *state, _grClipTriangle *tri,
     }
 }
 
+static void grTessellateTriangle(Gerbera_s *state, _grClipTriangle *tri,
+                                 unsigned int origIndices, int level)
+{
+    _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
+    int classify = grClassifyTriangle(state, vertexBuffer, tri->indices);
+
+    if (classify == GR_TRIANGLESTATUS_DISCARD)
+        return;
+    if (classify == GR_TRIANGLESTATUS_AFFINE || level == 7)
+    {
+        if (level != 0)
+        {
+            HGint64 area64 = grComputeTriangleArea(vertexBuffer, tri->indices);
+
+            if (hgIsZero64(area64) != 0)
+                return;
+            tri->area = grRoundTriangleArea(area64);
+        }
+        grDrawClippedTriangle(state, tri, origIndices, 8);
+        return;
+    }
+    grTessellateTriangleSubdivide(state, tri, origIndices, level);
+}
+
 /* --- grTriangleTessellator (grTessellator.inl 512; DLL 27249-27359) ----------
  * Seeds the per-vertex w (normalized by IVector4_wNorm so all three share an
  * exponent), checks/seeds the barycentric weights of the triangle's records,
@@ -363,19 +390,68 @@ static void grTessellateTriangle(Gerbera_s *state, _grClipTriangle *tri,
 void grTriangleTessellator(Gerbera_s *state, _grClipTriangle *tri,
                            unsigned int origIndices)
 {
-    _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
+    _grVertex *vertexBuffer;
     _grVertex *v0;
     _grVertex *v1;
     _grVertex *v2;
+    _grRect *scissor;
+    int x0, x1, x2, y0, y1, y2;
+    int xMin, xMax, yMin, yMax, extent;
     int w[3];
+    int wMin, wMax;
 
     if ((state == NULL || tri == NULL) &&
         grAssert("state && tri", "grTessellator.inl", 512) != 0)
         grDie(0);
+    vertexBuffer = GR_VERTEX_BUFFER(state);
     v0 = vertexBuffer + grUnpackIndex(tri->indices, 0);
     v1 = vertexBuffer + grUnpackIndex(tri->indices, 1);
     v2 = vertexBuffer + grUnpackIndex(tri->indices, 2);
+    x0 = v0->screenPosition[0];
+    x1 = v1->screenPosition[0];
+    x2 = v2->screenPosition[0];
+    y0 = v0->screenPosition[1];
+    y1 = v1->screenPosition[1];
+    y2 = v2->screenPosition[1];
+    xMin = hgMin32(hgMin32(x0, x1), x2);
+    xMax = hgMax32(hgMax32(x0, x1), x2);
+    yMin = hgMin32(hgMin32(y0, y1), y2);
+    yMax = hgMax32(hgMax32(y0, y1), y2);
+    extent = hgMax32(xMax - xMin, yMax - yMin);
+    if (extent < 0x4000)
+    {
+        grDrawClippedTriangle(state, tri, origIndices, 8);
+        return;
+    }
+    scissor = &state->renderScissor;
+    if (grSubpixelTrunc(xMax) <= scissor->x0 ||
+        grSubpixelTrunc(xMin) >= scissor->x1 ||
+        grSubpixelTrunc(yMax) <= scissor->y0 ||
+        grSubpixelTrunc(yMin) >= scissor->y1)
+        return;
     IVector4_wNorm(w, &v0->clipPosition, &v1->clipPosition, &v2->clipPosition);
+    wMin = hgMin32(hgMin32(w[0], w[1]), w[2]);
+    wMax = hgMax32(hgMax32(w[0], w[1]), w[2]);
+    if (wMin == wMax)
+    {
+        if (wMin > 0)
+        {
+            grDrawClippedTriangle(state, tri, origIndices, 8);
+            return;
+        }
+    }
+    else
+    {
+        int wMaxBoosted = hgMax32(wMax, wMin + (wMin >> 4));
+        HGint64 smallSq = hgLsl64h(hgMul64(4096 - extent, 4096 - extent), 10);
+        HGint64 bigSq = hgLsl64h(hgMul64(extent + 4096, extent + 4096), 10);
+
+        if (hgLessThan64(hgMul64(wMaxBoosted, smallSq), hgMul64(wMin, bigSq)) != 0)
+        {
+            grDrawClippedTriangle(state, tri, origIndices, 8);
+            return;
+        }
+    }
     v0->normal[2] = w[0];
     v1->normal[2] = w[1];
     v2->normal[2] = w[2];
@@ -426,5 +502,5 @@ void grTriangleTessellator(Gerbera_s *state, _grClipTriangle *tri,
                 grDie(0);
         }
     }
-    grTessellateTriangle(state, tri, origIndices, 0);
+    grTessellateTriangleSubdivide(state, tri, origIndices, 0);
 }

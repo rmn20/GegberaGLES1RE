@@ -19,6 +19,7 @@
 
 #include "hg/hgDefs.h"
 #include "hg/hgFloat.h"
+#include "hg/hgInt32.h"
 
 HG_EXTERN_C_BEGIN
 
@@ -199,7 +200,19 @@ int      imLsl64h_0_31OF(HGint64 a, unsigned int sh);
 
 /* reciprocal estimate: returns 64-bit packed (high = reciprocal mantissa,
  * low = normalization shift) */
+extern const HGint8 imIntrcpLUT[310];
 HGint64  imRcpu(unsigned int x);
+
+static inline HGint64 imRcpu_inline(unsigned int x)
+{
+    unsigned int sh = hgClz32(x);
+    unsigned int xn = x << sh;
+    unsigned int a0 = ((unsigned int)(HGuint8)imIntrcpLUT[(HGuint8)(xn >> 23)]) << 24;
+    unsigned int v1 = hgMulu64h(a0, xn);
+    unsigned int a0a = 2 * hgMulu64h(a0, ~v1);
+    unsigned int v2 = hgMulu64h(a0a, xn);
+    return (HGint64)(((HGint64)(hgMulu64h(a0a, ~v2)) << 32) | sh);
+}
 
 /* --- XColor3 (imInline.inl) ------------------------------------------ */
 

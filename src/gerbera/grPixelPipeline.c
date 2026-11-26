@@ -1858,8 +1858,8 @@ void grEnsureValidPixelPipeline(Gerbera_s *state)
 
         if (backend == HCARMBackend_create())
         {
-            lengthInBytes = grCompileARMPixelPipeline(state->scratchMemory, state->scratchMemorySize,
-                                                      &signature, textureLayout, &gradientMask);
+            lengthInBytes = grCompileARMPixelPipelineEx(state->scratchMemory, state->scratchMemorySize,
+                                                        &signature, textureLayout, &gradientMask, 1);
             if (lengthInBytes > 0)
             {
                 code = state->scratchMemory;

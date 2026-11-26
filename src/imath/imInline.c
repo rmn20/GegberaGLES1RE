@@ -264,7 +264,7 @@ int XScalar_exp2(int x)
 /* reciprocal estimate: (x << sh) normalized, table seed + 2 NR steps.
  * result: high 32 bits = reciprocal mantissa, low 32 bits = shift. */
 
-static const HGint8 intrcpLUT[310] = {
+const HGint8 imIntrcpLUT[310] = {
     0xFF, 0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8, 0xF7, 0xF6, 0xF5,
     0xF4, 0xF3, 0xF2, 0xF1, 0xF0, 0xF0, 0xEF, 0xEE, 0xED, 0xEC, 0xEB, 0xEA,
     0xEA, 0xE9, 0xE8, 0xE7, 0xE6, 0xE5, 0xE5, 0xE4, 0xE3, 0xE2, 0xE1, 0xE1,
@@ -296,12 +296,7 @@ static const HGint8 intrcpLUT[310] = {
 
 HGint64 imRcpu(unsigned int x)
 {
-    unsigned int sh = hgClz32(x);
-    unsigned int a0 = ((unsigned int)(HGuint8)intrcpLUT[(HGuint8)((x << sh) >> 23)]) << 24;
-    unsigned int v1 = hgMulu64h(a0, x << sh);
-    unsigned int a0a = 2 * hgMulu64h(a0, ~v1);
-    unsigned int v2 = hgMulu64h(a0a, x << sh);
-    return (HGint64)(((HGint64)(hgMulu64h(a0a, ~v2)) << 32) | sh);
+    return imRcpu_inline(x);
 }
 
 /* --- XColor3 ----------------------------------------------------------- */

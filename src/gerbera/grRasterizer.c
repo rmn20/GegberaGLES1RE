@@ -29,18 +29,21 @@ int grSubpixelTrunc(int i);   /* grClipper.c (grUtil.h; DLL 004214A0) */
 /* --- grSetupGradient (grRasterizer.inl 500; DLL 25988-26026) ---------------- */
 
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
-__attribute__((optimize("O3")))
+__attribute__((optimize("O3,no-ipa-sra")))
 #endif
-void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
+void grSetupGradient(const _grGradientInfo *info, int gradient, int g01, int g02,
                      int reference)
 {
     int xAdd32 = 0;
     int yAdd32 = 0;
 
+    _grPixelPipe *pPP;
+
     if (hgInRange32(info->shift, 0, 31) == 0)
         imAssert("hgInRange32(info->shift, 0, 31)", "grRasterizer.inl", 500);
     if (info == NULL)
         imAssert("info", "grRasterizer.inl", 501);
+    pPP = info->pPP;
     if (g01 != 0 || g02 != 0)   /* __PAIR64__(g02, g01) != 0 */
     {
         HGint64 xAdd64 = hgMul64(info->v01syPerArea, g02);
@@ -60,7 +63,11 @@ void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
                           info->shift + 14);
         yAdd32 = hgGet64l(yAdd64a);
         yHi = hgGet64h(yAdd64a);
+#if defined(__GNUC__)
+        if (__builtin_expect(((xHi ^ (xAdd32 >> 31)) | (yHi ^ (yAdd32 >> 31))) == 0, 1))
+#else
         if (((xHi ^ (xAdd32 >> 31)) | (yHi ^ (yAdd32 >> 31))) == 0)
+#endif
         {
 #if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
             unsigned int lo;
@@ -83,9 +90,9 @@ void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
         }
         reference = (int)((unsigned int)reference - (unsigned int)refSub);
     }
-    info->pPP->reference[gradient] = reference;
-    info->pPP->xAdder[gradient] = xAdd32;
-    info->pPP->yAdder[gradient] = yAdd32;
+    pPP->reference[gradient] = reference;
+    pPP->xAdder[gradient] = xAdd32;
+    pPP->yAdder[gradient] = yAdd32;
 }
 
 /* --- grComputeDeltas (grRasterizer.inl 550; DLL 26029-26061) -----------------
@@ -94,7 +101,7 @@ void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
  * before they are re-shifted per wrap mode). The >= 32 / < 32 split computes
  * (syDelta >> (shift+14)) from the high word with a compensating left shift. */
 
-void grComputeDeltas(_grGradientInfo *info, int gradient, int g01, int g02)
+void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02)
 {
     int xAdder = 0;
     int yAdder = 0;
@@ -121,9 +128,12 @@ void grComputeDeltas(_grGradientInfo *info, int gradient, int g01, int g02)
         }
         else
         {
-            int sh = 32 - (info->shift + 14);
-            xAdder = hgLsl64h_0_31(syDelta, sh);
-            yAdder = hgLsl64h_0_31(sxDelta, sh);
+            int sh = 18 - info->shift; /* 1..18 because info->shift in 0..17 */
+            int rsh = 32 - sh;         /* 14..31 */
+            xAdder = (int)(((unsigned int)hgGet64h(syDelta) << sh) |
+                           ((unsigned int)hgGet64l(syDelta) >> rsh));
+            yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
+                           ((unsigned int)hgGet64l(sxDelta) >> rsh));
         }
     }
     info->pPP->xAdder[gradient] = xAdder;
@@ -179,7 +189,7 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
 
         /* imRcpu(abs(area)): low word = normalization shift, high word =
          * reciprocal mantissa (0.32) */
-        reciprocal = imRcpu((unsigned int)hgAbs32(tri->area));
+        reciprocal = imRcpu_inline((unsigned int)hgAbs32(tri->area));
         recipShift = hgGet64l(reciprocal);
         signedRecip = hgCopySign32(hgGet64h(reciprocal), -tri->area);
         info.pPP = pixelPipe;
@@ -209,7 +219,16 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
             int d1 = v1->screenPosition[2];
             int d2 = v2->screenPosition[2];
 
-            grSetupGradient(&info, GR_GRADIENT_DEPTH, d1 - d0, d2 - d0, d0);
+            if (d0 == d1 && d0 == d2)
+            {
+                pixelPipe->reference[GR_GRADIENT_DEPTH] = d0;
+                pixelPipe->xAdder[GR_GRADIENT_DEPTH] = 0;
+                pixelPipe->yAdder[GR_GRADIENT_DEPTH] = 0;
+            }
+            else
+            {
+                grSetupGradient(&info, GR_GRADIENT_DEPTH, d1 - d0, d2 - d0, d0);
+            }
             if (grIsDepthOffsetEnabled(state, state->primitiveType) != 0)
                 grComputeDepthOffset(state);
         }
@@ -305,6 +324,33 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
                 grDie(0);
             if (grTestCapability(state, GR_CAPABILITY_SMOOTH_SHADING) != 0)
             {
+                if (side == GR_SIDE_FRONT && (gradientMask & 0x3Cu) == 0x3Cu)
+                {
+                    unsigned int rg0, rg1, rg2, ba0, ba1, ba2;
+                    __builtin_memcpy(&rg0, &v0->color.final[0][0], sizeof(rg0));
+                    __builtin_memcpy(&rg1, &v1->color.final[0][0], sizeof(rg1));
+                    __builtin_memcpy(&rg2, &v2->color.final[0][0], sizeof(rg2));
+                    __builtin_memcpy(&ba0, &v0->color.final[0][2], sizeof(ba0));
+                    __builtin_memcpy(&ba1, &v1->color.final[0][2], sizeof(ba1));
+                    __builtin_memcpy(&ba2, &v2->color.final[0][2], sizeof(ba2));
+                    if (rg0 == rg1 && rg0 == rg2 && ba0 == ba1 && ba0 == ba2)
+                    {
+                        const unsigned short *c = &v0->color.final[0][0];
+                        pixelPipe->reference[GR_GRADIENT_COLOR_R] = ((int)c[0] << 8) + 0x8000;
+                        pixelPipe->reference[GR_GRADIENT_COLOR_G] = ((int)c[1] << 8) + 0x8000;
+                        pixelPipe->reference[GR_GRADIENT_COLOR_B] = ((int)c[2] << 8) + 0x8000;
+                        pixelPipe->reference[GR_GRADIENT_COLOR_A] = ((int)c[3] << 8) + 0x8000;
+                        pixelPipe->xAdder[GR_GRADIENT_COLOR_R] = 0;
+                        pixelPipe->xAdder[GR_GRADIENT_COLOR_G] = 0;
+                        pixelPipe->xAdder[GR_GRADIENT_COLOR_B] = 0;
+                        pixelPipe->xAdder[GR_GRADIENT_COLOR_A] = 0;
+                        pixelPipe->yAdder[GR_GRADIENT_COLOR_R] = 0;
+                        pixelPipe->yAdder[GR_GRADIENT_COLOR_G] = 0;
+                        pixelPipe->yAdder[GR_GRADIENT_COLOR_B] = 0;
+                        pixelPipe->yAdder[GR_GRADIENT_COLOR_A] = 0;
+                        return 1;
+                    }
+                }
                 for (coord = GR_GRADIENT_COLOR_R; coord >= GR_GRADIENT_DEPTH; --coord)
                 {
                     if (((4 << coord) & gradientMask) != 0)
@@ -387,30 +433,52 @@ int grDivsu(int a, int b)
     return a / b;
 }
 
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static unsigned int grFastRecip32(unsigned int d)
+{
+    if (d == 1u)
+        return 0xFFFFFFFFu;
+    {
+        HGint64 rr = imRcpu_inline(d);
+        unsigned int sh = (unsigned int)rr;
+        unsigned int recip = (unsigned int)(rr >> 32);
+        unsigned int q = recip >> (30u - sh);
+        if (0xFFFFFFFFu - q * d >= d)
+            ++q;
+        return q;
+    }
+}
+
 #if defined(__GNUC__) && defined(__arm__)
 __attribute__((always_inline))
 #endif
 static inline int grDivideEdgeSlopeCached(Gerbera_s *state, int numerator, int denominator)
 {
-    unsigned int divisor, magnitude, reciprocal, quotient, slot;
+    unsigned int divisor, sign, magnitude, reciprocal, quotient, slot;
 
     if (denominator <= 0)
         return grDivsu(numerator, denominator);
+    if (numerator == 0)
+        return 0;
+    if (denominator == 1)
+        return numerator;
     divisor = (unsigned int)denominator;
     slot = (divisor ^ (divisor >> 6)) & (GR_EDGE_SLOPE_CACHE_SIZE - 1u);
     reciprocal = state->edgeSlopeCache[slot].reciprocal;
     if (state->edgeSlopeCache[slot].divisor != divisor)
     {
-        reciprocal = 0xFFFFFFFFu / divisor;
+        reciprocal = grFastRecip32(divisor);
         state->edgeSlopeCache[slot].divisor = divisor;
         state->edgeSlopeCache[slot].reciprocal = reciprocal;
     }
-    magnitude = numerator < 0 ? 0u - (unsigned int)numerator
-                              : (unsigned int)numerator;
+    sign = (unsigned int)(numerator >> 31);
+    magnitude = ((unsigned int)numerator ^ sign) - sign;
     /* The high word of n * floor((2^32-1)/d) is n/d or one less. */
     quotient = hgMulu64h(magnitude, reciprocal);
     quotient += magnitude - quotient * divisor >= divisor;
-    return numerator < 0 ? (int)(0u - quotient) : (int)quotient;
+    return (int)((quotient ^ sign) - sign);
 }
 
 int grDivideEdgeSlope(Gerbera_s *state, int numerator, int denominator)
@@ -791,48 +859,53 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
     if (((b | a) & 0x1FFFFFFF) != 0)
     {
         int c = IUNITSCALAR_ONE - a - b;
-        int u, coord, comp;
 
         if ((a == IUNITSCALAR_ONE || b == IUNITSCALAR_ONE || (a == 0 && b == 0)) &&
             grAssert("a!=IUNITSCALAR_ONE && b!=IUNITSCALAR_ONE && (a!=0 || b!=0)",
                      "grRasterizer.inl", 303) != 0)
             grDie(0);
-        for (u = 1; u >= 0; --u)
-        {
-            if (((192 << (2 * u)) & gradientMask) != 0)
-            {
-                int *src0 = (int *)((char *)v0 + 56 + 8 * u);
-                int *src1 = (int *)((char *)v1 + 56 + 8 * u);
-                int *src2 = (int *)((char *)v2 + 56 + 8 * u);
+#define GR_INTERP_TEXCOORD(u_)                                                  \
+        do {                                                                    \
+            int t0y = v0->texCoord[u_].y;                                       \
+            int t1y = v1->texCoord[u_].y;                                       \
+            int t2y = v2->texCoord[u_].y;                                       \
+            int gy = (t0y == t1y && t0y == t2y) ? t0y :                         \
+                (int)imLsl64h_0_31OF(                                           \
+                    hgMadd64(hgMadd64(hgMul64(a, t0y), b, t1y), c, t2y), 3);    \
+            int t0x = v0->texCoord[u_].x;                                       \
+            int t1x = v1->texCoord[u_].x;                                       \
+            int t2x = v2->texCoord[u_].x;                                       \
+            int gx = (t0x == t1x && t0x == t2x) ? t0x :                         \
+                (int)imLsl64h_0_31OF(                                           \
+                    hgMadd64(hgMadd64(hgMul64(a, t0x), b, t1x), c, t2x), 3);    \
+            if (hgInRange32(gy, hgMin32(hgMin32(t0y, t1y), t2y),                \
+                            hgMax32(hgMax32(t0y, t1y), t2y)) == 0 &&            \
+                grAssert("hgInRange32(g, hgMin32(hgMin32(t0, t1), t2), hgMax32(hgMax32(t0, t1), t2))", \
+                         "grRasterizer.inl", 332) != 0)                         \
+                grDie(0);                                                       \
+            if (hgInRange32(gx, hgMin32(hgMin32(t0x, t1x), t2x),                \
+                            hgMax32(hgMax32(t0x, t1x), t2x)) == 0 &&            \
+                grAssert("hgInRange32(g, hgMin32(hgMin32(t0, t1), t2), hgMax32(hgMax32(t0, t1), t2))", \
+                         "grRasterizer.inl", 332) != 0)                         \
+                grDie(0);                                                       \
+            vertex->texCoord[u_].y = gy;                                        \
+            vertex->texCoord[u_].x = gx;                                        \
+        } while (0)
 
-                for (coord = 1; coord >= 0; --coord)
-                {
-                    int t0 = src0[coord];
-                    int t1 = src1[coord];
-                    int t2 = src2[coord];
-                    HGint64 sum = hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2);
-                    int g = (int)imLsl64h_0_31OF(sum, 3);
-
-                    if (hgInRange32(g, hgMin32(hgMin32(t0, t1), t2),
-                                    hgMax32(hgMax32(t0, t1), t2)) == 0 &&
-                        grAssert("hgInRange32(g, hgMin32(hgMin32(t0, t1), t2), hgMax32(hgMax32(t0, t1), t2))",
-                                 "grRasterizer.inl", 332) != 0)
-                        grDie(0);
-                    (&vertex->texCoord[u].x)[coord] = g;
-                }
-            }
-        }
+        if ((gradientMask & 0xC0u) != 0)
+            GR_INTERP_TEXCOORD(0);
+        if ((gradientMask & 0x300u) != 0)
+            GR_INTERP_TEXCOORD(1);
+#undef GR_INTERP_TEXCOORD
         if ((gradientMask & 2) != 0)
         {
             int t0 = v0->color.final[1][3];
             int t1 = v1->color.final[1][3];
             int t2 = v2->color.final[1][3];
-            HGint64 sum = hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2);
-            int g = (int)imLsl64h_0_31OF(sum, 3);
-            int rangeMin = hgMin32(hgMin32(v0->color.final[1][3], v1->color.final[1][3]),
-                                   v2->color.final[1][3]);
-            int rangeMax = hgMax32(hgMax32(v0->color.final[1][3], v1->color.final[1][3]),
-                                   v2->color.final[1][3]);
+            int g = (t0 == t1 && t0 == t2) ? t0 :
+                (int)imLsl64h_0_31OF(hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2), 3);
+            int rangeMin = hgMin32(hgMin32(t0, t1), t2);
+            int rangeMax = hgMax32(hgMax32(t0, t1), t2);
 
             if (hgInRange32(g, 0, 0xFFFF) == 0 &&
                 grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 341) != 0)
@@ -845,44 +918,44 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
         }
         if ((gradientMask & 0x1C) != 0)
         {
-            for (comp = 2; comp >= 0; --comp)
-            {
-                if (((4 << comp) & gradientMask) != 0)
-                {
-                    int t0 = v0->color.final[side][comp];
-                    int t1 = v1->color.final[side][comp];
-                    int t2 = v2->color.final[side][comp];
-                    HGint64 sum = hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2);
-                    int g = (int)imLsl64h_0_31OF(sum, 3);
-                    int rangeMin = hgMin32(hgMin32(v0->color.final[side][comp],
-                                                   v1->color.final[side][comp]),
-                                           v2->color.final[side][comp]);
-                    int rangeMax = hgMax32(hgMax32(v0->color.final[side][comp],
-                                                   v1->color.final[side][comp]),
-                                           v2->color.final[side][comp]);
-
-                    if (hgInRange32(g, 0, 0xFFFF) == 0 &&
-                        grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 371) != 0)
-                        grDie(0);
-                    if (hgInRange32(g, rangeMin, rangeMax) == 0 &&
-                        grAssert("hgInRange32(g, hgMin32(hgMin32(g0, g1), g2), hgMax32(hgMax32(g0, g1), g2))",
-                                 "grRasterizer.inl", 373) != 0)
-                        grDie(0);
-                    vertex->color.final[side][comp] = (unsigned short)g;
-                }
+            const unsigned short *c0 = v0->color.final[side];
+            const unsigned short *c1 = v1->color.final[side];
+            const unsigned short *c2 = v2->color.final[side];
+            unsigned short *cd = vertex->color.final[side];
+#define GR_INTERP_COMP(comp_)                                                   \
+            if ((gradientMask & (4u << (comp_))) != 0)                          \
+            {                                                                   \
+                int t0 = c0[comp_];                                             \
+                int t1 = c1[comp_];                                             \
+                int t2 = c2[comp_];                                             \
+                int g = (t0 == t1 && t0 == t2) ? t0 :                           \
+                    (int)imLsl64h_0_31OF(                                       \
+                        hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2), 3);   \
+                int rangeMin = hgMin32(hgMin32(t0, t1), t2);                    \
+                int rangeMax = hgMax32(hgMax32(t0, t1), t2);                    \
+                if (hgInRange32(g, 0, 0xFFFF) == 0 &&                           \
+                    grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 371) != 0) \
+                    grDie(0);                                                   \
+                if (hgInRange32(g, rangeMin, rangeMax) == 0 &&                  \
+                    grAssert("hgInRange32(g, hgMin32(hgMin32(g0, g1), g2), hgMax32(hgMax32(g0, g1), g2))", \
+                             "grRasterizer.inl", 373) != 0)                     \
+                    grDie(0);                                                   \
+                cd[comp_] = (unsigned short)g;                                  \
             }
+            GR_INTERP_COMP(2);
+            GR_INTERP_COMP(1);
+            GR_INTERP_COMP(0);
+#undef GR_INTERP_COMP
         }
         if ((gradientMask & 0x20) != 0)
         {
             int t0 = v0->color.final[0][3];
             int t1 = v1->color.final[0][3];
             int t2 = v2->color.final[0][3];
-            HGint64 sum = hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2);
-            int g = (int)imLsl64h_0_31OF(sum, 3);
-            int rangeMin = hgMin32(hgMin32(v0->color.final[0][3], v1->color.final[0][3]),
-                                   v2->color.final[0][3]);
-            int rangeMax = hgMax32(hgMax32(v0->color.final[0][3], v1->color.final[0][3]),
-                                   v2->color.final[0][3]);
+            int g = (t0 == t1 && t0 == t2) ? t0 :
+                (int)imLsl64h_0_31OF(hgMadd64(hgMadd64(hgMul64(a, t0), b, t1), c, t2), 3);
+            int rangeMin = hgMin32(hgMin32(t0, t1), t2);
+            int rangeMax = hgMax32(hgMax32(t0, t1), t2);
 
             if (hgInRange32(g, 0, 0xFFFF) == 0 &&
                 grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 384) != 0)
@@ -1146,17 +1219,19 @@ void grDrawClippedPoint(Gerbera_s *state, _grClipTriangle *tri,
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3")))
 #endif
-void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, int v0sy)
+void grSetupTextureUnit(Gerbera_s * restrict state, int texIndex, int (* restrict g0)[2],
+                        int v0sx, int v0sy)
 {
-    _grPixelPipe *pipe = GR_PIXEL_PIPE(state);
-    _grTexture *texture = state->textureUnit[2 * texIndex].texture;
-    int activeGradMask = state->activeGradientMask;
+    _grPixelPipe * restrict pipe = GR_PIXEL_PIPE(state);
+    const _grTexture * restrict texture = state->textureUnit[2 * texIndex].texture;
+    unsigned int activeGradMask = (unsigned int)state->activeGradientMask;
     int isMag = 1;
     int mipLevel = 0;
     unsigned char filterByte;
     int linear;
-    _grMipLevel *mipmap;
-    _grPixelPipeTextureUnit *tex;
+    const _grMipLevel * restrict mipmap;
+    _grPixelPipeTextureUnit * restrict tex;
+    int log2S, log2T;
     int i;
 
     if (hgInRange32(texIndex, 0, GR_MAX_TEXTURE_UNITS - 1) == 0 &&
@@ -1166,12 +1241,14 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
         grAssert("texture", "grRasterizer.inl", 70) != 0)
         grDie(0);
 
-    if ((texture->parmMask & 0x20u) != 0)
+    if ((texture->parmMask & 0x20u) != 0 &&
+        ((texture->filterMask[GR_FILTERTYPE_MIN] & GR_FILTERMASK_USE_MIPMAPS) != 0 ||
+         texture->filterMask[GR_FILTERTYPE_MAG] != texture->filterMask[GR_FILTERTYPE_MIN]))
     {
         HGuint64 maxRho2 = hgToUnsigned64(hgZero64());
         for (i = 1; i >= 0; --i)
         {
-            if (((64 << (i + 2 * texIndex)) & activeGradMask) != 0)
+            if (((64 << (i + 2 * texIndex)) & (int)activeGradMask) != 0)
             {
                 int gradIdx = i + 6 + 2 * texIndex;
                 int xAdd = pipe->xAdder[gradIdx];
@@ -1216,52 +1293,57 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
     linear = (filterByte & GR_FILTERMASK_FILTER) != 0;
     mipmap = &texture->mipmap[mipLevel];
     tex = &pipe->textureUnit[texIndex];
+    log2S = mipmap->log2Dim[GR_TEXCOORD_S];
+    log2T = mipmap->log2Dim[GR_TEXCOORD_T];
 
     if (mipmap->pixels == NULL &&
         grAssert("mipmap->pixels", "grRasterizer.inl", 152) != 0)
         grDie(0);
-    if (mipmap->log2Dim[GR_TEXCOORD_S] < 0 &&
+    if (log2S < 0 &&
         grAssert("mipmap->log2Dim[GR_TEXCOORD_S] >= 0", "grRasterizer.inl", 153) != 0)
         grDie(0);
-    if (mipmap->log2Dim[GR_TEXCOORD_T] < 0 &&
+    if (log2T < 0 &&
         grAssert("mipmap->log2Dim[GR_TEXCOORD_T] >= 0", "grRasterizer.inl", 154) != 0)
         grDie(0);
 
     for (i = 1; i >= 0; --i)
     {
-        if (((64 << (i + 2 * texIndex)) & activeGradMask) != 0)
+        if (((64 << (i + 2 * texIndex)) & (int)activeGradMask) != 0)
         {
             int gradIdx = i + 6 + 2 * texIndex;
-            if (mipmap->log2Dim[i] != 0)
+            int l2 = i == 0 ? log2S : log2T;
+            if (l2 != 0)
             {
                 int bias = 0;
                 int xAdd = pipe->xAdder[gradIdx];
                 int yAdd = pipe->yAdder[gradIdx];
+                int g0val = g0[i][0];
+                int g0sh = g0[i][1];
                 int ref;
                 int lsh = 0;
                 int baseShift = 0;
 
                 if (linear)
                 {
-                    int relShift = mipmap->log2Dim[i] - g0[i][1];
+                    int relShift = l2 - g0sh;
                     bias = (int)(relShift >= 0 ? 0x100000u >> relShift : 0x100000u << -relShift);
                 }
 
-                ref = (int)((unsigned int)g0[i][0] +
+                ref = (int)((unsigned int)g0val +
                     (unsigned int)grComputeGradientReference(v0sx, v0sy, xAdd, yAdd) -
                     (unsigned int)bias);
                 switch (texture->wrapMode[i])
                 {
                 case GR_WRAPMODE_REPEAT:
-                    lsh = 11 - g0[i][1];
+                    lsh = 11 - g0sh;
                     baseShift = 32;
                     break;
                 case GR_WRAPMODE_CLAMP_TO_EDGE:
                     lsh = 0;
-                    baseShift = g0[i][1] + 21;
+                    baseShift = g0sh + 21;
                     break;
                 case GR_WRAPMODE_MIRRORED_REPEAT:
-                    lsh = 10 - g0[i][1];
+                    lsh = 10 - g0sh;
                     baseShift = 31;
                     break;
                 default:
@@ -1271,7 +1353,7 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
                 pipe->xAdder[gradIdx] = (int)((unsigned int)xAdd << lsh);
                 pipe->yAdder[gradIdx] = (int)((unsigned int)yAdd << lsh);
                 pipe->reference[gradIdx] = (int)((unsigned int)ref << lsh);
-                tex->rShift[i] = baseShift - mipmap->log2Dim[i];
+                tex->rShift[i] = baseShift - l2;
                 if ((unsigned int)tex->rShift[i] > 31u &&
                     grAssert("tex->rShift[i] >= 0 && tex->rShift[i] <= 31",
                              "grRasterizer.inl", 202) != 0)
@@ -1288,9 +1370,9 @@ void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*g0)[2], int v0sx, 
     }
 
     tex->pixels = mipmap->pixels;
-    tex->sMask = (1 << mipmap->log2Dim[GR_TEXCOORD_S]) - 1;
-    tex->tMask = (1 << mipmap->log2Dim[GR_TEXCOORD_T]) - 1;
-    tex->log2DimS = mipmap->log2Dim[GR_TEXCOORD_S];
+    tex->sMask = (1 << log2S) - 1;
+    tex->tMask = (1 << log2T) - 1;
+    tex->log2DimS = log2S;
     tex->linear = linear;
     tex->palette = texture->palette;
 }

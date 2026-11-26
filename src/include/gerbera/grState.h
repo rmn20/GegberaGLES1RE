@@ -1247,9 +1247,9 @@ void grRenderElements(Gerbera_s *state, int primitiveType, int vertexCount,
 void grRenderArrays(Gerbera_s *state, int primitiveType, int vertexCount, int baseIndex);
 
 /* --- grRasterizer.inl: gradient setup ---------------------------------------- */
-void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
+void grSetupGradient(const _grGradientInfo *info, int gradient, int g01, int g02,
                      int reference);
-void grComputeDeltas(_grGradientInfo *info, int gradient, int g01, int g02);
+void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02);
 int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
                                     int flatShadeIndex, unsigned int gradientMask,
                                     int rejectDepth);

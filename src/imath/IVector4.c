@@ -432,7 +432,7 @@ void IVector4_viewportTransform(int *pD, _IVector4 *pS, int *pScale, int *pOffse
         /* Preserve the reciprocal estimator's bias and truncation for the
          * common normalized affine W. This is not exact division by W. */
         HGint64 rr = w == IUNITSCALAR_ONE
-            ? (HGint64)0x7fffffef00000002ULL : imRcpu(w + (w >> 27));
+            ? (HGint64)0x7fffffef00000002ULL : imRcpu_inline(w + (w >> 27));
         unsigned int recip = (unsigned int)(rr >> 32);   /* high: mantissa */
         unsigned int rsh = (unsigned int)rr;             /* low: shift     */
         int sx, sy, sz;
