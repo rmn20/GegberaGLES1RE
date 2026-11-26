@@ -45,24 +45,43 @@ void grSetupGradient(_grGradientInfo *info, int gradient, int g01, int g02,
     {
         HGint64 xAdd64 = hgMul64(info->v01syPerArea, g02);
         HGint64 xAdd64a;
-        HGint64 xAdd64b;
         HGint64 yAdd64 = hgMul64(info->v02sxPerArea, g01);
         HGint64 yAdd64a;
-        HGint64 yAdd64b;
+        int xHi, yHi, refSub;
 
         /* ARM RSB wraps before the signed long multiply, including INT_MIN. */
         xAdd64a = hgAsr64(hgMadd64(xAdd64, info->v02syPerArea,
                                   (int)(0u - (unsigned int)g01)),
                           info->shift + 14);
         xAdd32 = hgGet64l(xAdd64a);
-        xAdd64b = hgMul64x32(xAdd64a, info->v0sx);
+        xHi = hgGet64h(xAdd64a);
         yAdd64a = hgAsr64(hgMadd64(yAdd64, info->v01sxPerArea,
                                   (int)(0u - (unsigned int)g02)),
                           info->shift + 14);
         yAdd32 = hgGet64l(yAdd64a);
-        yAdd64b = hgMul64x32(yAdd64a, info->v0sy);
-        reference = (int)((unsigned int)reference
-            - (unsigned int)hgLsl64h_0_31(hgAdd64(xAdd64b, yAdd64b), 20));
+        yHi = hgGet64h(yAdd64a);
+        if (((xHi ^ (xAdd32 >> 31)) | (yHi ^ (yAdd32 >> 31))) == 0)
+        {
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
+            unsigned int lo;
+            int hi;
+            __asm__("smull %0, %1, %2, %3\n\t"
+                    "smlal %0, %1, %4, %5"
+                    : "=&r"(lo), "=&r"(hi)
+                    : "r"(xAdd32), "r"(info->v0sx), "r"(yAdd32), "r"(info->v0sy));
+            refSub = (int)(((unsigned int)hi << 20) | (lo >> 12));
+#else
+            HGint64 s = hgMadd64(hgMul64(xAdd32, info->v0sx), yAdd32, info->v0sy);
+            refSub = hgLsl64h_0_31(s, 20);
+#endif
+        }
+        else
+        {
+            HGint64 xAdd64b = hgMul64x32(xAdd64a, info->v0sx);
+            HGint64 yAdd64b = hgMul64x32(yAdd64a, info->v0sy);
+            refSub = hgLsl64h_0_31(hgAdd64(xAdd64b, yAdd64b), 20);
+        }
+        reference = (int)((unsigned int)reference - (unsigned int)refSub);
     }
     info->pPP->reference[gradient] = reference;
     info->pPP->xAdder[gradient] = xAdd32;
@@ -252,12 +271,23 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
         /* fog gradient (fog rides the back-alpha slot, record +54) */
         if ((gradientMask & 2) != 0)
         {
-            int f0 = (int)v0->color.final[1][3] << 8;
-            int f1 = (int)v1->color.final[1][3] << 8;
-            int f2 = (int)v2->color.final[1][3] << 8;
+            unsigned short rf0 = v0->color.final[1][3];
+            unsigned short rf1 = v1->color.final[1][3];
+            unsigned short rf2 = v2->color.final[1][3];
+            int f0 = (int)rf0 << 8;
 
-            grSetupGradient(&info, GR_GRADIENT_FOG, f1 - f0, f2 - f0,
-                            f0 + 128);
+            if (rf0 == rf1 && rf0 == rf2)
+            {
+                pixelPipe->reference[GR_GRADIENT_FOG] = f0 + 128;
+                pixelPipe->xAdder[GR_GRADIENT_FOG] = 0;
+                pixelPipe->yAdder[GR_GRADIENT_FOG] = 0;
+            }
+            else
+            {
+                grSetupGradient(&info, GR_GRADIENT_FOG,
+                                ((int)rf1 << 8) - f0, ((int)rf2 << 8) - f0,
+                                f0 + 128);
+            }
         }
 
         /* color gradients: per-vertex when smooth shading is on, constant
@@ -279,23 +309,45 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
                 {
                     if (((4 << coord) & gradientMask) != 0)
                     {
-                        int c0 = (int)v0->color.final[side][coord] << 8;
-                        int c1 = (int)v1->color.final[side][coord] << 8;
-                        int c2 = (int)v2->color.final[side][coord] << 8;
+                        unsigned short rc0 = v0->color.final[side][coord];
+                        unsigned short rc1 = v1->color.final[side][coord];
+                        unsigned short rc2 = v2->color.final[side][coord];
+                        int c0 = (int)rc0 << 8;
 
-                        grSetupGradient(&info, coord + 2, c1 - c0, c2 - c0,
-                                        c0 + 0x8000);
+                        if (rc0 == rc1 && rc0 == rc2)
+                        {
+                            pixelPipe->reference[coord + 2] = c0 + 0x8000;
+                            pixelPipe->xAdder[coord + 2] = 0;
+                            pixelPipe->yAdder[coord + 2] = 0;
+                        }
+                        else
+                        {
+                            grSetupGradient(&info, coord + 2,
+                                            ((int)rc1 << 8) - c0, ((int)rc2 << 8) - c0,
+                                            c0 + 0x8000);
+                        }
                     }
                 }
                 if ((gradientMask & 0x20) != 0)
                 {
                     /* alpha always interpolates the FRONT alpha (+46) */
-                    int a0 = (int)v0->color.final[0][3] << 8;
-                    int a1 = (int)v1->color.final[0][3] << 8;
-                    int a2 = (int)v2->color.final[0][3] << 8;
+                    unsigned short ra0 = v0->color.final[0][3];
+                    unsigned short ra1 = v1->color.final[0][3];
+                    unsigned short ra2 = v2->color.final[0][3];
+                    int a0 = (int)ra0 << 8;
 
-                    grSetupGradient(&info, GR_GRADIENT_COLOR_A,
-                                    a1 - a0, a2 - a0, a0 + 0x8000);
+                    if (ra0 == ra1 && ra0 == ra2)
+                    {
+                        pixelPipe->reference[GR_GRADIENT_COLOR_A] = a0 + 0x8000;
+                        pixelPipe->xAdder[GR_GRADIENT_COLOR_A] = 0;
+                        pixelPipe->yAdder[GR_GRADIENT_COLOR_A] = 0;
+                    }
+                    else
+                    {
+                        grSetupGradient(&info, GR_GRADIENT_COLOR_A,
+                                        ((int)ra1 << 8) - a0, ((int)ra2 << 8) - a0,
+                                        a0 + 0x8000);
+                    }
                 }
             }
             else
@@ -471,12 +523,15 @@ void grScanConvertWithoutXScissoring(_grEdgePair *edgePairs,
             int numPixels = hgMaxZero32(right - left);
 
             *scanlineInfo++ = left + (numPixels << 16);
-            if (hgInRange32(left, 0, 0xFFFF) == 0 &&
-                grAssert("hgInRange32(left, 0, 0xFFFF)", "grScanConvert.inl", 135) != 0)
-                grDie(0);
-            if (hgInRange32(numPixels, 0, 0xFFFF) == 0 &&
-                grAssert("hgInRange32(numPixels, 0, 0xFFFF)", "grScanConvert.inl", 136) != 0)
-                grDie(0);
+            if (((unsigned int)left | (unsigned int)numPixels) > 0xFFFFu)
+            {
+                if (hgInRange32(left, 0, 0xFFFF) == 0 &&
+                    grAssert("hgInRange32(left, 0, 0xFFFF)", "grScanConvert.inl", 135) != 0)
+                    grDie(0);
+                if (hgInRange32(numPixels, 0, 0xFFFF) == 0 &&
+                    grAssert("hgInRange32(numPixels, 0, 0xFFFF)", "grScanConvert.inl", 136) != 0)
+                    grDie(0);
+            }
             leftX += leftAdder;
             rightX += rightAdder;
             --topHeight;
@@ -497,12 +552,15 @@ void grScanConvertWithoutXScissoring(_grEdgePair *edgePairs,
             int numPixels = hgMaxZero32(right - left);
 
             *scanlineInfo++ = left + (numPixels << 16);
-            if (hgInRange32(left, 0, 0xFFFF) == 0 &&
-                grAssert("hgInRange32(left, 0, 0xFFFF)", "grScanConvert.inl", 158) != 0)
-                grDie(0);
-            if (hgInRange32(numPixels, 0, 0xFFFF) == 0 &&
-                grAssert("hgInRange32(numPixels, 0, 0xFFFF)", "grScanConvert.inl", 159) != 0)
-                grDie(0);
+            if (((unsigned int)left | (unsigned int)numPixels) > 0xFFFFu)
+            {
+                if (hgInRange32(left, 0, 0xFFFF) == 0 &&
+                    grAssert("hgInRange32(left, 0, 0xFFFF)", "grScanConvert.inl", 158) != 0)
+                    grDie(0);
+                if (hgInRange32(numPixels, 0, 0xFFFF) == 0 &&
+                    grAssert("hgInRange32(numPixels, 0, 0xFFFF)", "grScanConvert.inl", 159) != 0)
+                    grDie(0);
+            }
             leftX += leftAdder;
             rightX += rightAdder;
             --btmHeight;
@@ -572,24 +630,27 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
     if ((topHeight < 0 || btmHeight < 0) &&
         grAssert("topHeight >= 0 && btmHeight >= 0", "grScanConvert.inl", 250) != 0)
         grDie(0);
-    if (((1 << emptyBits) - 1) & p0->x &&
-        grAssert("!(v0sx & ((1<<emptyBits)-1))", "grScanConvert.inl", 252) != 0)
-        grDie(0);
-    if (((1 << emptyBits) - 1) & p0->y &&
-        grAssert("!(v0sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 253) != 0)
-        grDie(0);
-    if (((1 << emptyBits) - 1) & p1->x &&
-        grAssert("!(v1sx & ((1<<emptyBits)-1))", "grScanConvert.inl", 254) != 0)
-        grDie(0);
-    if (((1 << emptyBits) - 1) & p1->y &&
-        grAssert("!(v1sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 255) != 0)
-        grDie(0);
-    if (((1 << emptyBits) - 1) & p2->x &&
-        grAssert("!(v2sx & ((1<<emptyBits)-1))", "grScanConvert.inl", 256) != 0)
-        grDie(0);
-    if (((1 << emptyBits) - 1) & p2->y &&
-        grAssert("!(v2sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 257) != 0)
-        grDie(0);
+    if ((((1 << emptyBits) - 1) & (p0->x | p0->y | p1->x | p1->y | p2->x | p2->y)) != 0)
+    {
+        if (((1 << emptyBits) - 1) & p0->x &&
+            grAssert("!(v0sx & ((1<<emptyBits)-1))", "grScanConvert.inl", 252) != 0)
+            grDie(0);
+        if (((1 << emptyBits) - 1) & p0->y &&
+            grAssert("!(v0sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 253) != 0)
+            grDie(0);
+        if (((1 << emptyBits) - 1) & p1->x &&
+            grAssert("!(v1sx & ((1<<emptyBits)-1))", "grScanConvert.inl", 254) != 0)
+            grDie(0);
+        if (((1 << emptyBits) - 1) & p1->y &&
+            grAssert("!(v1sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 255) != 0)
+            grDie(0);
+        if (((1 << emptyBits) - 1) & p2->x &&
+            grAssert("!(v2sx & ((1<<emptyBits)-1))", "grScanConvert.inl", 256) != 0)
+            grDie(0);
+        if (((1 << emptyBits) - 1) & p2->y &&
+            grAssert("!(v2sy & ((1<<emptyBits)-1))", "grScanConvert.inl", 257) != 0)
+            grDie(0);
+    }
 
     edges[0].xStart[side] = (int)longAtV0;     /* long edge, top half */
     edges[0].xAdder[side] = slope02;

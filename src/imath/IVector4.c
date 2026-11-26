@@ -403,6 +403,19 @@ int IVector4_stp(_IVector4 *pA, _IVector4 *pB, _IVector4 *pC)
     return r;
 }
 
+static inline int iv4_mulLsl32h(int a, int b, unsigned int sh)
+{
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
+    unsigned int lo;
+    int hi;
+    unsigned int rsh = 31u - sh;
+    __asm__("smull %0, %1, %2, %3" : "=&r"(lo), "=&r"(hi) : "r"(a), "r"(b));
+    return (int)(((unsigned int)hi << sh) | ((lo >> 1) >> rsh));
+#else
+    return hgLsl64h_0_31(hgMul64(a, b), (int)sh);
+#endif
+}
+
 void IVector4_viewportTransform(int *pD, _IVector4 *pS, int *pScale, int *pOffset, int xyShift)
 {
     if (!(pD != NULL && pS != NULL && pScale != NULL && pOffset != NULL))
@@ -423,14 +436,11 @@ void IVector4_viewportTransform(int *pD, _IVector4 *pS, int *pScale, int *pOffse
         unsigned int recip = (unsigned int)(rr >> 32);   /* high: mantissa */
         unsigned int rsh = (unsigned int)rr;             /* low: shift     */
         int sx, sy, sz;
-        HGint64 t;
 
         if (hgInRange32((int)rsh, 1, 5) == 0)
             imAssert("hgInRange32(rsh, 1, 5)", "imApi.inl", 0x576u);
-        t = hgLsl64h_0_31(hgMul64(pS->m[0], (int)recip), (int)rsh - 1);
-        sx = (int)t;
-        t = hgLsl64h_0_31(hgMul64(pS->m[1], (int)recip), (int)rsh - 1);
-        sy = (int)t;
+        sx = iv4_mulLsl32h(pS->m[0], (int)recip, rsh - 1u);
+        sy = iv4_mulLsl32h(pS->m[1], (int)recip, rsh - 1u);
         sz = hgMul64h((int)((unsigned int)pS->m[2] << ((int)rsh - 1)), (int)recip);
         if (hgSignBit32(sx) != hgSignBit32(pS->m[0]))
             imAssert("hgSignBit32(sx) == hgSignBit32(pS->m[0])", "imApi.inl", 0x580u);
@@ -440,7 +450,7 @@ void IVector4_viewportTransform(int *pD, _IVector4 *pS, int *pScale, int *pOffse
             imAssert("hgInRange32(sz, -IUNITSCALAR_ONE, IUNITSCALAR_ONE)", "imApi.inl", 0x582u);
         pD[0] = (int)((unsigned int)(*pOffset + hgMul64h(sx, *pScale)) << xyShift);
         pD[1] = (int)((unsigned int)(pOffset[1] + hgMul64h(sy, pScale[1])) << xyShift);
-        pD[2] = pOffset[2] + hgLsl64h_0_31(hgMul64(sz, pScale[2]), 3);
+        pD[2] = pOffset[2] + iv4_mulLsl32h(sz, pScale[2], 3u);
     }
     else
     {

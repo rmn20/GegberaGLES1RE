@@ -1057,7 +1057,11 @@ void IVertexTransform_copy(_IVertexTransform *pD, _IMatrix4x4 *pM)
         {
             int sh = (int)maxExp - (int)((pD->v[r].e >> (8 * c)) & 0xFFu) + 1;
             int m = pD->v[r].m[c];
-            if (sh > 0x1F)
+            if (m == 0)
+            {
+                sh = 1;
+            }
+            else if (sh > 0x1F)
             {
                 m >>= hgClamp32_0_x(sh - 31, 31);
                 sh = 31;

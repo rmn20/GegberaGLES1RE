@@ -1072,7 +1072,10 @@ struct Gerbera_s
     unsigned int floatTransformMisses;
     _ICommonVertexTransform commonTransform;
     unsigned int pixelTextureLayout; /* dimensions and wrap modes of specialized code */
+    void (*transformVertexFast)(struct Gerbera_s *state, _grVertex *vertex);
 };
+
+void (*grSelectFastVertexTransform(Gerbera_s *state))(Gerbera_s *state, _grVertex *vertex);
 
 /* --- grApiSmall.inl: transform stack / user clip planes -------------------- */
 void grSetMatrix(Gerbera_s *state, int mode, _IMatrix4x4 *matrix);

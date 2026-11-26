@@ -325,11 +325,7 @@ void ITCTransform_mulfv4(int *pO, _ITCTransform *pT, int *strq)
  * clamped shifts so large coordinates retain the transform's wrapping. */
 static int texCoordUnitFloat(int value)
 {
-    int scalar = IScalar_iftos(value);
-    int mantissa = IScalar_getMantissa(scalar) >> 3;
-    int shift = (int)IScalar_getExponent(scalar) - 132;
-    return (int)((unsigned int)mantissa << hgClamp32_0_x(shift, 31)) >>
-        hgClamp32_0_x(-shift, 31);
+    return grTexCoordUnitFloatFast(value);
 }
 
 void ITCTransform_mulfv(int *pO, _ITCTransform *pT, int *strq, int n)

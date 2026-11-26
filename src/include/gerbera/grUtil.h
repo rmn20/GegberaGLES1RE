@@ -69,4 +69,30 @@ void grFill4x8(unsigned char *dst, unsigned char a, unsigned char b, unsigned ch
 void grFill4x16(unsigned short *dst, unsigned short a, unsigned short b, unsigned short c, unsigned short d, unsigned int mask, int size);
 void grFill4x32(unsigned int *dst, unsigned int a, unsigned int b, unsigned int c, unsigned int d, unsigned int mask, int size);
 
+/* Bit-exact float texcoord -> 16.16 fixed-point conversion for unit matrix. */
+static inline int grTexCoordUnitFloatFast(int value)
+{
+    unsigned int e = (unsigned int)(unsigned char)((unsigned int)value >> 23);
+    int sign, mag, mantissa, rshift;
+
+    if ((unsigned int)(e - 1u) >= 254u)
+        return 0;
+    sign = value >> 31;
+    mag = (int)(((unsigned int)value & 0x7FFFFFu) | 0x800000u) << 3;
+    mantissa = (int)(((unsigned int)mag ^ (unsigned int)sign) - (unsigned int)sign);
+    rshift = 132 - (int)e;
+    if (rshift >= 0)
+    {
+        if (rshift > 31)
+            rshift = 31;
+        return mantissa >> rshift;
+    }
+    {
+        int lshift = -rshift;
+        if (lshift > 31)
+            lshift = 31;
+        return (int)((unsigned int)mantissa << lshift);
+    }
+}
+
 #endif /* GR_UTIL_H */

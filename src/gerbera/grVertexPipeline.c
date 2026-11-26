@@ -308,6 +308,60 @@ int grGetVertexPositionState(_grVertex *v)
 /* --- grGetFogZ (30145-30180; assert grVertexPipeline.inl 1911) --------------
  * The eye-space Z of a vertex depending on how far grTransformVertex got. */
 
+static inline int grVp_zmulfv4Raw3(const _IVertexTransform *pT, const int *src)
+{
+    int v0 = src[0], v1 = src[1], v2 = src[2];
+    unsigned int e0 = (unsigned int)(unsigned char)((unsigned int)v0 >> 23);
+    unsigned int e1 = (unsigned int)(unsigned char)((unsigned int)v1 >> 23);
+    unsigned int e2 = (unsigned int)(unsigned char)((unsigned int)v2 >> 23);
+
+    if ((pT->cl & 0xFF0000u) == 0x200000u)
+        return IScalar_iftos(v2);
+
+    if (e0 != 255u && e1 != 255u && e2 != 255u)
+    {
+        const _IFVector4 *pA = &pT->v[2];
+        int s0 = v0 >> 31, s1 = v1 >> 31, s2 = v2 >> 31;
+        int m0 = e0 ? (int)(((((unsigned int)v0 & 0x7FFFFFu) | 0x800000u) << 6 ^ (unsigned int)s0) - (unsigned int)s0) : 0;
+        int m1 = e1 ? (int)(((((unsigned int)v1 & 0x7FFFFFu) | 0x800000u) << 6 ^ (unsigned int)s1) - (unsigned int)s1) : 0;
+        int m2 = e2 ? (int)(((((unsigned int)v2 & 0x7FFFFFu) | 0x800000u) << 6 ^ (unsigned int)s2) - (unsigned int)s2) : 0;
+        unsigned int pae = pA->e;
+        int ea0 = (int)(pae & 0xFFu);
+        int ea1 = (int)((pae >> 8) & 0xFFu);
+        int ea2 = (int)((pae >> 16) & 0xFFu);
+        int ea3 = (int)((pae >> 24) & 0xFFu);
+        int ee0 = (ea0 != 0 && e0 != 0u) ? ea0 + (int)e0 : 0;
+        int ee1 = (ea1 != 0 && e1 != 0u) ? ea1 + (int)e1 : 0;
+        int ee2 = (ea2 != 0 && e2 != 0u) ? ea2 + (int)e2 : 0;
+        int ee3 = (ea3 != 0) ? ea3 + 127 : 0;
+        int maxE = ee0;
+        int sh0, sh1, sh2, sh3, m, z;
+
+        if (maxE < ee1) maxE = ee1;
+        if (maxE < ee2) maxE = ee2;
+        if (maxE < ee3) maxE = ee3;
+        sh0 = maxE - ee0; if (sh0 > 31) sh0 = 31;
+        sh1 = maxE - ee1; if (sh1 > 31) sh1 = 31;
+        sh2 = maxE - ee2; if (sh2 > 31) sh2 = 31;
+        sh3 = maxE - ee3; if (sh3 > 31) sh3 = 31;
+        m = hgMul64h(pA->m[0], m0) >> sh0;
+        m += hgMul64h(pA->m[1], m1) >> sh1;
+        m += hgMul64h(pA->m[2], m2) >> sh2;
+        m += (pA->m[3] >> 3) >> sh3;
+        if (m == 0)
+            return IScalar_zero();
+        z = IScalar_setAndNormalize((unsigned int)(maxE - 125), m);
+        if (IScalar_isValid(z) == 0)
+            imAssert("IScalar_isValid(z)", "IMatrix4.c", 1789);
+        return z;
+    }
+    {
+        _IFVector4 tmp;
+        IFVector4_setfv(&tmp, (int *)src, 3);
+        return IVertexTransform_zmulfv4((_IVertexTransform *)pT, &tmp);
+    }
+}
+
 int grGetFogZ(Gerbera_s *state, _grVertex *vertex)
 {
     int result;
@@ -315,8 +369,25 @@ int grGetFogZ(Gerbera_s *state, _grVertex *vertex)
     switch (grGetVertexPositionState(vertex))
     {
         case 0:
-            result = IVertexTransform_zmulfv4(&state->modelviewTransform,
-                                              vertex->position.objectSpaceFloat);
+            if ((vertex->stateMask & GR_VERTEXMASK_APPROXIMATE_POSITION) != 0 &&
+                state->vertexArray[0].data != NULL)
+            {
+                const _grVertexArray *array = &state->vertexArray[0];
+                const int *src = (const int *)((const unsigned char *)array->data + array->stride * vertex->index);
+                if (array->type == GR_DATATYPE_FLOAT && array->size == 3)
+                    result = grVp_zmulfv4Raw3(&state->modelviewTransform, src);
+                else
+                {
+                    _IFVector4 tmp;
+                    IFVector4_setfv(&tmp, (int *)src, array->size);
+                    result = IVertexTransform_zmulfv4(&state->modelviewTransform, &tmp);
+                }
+            }
+            else
+            {
+                result = IVertexTransform_zmulfv4(&state->modelviewTransform,
+                                                  vertex->position.objectSpaceFloat);
+            }
             break;
         case 1:
             result = IVertexTransform_zmulxv4(&state->modelviewTransform,
@@ -356,26 +427,201 @@ void grApplyFogFAST(Gerbera_s *state, unsigned char *vertexList)
     } while (*vertexLista++ != 0xFF);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static unsigned short grApplyFogLINEAR_zeroZ(unsigned int fogEndBits, unsigned int fogOOBits)
+{
+    return (unsigned short)~(unsigned short)hgClamp32_0_x(
+        IScalar_scalarToFixed((HGint32)F_MUL(fogEndBits, fogOOBits), 16), 0xFFFF);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static unsigned short grApplyFogLINEAR_slow(Gerbera_s *state, _grVertex *vertex)
+{
+    int d = IScalar_abs(grGetFogZ(state, vertex));
+    int fogOORange = state->fogOORange;
+    return (unsigned short)~(unsigned short)hgClamp32_0_x(
+        IScalar_scalarToFixed(IScalar_mul(IScalar_sub(state->fogEnd, d), fogOORange), 16),
+        0xFFFF);
+}
+
 void grApplyFogLINEAR(Gerbera_s *state, unsigned char *vertexList)
 {
     _grVertex *vertexBuffer;
     _grVertex *vertex;
     unsigned char *vertexLista;
-    int fogOORange;
-    int d;
 
     GR_FETCH_CHECK(vertexList, 1925);
     vertexBuffer = GR_VERTEX_BUFFER(state);
     vertexLista = vertexList + 1;
     vertex = &vertexBuffer[*vertexList];
+
+    if (state->fogEnd >= 0 && state->fogOORange > 0 &&
+        state->vertexArray[0].data != NULL &&
+        state->vertexArray[0].type == GR_DATATYPE_FLOAT &&
+        state->vertexArray[0].size == 3 &&
+        (state->modelviewTransform.cl & 0xFF0000u) != 0x200000u)
+    {
+        unsigned int fogEndBits = (unsigned int)state->fogEnd;
+        unsigned int fogOOBits = (unsigned int)state->fogOORange;
+        unsigned int eEnd = fogEndBits >> 23;
+        unsigned int eOOR = fogOOBits >> 23;
+
+        if (eEnd < 255u && eOOR >= 1u && eOOR < 255u)
+        {
+            const _grVertexArray *array = &state->vertexArray[0];
+            const unsigned char *vbase = (const unsigned char *)array->data;
+            int vstride = array->stride;
+            const _IFVector4 *pA = &state->modelviewTransform.v[2];
+            unsigned int pae = pA->e;
+            int ea0 = (int)(pae & 0xFFu);
+            int ea1 = (int)((pae >> 8) & 0xFFu);
+            int ea2 = (int)((pae >> 16) & 0xFFu);
+            int ea3 = (int)(pae >> 24);
+            int ee3 = (ea3 != 0) ? ea3 + 127 : 0;
+            int pm0 = pA->m[0];
+            int pm1 = pA->m[1];
+            int pm2 = pA->m[2];
+            int pm3 = pA->m[3] >> 3;
+            unsigned int sbOOR = (fogOOBits << 8) | 0x80000000u;
+            unsigned int endMan = ((fogEndBits & 0x7FFFFFu) | 0x800000u) << 7;
+
+            do
+            {
+                if (grGetVertexPositionState(vertex) == GR_POSITION_OBJECT_SPACE_FLOAT)
+                {
+                    const int *src = (const int *)(vbase + vstride * vertex->index);
+                    int v0 = src[0], v1 = src[1], v2 = src[2];
+                    unsigned int e0 = (unsigned int)(unsigned char)((unsigned int)v0 >> 23);
+                    unsigned int e1 = (unsigned int)(unsigned char)((unsigned int)v1 >> 23);
+                    unsigned int e2 = (unsigned int)(unsigned char)((unsigned int)v2 >> 23);
+
+                    if (e0 != 255u && e1 != 255u && e2 != 255u)
+                    {
+                        int ee0 = (ea0 != 0 && e0 != 0u) ? ea0 + (int)e0 : 0;
+                        int ee1 = (ea1 != 0 && e1 != 0u) ? ea1 + (int)e1 : 0;
+                        int ee2 = (ea2 != 0 && e2 != 0u) ? ea2 + (int)e2 : 0;
+                        int maxE = ee0;
+                        int sh, m, ea;
+                        unsigned int absM, mb, d;
+
+                        if (maxE < ee1) maxE = ee1;
+                        if (maxE < ee2) maxE = ee2;
+                        if (maxE < ee3) maxE = ee3;
+                        sh = maxE - ee3; if (sh > 31) sh = 31;
+                        m = pm3 >> sh;
+                        if (ee0 != 0)
+                        {
+                            unsigned int s0 = (unsigned int)(v0 >> 31);
+                            int m0 = (int)((((((unsigned int)v0 & 0x7FFFFFu) | 0x800000u) << 6) ^ s0) - s0);
+                            sh = maxE - ee0; if (sh > 31) sh = 31;
+                            m += hgMul64h(pm0, m0) >> sh;
+                        }
+                        if (ee1 != 0)
+                        {
+                            unsigned int s1 = (unsigned int)(v1 >> 31);
+                            int m1 = (int)((((((unsigned int)v1 & 0x7FFFFFu) | 0x800000u) << 6) ^ s1) - s1);
+                            sh = maxE - ee1; if (sh > 31) sh = 31;
+                            m += hgMul64h(pm1, m1) >> sh;
+                        }
+                        if (ee2 != 0)
+                        {
+                            unsigned int s2 = (unsigned int)(v2 >> 31);
+                            int m2 = (int)((((((unsigned int)v2 & 0x7FFFFFu) | 0x800000u) << 6) ^ s2) - s2);
+                            sh = maxE - ee2; if (sh > 31) sh = 31;
+                            m += hgMul64h(pm2, m2) >> sh;
+                        }
+                        if (m == 0)
+                        {
+                            vertex->color.final[1][3] = grApplyFogLINEAR_zeroZ(fogEndBits, fogOOBits);
+                            goto next_vtx;
+                        }
+                        absM = (unsigned int)(m < 0 ? -m : m);
+                        sh = hgClz32(absM) - 1;
+                        ea = (maxE - 125) - sh + 1;
+                        if (ea <= 0)
+                        {
+                            vertex->color.final[1][3] = grApplyFogLINEAR_zeroZ(fogEndBits, fogOOBits);
+                            goto next_vtx;
+                        }
+                        if ((unsigned int)ea > 254u)
+                        {
+                            vertex->color.final[1][3] = 0xFFFFu;
+                            goto next_vtx;
+                        }
+                        mb = (sh >= 0) ? ((absM << sh) >> 1) : (absM >> 2);
+                        d = ((unsigned int)ea << 23) | ((mb >> 6) & 0x7FFFFFu);
+                        if (d >= fogEndBits)
+                        {
+                            vertex->color.final[1][3] = 0xFFFFu;
+                        }
+                        else
+                        {
+                            unsigned int expDiff = eEnd - (unsigned int)ea;
+                            unsigned int bMan = (mb << 1) & 0xFFFFFF80u;
+                            unsigned int bManFull = bMan;
+                            unsigned int aMan, sa, prodHigh;
+                            int subSh, aExp, expProd, fsh;
+
+                            if (expDiff > 31u)
+                                expDiff = 31u;
+                            bMan >>= expDiff;
+                            if (bManFull != (bMan << expDiff))
+                                ++bMan;
+                            aMan = endMan - bMan;
+                            subSh = hgClz32(aMan) - 1;
+                            aExp = (int)eEnd - subSh;
+                            if (aExp <= 0)
+                            {
+                                vertex->color.final[1][3] = 0xFFFFu;
+                                goto next_vtx;
+                            }
+                            aMan <<= subSh;
+                            sa = (aMan << 1) & 0xFFFFFF00u;
+                            prodHigh = hgMulu64h(sa, sbOOR);
+                            if ((int)prodHigh < 0)
+                            {
+                                expProd = aExp + (int)eOOR - 126;
+                                aMan = (prodHigh >> 1) & 0xFFFFFF80u;
+                            }
+                            else
+                            {
+                                expProd = aExp + (int)eOOR - 127;
+                                aMan = prodHigh & 0xFFFFFF80u;
+                            }
+                            fsh = 141 - expProd;
+                            if (fsh < 0)
+                            {
+                                vertex->color.final[1][3] = 0u;
+                            }
+                            else if (fsh > 31)
+                            {
+                                vertex->color.final[1][3] = 0xFFFFu;
+                            }
+                            else
+                            {
+                                unsigned int f = aMan >> fsh;
+                                if (f > 0xFFFFu) f = 0xFFFFu;
+                                vertex->color.final[1][3] = (unsigned short)~(unsigned short)f;
+                            }
+                        }
+                        goto next_vtx;
+                    }
+                }
+                vertex->color.final[1][3] = grApplyFogLINEAR_slow(state, vertex);
+            next_vtx:
+                vertex = &vertexBuffer[*vertexLista];
+            } while (*vertexLista++ != 0xFF);
+            return;
+        }
+    }
+
     do
     {
-        d = IScalar_abs(grGetFogZ(state, vertex));
-        fogOORange = state->fogOORange;
-        vertex->color.final[1][3] =
-            (unsigned short)~(unsigned short)hgClamp32_0_x(
-                IScalar_scalarToFixed(IScalar_mul(IScalar_sub(state->fogEnd, d), fogOORange), 16),
-                0xFFFF);
+        vertex->color.final[1][3] = grApplyFogLINEAR_slow(state, vertex);
         vertex = &vertexBuffer[*vertexLista];
     } while (*vertexLista++ != 0xFF);
 }
@@ -959,6 +1205,20 @@ void grTransformTexCoordFLOATx4(Gerbera_s *state, unsigned char *vertexList, int
     vertexBuffer = GR_VERTEX_BUFFER(state);
     vertexLista = vertexList + 1;
     vertex = &vertexBuffer[*vertexList];
+    if (size == 2 && (unsigned int)state->texCoordTransform[texUnit].cl == 0x80200802u)
+    {
+        do
+        {
+            const int *src = (const int *)&ptr[stride * vertex->index];
+            if (grIsAligned(src, 4) == 0 &&
+                grAssert("grIsAligned(ptr + stride*vertex->index, 4)", "grVertexPipeline.inl", 1868) != 0)
+                grDie(0);
+            vertex->texCoord[texUnit].x = grTexCoordUnitFloatFast(src[0]);
+            vertex->texCoord[texUnit].y = grTexCoordUnitFloatFast(src[1]);
+            vertex = &vertexBuffer[*vertexLista];
+        } while (*vertexLista++ != 0xFF);
+        return;
+    }
     do
     {
         if (grIsAligned(&ptr[stride * vertex->index], 4) == 0 &&
@@ -1565,10 +1825,333 @@ transformed:
     grComputeVertexClipCodes(state, vertex);
 }
 
-/* Three-component short positions have an implicit W of one. */
-#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && __ARM_ARCH >= 6
-__attribute__((optimize("no-schedule-insns")))
+static inline int grVp_dot4hi(const int *q, int m0, int m1, int m2, int m3)
+{
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
+    unsigned int lo;
+    int hi;
+    __asm__("smull %0, %1, %2, %3" : "=&r"(lo), "=&r"(hi) : "r"(q[0]), "r"(m0));
+    __asm__("smlal %0, %1, %4, %5" : "=&r"(lo), "=&r"(hi) : "0"(lo), "1"(hi), "r"(q[1]), "r"(m1));
+    __asm__("smlal %0, %1, %4, %5" : "=&r"(lo), "=&r"(hi) : "0"(lo), "1"(hi), "r"(q[2]), "r"(m2));
+    __asm__("smlal %0, %1, %4, %5" : "=&r"(lo), "=&r"(hi) : "0"(lo), "1"(hi), "r"(q[3]), "r"(m3));
+    return hi;
+#else
+    return (int)(((HGint64)q[0] * m0 + (HGint64)q[1] * m1 +
+                  (HGint64)q[2] * m2 + (HGint64)q[3] * m3) >> 32);
 #endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void grTransformVertexFloat3Fallback(Gerbera_s *state, _grVertex *vertex, const int *src)
+{
+    _IFVector4 *position = vertex->position.objectSpaceFloat;
+    IFVector4_setfv(position, (int *)src, 3);
+    grSetVertexPositionState(vertex, GR_POSITION_OBJECT_SPACE_FLOAT);
+    vertex->stateMask |= GR_VERTEXMASK_TRANSFORMED;
+    if (state->floatTransformMisses < GR_FLOAT_TRANSFORM_MISS_LIMIT &&
+        state->objectToClipTransform.cl != 0x80200802u)
+    {
+        unsigned int recent = state->floatTransformRecent;
+        _IFVertexTransformPlan *fplan = &state->floatTransformPlan[recent];
+        if (fplan->inputExponent != position->e)
+        {
+            recent ^= 1;
+            fplan = &state->floatTransformPlan[recent];
+            state->floatTransformRecent = recent;
+            if (fplan->inputExponent != position->e)
+            {
+                ++state->floatTransformMisses;
+                IVertexTransform_prepareFloat(fplan, &state->objectToClipTransform, position->e);
+            }
+            else
+                state->floatTransformMisses = 0;
+        }
+        else
+            state->floatTransformMisses = 0;
+        IVertexTransform_mulfv4Prepared(&vertex->clipPosition,
+                                        &state->objectToClipTransform, position, fplan);
+    }
+    else
+        IVertexTransform_mulfv4(&vertex->clipPosition,
+                                &state->objectToClipTransform, position);
+    grComputeVertexClipCodes(state, vertex);
+}
+
+static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
+{
+    const _grVertexArray *array = &state->vertexArray[0];
+    const int *src;
+    int v0, v1, v2;
+    unsigned int e0, e1, e2, maxE;
+    int m0, m1, m2, m3;
+    const _ICommonVertexTransform *plan;
+    int r0, r1, r2, r3;
+    int a0, a1, a2;
+    unsigned int probe;
+    int shift, exponent;
+
+    GR_VP_CHECK(state && vertex, 230);
+    GR_VP_CHECK(array->data, 231);
+    GR_VP_CHECK(!(vertex->stateMask & GR_VERTEXMASK_TRANSFORMED), 232);
+    src = (const int *)((const unsigned char *)array->data + array->stride * vertex->index);
+    GR_VP_CHECK(grIsAligned(src, 4), 250);
+
+    v0 = src[0];
+    v1 = src[1];
+    v2 = src[2];
+    e0 = (unsigned int)(unsigned char)((unsigned int)v0 >> 23);
+    e1 = (unsigned int)(unsigned char)((unsigned int)v1 >> 23);
+    e2 = (unsigned int)(unsigned char)((unsigned int)v2 >> 23);
+    if (e0 == 255u || e1 == 255u || e2 == 255u)
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+
+    maxE = 127u;
+    if (maxE < e0) maxE = e0;
+    if (maxE < e1) maxE = e1;
+    if (maxE < e2) maxE = e2;
+    if ((e0 && maxE - e0 > IM_COMMON_TRANSFORM_SPREAD) ||
+        (e1 && maxE - e1 > IM_COMMON_TRANSFORM_SPREAD) ||
+        (e2 && maxE - e2 > IM_COMMON_TRANSFORM_SPREAD) ||
+        (maxE - 127u > IM_COMMON_TRANSFORM_SPREAD))
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+
+    {
+        unsigned int s0 = (unsigned int)(v0 >> 31);
+        unsigned int s1 = (unsigned int)(v1 >> 31);
+        unsigned int s2 = (unsigned int)(v2 >> 31);
+        unsigned int mag0 = e0 ? ((((unsigned int)v0 & 0x7FFFFFu) | 0x800000u) << 6) : 0u;
+        unsigned int mag1 = e1 ? ((((unsigned int)v1 & 0x7FFFFFu) | 0x800000u) << 6) : 0u;
+        unsigned int mag2 = e2 ? ((((unsigned int)v2 & 0x7FFFFFu) | 0x800000u) << 6) : 0u;
+        m0 = e0 ? ((int)((mag0 ^ s0) - s0) >> (maxE - e0)) : 0;
+        m1 = e1 ? ((int)((mag1 ^ s1) - s1) >> (maxE - e1)) : 0;
+        m2 = e2 ? ((int)((mag2 ^ s2) - s2) >> (maxE - e2)) : 0;
+        m3 = 0x20000000 >> (maxE - 127u);
+    }
+
+    plan = &state->commonTransform;
+    r3 = grVp_dot4hi(plan->m[3], m0, m1, m2, m3);
+    if (r3 < IM_COMMON_TRANSFORM_MIN_W)
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+    probe = (unsigned int)r3;
+    r0 = grVp_dot4hi(plan->m[0], m0, m1, m2, m3);
+    a0 = hgAbs32(r0);
+    if ((a0 >> 2) >= r3 - IM_COMMON_TRANSFORM_CLIP_MARGIN ||
+        (unsigned int)(a0 - r3 + IM_COMMON_TRANSFORM_CLIP_MARGIN) < 2 * IM_COMMON_TRANSFORM_CLIP_MARGIN)
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+    probe |= (unsigned int)a0;
+    r1 = grVp_dot4hi(plan->m[1], m0, m1, m2, m3);
+    a1 = hgAbs32(r1);
+    if ((a1 >> 2) >= r3 - IM_COMMON_TRANSFORM_CLIP_MARGIN ||
+        (unsigned int)(a1 - r3 + IM_COMMON_TRANSFORM_CLIP_MARGIN) < 2 * IM_COMMON_TRANSFORM_CLIP_MARGIN)
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+    probe |= (unsigned int)a1;
+    r2 = grVp_dot4hi(plan->m[2], m0, m1, m2, m3);
+    a2 = hgAbs32(r2);
+    if ((unsigned int)(a2 - r3 + IM_COMMON_TRANSFORM_CLIP_MARGIN) < 2 * IM_COMMON_TRANSFORM_CLIP_MARGIN)
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+    probe |= (unsigned int)a2;
+    shift = hgClz32(probe) - 2;
+    exponent = plan->exponent + (int)maxE - 124 - shift;
+    if ((unsigned int)(exponent - 2) >= 252)
+    {
+        grTransformVertexFloat3Fallback(state, vertex, src);
+        return;
+    }
+
+    vertex->stateMask = (unsigned short)((vertex->stateMask & 0x3FFFu) |
+                        GR_VERTEXMASK_TRANSFORMED | GR_VERTEXMASK_APPROXIMATE_POSITION);
+    vertex->clipMask = (unsigned short)(
+        ((unsigned int)(r3 + r2) >> 31) |
+        (((unsigned int)(r3 - r2) >> 31) << 1) |
+        (((unsigned int)(r3 + r0) >> 31) << 6) |
+        (((unsigned int)(r3 - r0) >> 31) << 7) |
+        (((unsigned int)(r3 + r1) >> 31) << 8) |
+        (((unsigned int)(r3 - r1) >> 31) << 9));
+    vertex->clipPosition.e = (unsigned int)exponent;
+    vertex->clipPosition.m[0] = (int)((unsigned int)r0 << shift);
+    vertex->clipPosition.m[1] = (int)((unsigned int)r1 << shift);
+    vertex->clipPosition.m[2] = (int)((unsigned int)r2 << shift);
+    vertex->clipPosition.m[3] = (int)((unsigned int)r3 << shift);
+}
+
+static inline HGint64 grVp_mulacc3ShRow(HGint64 w, const int *u, unsigned int sh,
+                                          int s0, int s1, int s2)
+{
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
+    unsigned int lo = (unsigned int)(HGuint64)w;
+    int hi = (int)((HGuint64)w >> 32);
+    int t0, t1;
+    __asm__(
+        "and %2, %7, #255\n\t"
+        "rsb %2, %2, #16\n\t"
+        "ldr %3, [%6, #0]\n\t"
+        "lsl %2, %8, %2\n\t"
+        "smlal %0, %1, %3, %2\n\t"
+        "lsr %2, %7, #8\n\t"
+        "and %2, %2, #255\n\t"
+        "rsb %2, %2, #16\n\t"
+        "ldr %3, [%6, #4]\n\t"
+        "lsl %2, %9, %2\n\t"
+        "smlal %0, %1, %3, %2\n\t"
+        "lsr %2, %7, #16\n\t"
+        "and %2, %2, #255\n\t"
+        "rsb %2, %2, #16\n\t"
+        "ldr %3, [%6, #8]\n\t"
+        "lsl %2, %10, %2\n\t"
+        "smlal %0, %1, %3, %2"
+        : "=&r"(lo), "=&r"(hi), "=&r"(t0), "=&r"(t1)
+        : "0"(lo), "1"(hi), "r"(u), "r"(sh), "r"(s0), "r"(s1), "r"(s2),
+          "m"(*(const int (*)[3])u));
+    return (HGint64)(((HGuint64)(unsigned int)hi << 32) | lo);
+#else
+    int x0 = (int)((unsigned int)s0 << (16 - (sh & 0xFFu)));
+    int x1 = (int)((unsigned int)s1 << (16 - ((sh >> 8) & 0xFFu)));
+    int x2 = (int)((unsigned int)s2 << (16 - ((sh >> 16) & 0xFFu)));
+    return w + (HGint64)u[0] * x0 + (HGint64)u[1] * x1 + (HGint64)u[2] * x2;
+#endif
+}
+
+static void grTransformVertexShort3Identity(Gerbera_s *state, _grVertex *vertex)
+{
+    _grVertexArray *array = &state->vertexArray[0];
+    const short *src;
+    int *position = (int *)&vertex->position;
+    int x, y, z, w = 65536;
+    unsigned int amax;
+    int sh, e;
+
+    GR_VP_CHECK(state && vertex, 230);
+    GR_VP_CHECK(array->data, 231);
+    GR_VP_CHECK(!(vertex->stateMask & GR_VERTEXMASK_TRANSFORMED), 232);
+    src = (const short *)((const unsigned char *)array->data + array->stride * vertex->index);
+    GR_VP_CHECK(grIsAligned(src, 2), 270);
+    vertex->stateMask |= GR_VERTEXMASK_TRANSFORMED;
+    x = (int)((unsigned int)src[0] << 16);
+    y = (int)((unsigned int)src[1] << 16);
+    z = (int)((unsigned int)src[2] << 16);
+    position[0] = x;
+    position[1] = y;
+    position[2] = z;
+    position[3] = 65536;
+    grSetVertexPositionState(vertex, GR_POSITION_OBJECT_SPACE_FIXED);
+
+    amax = (unsigned int)(hgAbs32(x) | hgAbs32(y) | hgAbs32(z) | 0x10000);
+    sh = hgClz32(amax) - 2;
+    e = 140 - sh;
+    if (sh >= 0)
+    {
+        x = (int)((unsigned int)x << sh);
+        y = (int)((unsigned int)y << sh);
+        z = (int)((unsigned int)z << sh);
+        w = (int)((unsigned int)w << sh);
+    }
+    else
+    {
+        sh = -sh;
+        x >>= sh; y >>= sh; z >>= sh; w >>= sh;
+    }
+    if (x == -1073741824 || y == -1073741824 ||
+        z == -1073741824 || w == -1073741824)
+    {
+        x >>= 1; y >>= 1; z >>= 1; w >>= 1;
+        ++e;
+    }
+    IVector4_set_noINF(&vertex->clipPosition, e, x, y, z, w);
+    grComputeVertexClipCodes(state, vertex);
+}
+
+static void grTransformVertexShort3Fast16(Gerbera_s *state, _grVertex *vertex)
+{
+    _grVertexArray *array = &state->vertexArray[0];
+    const short *src;
+    int *position = (int *)&vertex->position;
+    _IVertexTransform *pT = &state->objectToClipTransform;
+    int s0, s1, s2;
+    HGint64 acc0, acc1, acc2, acc3;
+    HGuint64 amax;
+
+    GR_VP_CHECK(state && vertex, 230);
+    GR_VP_CHECK(array->data, 231);
+    GR_VP_CHECK(!(vertex->stateMask & GR_VERTEXMASK_TRANSFORMED), 232);
+    src = (const short *)((const unsigned char *)array->data + array->stride * vertex->index);
+    GR_VP_CHECK(grIsAligned(src, 2), 270);
+    vertex->stateMask |= GR_VERTEXMASK_TRANSFORMED;
+    s0 = src[0];
+    s1 = src[1];
+    s2 = src[2];
+    position[0] = (int)((unsigned int)s0 << 16);
+    position[1] = (int)((unsigned int)s1 << 16);
+    position[2] = (int)((unsigned int)s2 << 16);
+    position[3] = 65536;
+    grSetVertexPositionState(vertex, GR_POSITION_OBJECT_SPACE_FIXED);
+
+    acc0 = grVp_mulacc3ShRow(pT->w[0], pT->unnormalized[0], pT->sh[0], s0, s1, s2);
+    acc1 = grVp_mulacc3ShRow(pT->w[1], pT->unnormalized[1], pT->sh[1], s0, s1, s2);
+    acc2 = grVp_mulacc3ShRow(pT->w[2], pT->unnormalized[2], pT->sh[2], s0, s1, s2);
+    acc3 = pT->w[3];
+    if ((pT->cl & 0x3F000000u) != 0)
+        acc3 = grVp_mulacc3ShRow(acc3, pT->unnormalized[3], pT->sh[3], s0, s1, s2);
+
+    amax = (HGuint64)hgAbs64(acc0) | (HGuint64)hgAbs64(acc1) |
+           (HGuint64)hgAbs64(acc2) | (HGuint64)hgAbs64(acc3);
+    if (amax != 0)
+    {
+        int sh = hgClz64((HGint64)amax) - 1;
+        int e = (int)pT->exp - sh + 1;
+        int m0, m1, m2, m3;
+        if (sh >= 32)
+        {
+            m0 = hgLsl64h(acc0, sh) >> 1;
+            m1 = hgLsl64h(acc1, sh) >> 1;
+            m2 = hgLsl64h(acc2, sh) >> 1;
+            m3 = hgLsl64h(acc3, sh) >> 1;
+        }
+        else
+        {
+            m0 = hgLsl64h_0_31(acc0, sh) >> 1;
+            m1 = hgLsl64h_0_31(acc1, sh) >> 1;
+            m2 = hgLsl64h_0_31(acc2, sh) >> 1;
+            m3 = hgLsl64h_0_31(acc3, sh) >> 1;
+        }
+        if (m0 == -1073741824 || m1 == -1073741824 ||
+            m2 == -1073741824 || m3 == -1073741824)
+        {
+            m0 >>= 1; m1 >>= 1; m2 >>= 1; m3 >>= 1;
+            ++e;
+        }
+        if (e > 0)
+        {
+            IVector4_set(&vertex->clipPosition, e, m0, m1, m2, m3);
+            grComputeVertexClipCodes(state, vertex);
+            return;
+        }
+    }
+
+    IVector4_zero(&vertex->clipPosition);
+    grComputeVertexClipCodes(state, vertex);
+}
+
+/* Three-component short positions have an implicit W of one. */
 static void grTransformVertexShort3(Gerbera_s *state, _grVertex *vertex)
 {
     _grVertexArray *array = &state->vertexArray[0];
@@ -1590,9 +2173,48 @@ static void grTransformVertexShort3(Gerbera_s *state, _grVertex *vertex)
     grComputeVertexClipCodes(state, vertex);
 }
 
+void (*grSelectFastVertexTransform(Gerbera_s *state))(Gerbera_s *state, _grVertex *vertex)
+{
+    if (grTestCapability(state, GR_CAPABILITY_MATRIX_PALETTE) != 0)
+        return NULL;
+    if (state->vertexArray[0].type == GR_DATATYPE_FLOAT &&
+        state->vertexArray[0].size == 3 &&
+        state->renderStackAllocated &&
+        !state->enabledUserClipPlaneIndices &&
+        state->commonTransform.eligible &&
+        state->primitiveType != GR_PRIMITIVETYPE_POINT &&
+        grTestCapability(state, GR_CAPABILITY_LIGHTING) == 0)
+        return grTransformVertexFloat3Common;
+    if (state->vertexArray[0].type == GR_DATATYPE_INT16 &&
+        state->vertexArray[0].size == 3)
+    {
+        const _IVertexTransform *pT = &state->objectToClipTransform;
+        unsigned int rowBad = (((pT->sh[0] & 0xFFFFFFu) - 0x010101u) |
+                               ((pT->sh[1] & 0xFFFFFFu) - 0x010101u) |
+                               ((pT->sh[2] & 0xFFFFFFu) - 0x010101u));
+        if (pT->cl == 0x80200802u)
+            return grTransformVertexShort3Identity;
+        if ((pT->cl & 0x3F000000u) != 0)
+            rowBad |= ((pT->sh[3] & 0xFFFFFFu) - 0x010101u);
+        if ((rowBad & 0xF0F0F0u) == 0)
+            return grTransformVertexShort3Fast16;
+        return grTransformVertexShort3;
+    }
+    return NULL;
+}
+
 void grTransformVertexPreloaded(Gerbera_s *state, _grVertex *vertex, int weightsPreloaded)
 {
-    if (state->vertexArray[0].type == GR_DATATYPE_INT16 &&
+    if (state->vertexArray[0].type == GR_DATATYPE_FLOAT &&
+        state->vertexArray[0].size == 3 &&
+        state->renderStackAllocated &&
+        !state->enabledUserClipPlaneIndices &&
+        state->commonTransform.eligible &&
+        state->primitiveType != GR_PRIMITIVETYPE_POINT &&
+        grTestCapability(state, GR_CAPABILITY_LIGHTING) == 0 &&
+        grTestCapability(state, GR_CAPABILITY_MATRIX_PALETTE) == 0)
+        grTransformVertexFloat3Common(state, vertex);
+    else if (state->vertexArray[0].type == GR_DATATYPE_INT16 &&
         state->vertexArray[0].size == 3 &&
         grTestCapability(state, GR_CAPABILITY_MATRIX_PALETTE) == 0)
         grTransformVertexShort3(state, vertex);

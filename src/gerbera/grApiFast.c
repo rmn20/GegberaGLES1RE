@@ -73,40 +73,46 @@ int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
     unsigned int entry = cache->cacheIndices[hash & 0x1F];
     int slot;
 
-    if (vtxIndex != vertexBuffer[grUnpackIndex(entry, 0)].index)
+    if (vtxIndex != vertexBuffer[(int)(unsigned char)entry].index)
     {
-        if (vtxIndex == vertexBuffer[grUnpackIndex(entry, 1)].index)
+        if (vtxIndex == vertexBuffer[(int)(unsigned char)(entry >> 8)].index)
         {
             entry = (unsigned int)hgRor32((int)entry, 8);
         }
-        else if (vtxIndex == vertexBuffer[grUnpackIndex(entry, 2)].index)
+        else if (vtxIndex == vertexBuffer[(int)(unsigned char)(entry >> 16)].index)
         {
             entry = (unsigned int)hgRor32((int)entry, 16);
         }
-        else if (vtxIndex == vertexBuffer[grUnpackIndex(entry, 3)].index)
+        else if (vtxIndex == vertexBuffer[(int)(unsigned char)(entry >> 24)].index)
         {
             entry = (unsigned int)hgRor32((int)entry, 24);
         }
         else
         {
             slot = (int)(hash & 0x3F);
-            unsigned int locked = slot < 32
-                ? (unsigned int)hgGet64l(cache->batchLockMask)
-                : (unsigned int)hgGet64h(cache->batchLockMask);
-            if ((locked & (1u << (slot & 31))) != 0)
             {
-                HGint64 notMask = hgNot64(cache->batchLockMask);
+                unsigned int locked = slot < 32
+                    ? (unsigned int)hgGet64l(cache->batchLockMask)
+                    : (unsigned int)hgGet64h(cache->batchLockMask);
+                if ((locked & (1u << (slot & 31))) != 0)
+                {
+                    HGint64 notMask = hgNot64(cache->batchLockMask);
 
-                slot = 63 - hgClz64(notMask);
-                if (hgInRange32(slot, 0, GR_VERTEX_CACHE_SIZE - 1) == 0 &&
-                    grAssert("hgInRange32(cIndex, 0, GR_VERTEX_CACHE_SIZE-1)",
-                             "grApiFast.inl", 793) != 0)
-                    grDie(0);
+                    slot = 63 - hgClz64(notMask);
+                    if (hgInRange32(slot, 0, GR_VERTEX_CACHE_SIZE - 1) == 0 &&
+                        grAssert("hgInRange32(cIndex, 0, GR_VERTEX_CACHE_SIZE-1)",
+                                 "grApiFast.inl", 793) != 0)
+                        grDie(0);
+                }
             }
             entry = (entry << 8) | (unsigned int)slot;
             vertexBuffer[slot].index = vtxIndex;
             vertexBuffer[slot].stateMask = 0;
-            if (grTestCapability(state, GR_CAPABILITY_MATRIX_PALETTE) != 0 &&
+            if (state->transformVertexFast != NULL)
+            {
+                state->transformVertexFast(state, &vertexBuffer[slot]);
+            }
+            else if (grTestCapability(state, GR_CAPABILITY_MATRIX_PALETTE) != 0 &&
                 grTestCapability(state, GR_CAPABILITY_MATRIX_INDEX_ARRAY) != 0 &&
                 grTestCapability(state, GR_CAPABILITY_WEIGHT_ARRAY) != 0 &&
                 state->vertexArray[3].data != NULL &&
@@ -121,8 +127,8 @@ int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
                 grTransformVertexPreloaded(state, &vertexBuffer[slot], 0);
             }
         }
+        cache->cacheIndices[hash & 0x1F] = entry;
     }
-    cache->cacheIndices[hash & 0x1F] = entry;
     slot = (int)(entry & 0xFF);
     if (hgInRange32(slot, 0, GR_VERTEX_CACHE_SIZE - 1) == 0 &&
         grAssert("hgInRange32(cIndex, 0, GR_VERTEX_CACHE_SIZE-1)",
@@ -183,8 +189,8 @@ int grRoundTriangleArea(HGint64 area)
  * renderStack+1192 counts DWORDS and the flush trigger (grApiFast.inl 1042)
  * fires when it would exceed 254 (128 commands fill the queue region). */
 
-static int queueLookupCacheIndex(Gerbera_s *state, _grVertexCache *cache,
-                                 int v, int prev0, int prev1, int prev2)
+static inline int queueLookupCacheIndex(Gerbera_s *state, _grVertexCache *cache,
+                                        int v, int prev0, int prev1, int prev2)
 {
     int ci = -1;
 
@@ -353,10 +359,143 @@ void grQueuePrimitive(Gerbera_s *state, int i0, int i1, int i2, int numVertices)
 /* --- grQueuePrimitive1/2/3 (DLL 32591-32618) --------------------------------
  * Degenerate-primitive rejection wrappers used by grFetchPrimitives. */
 
+static inline int grApi_stp(const _IVector4 *pA, const _IVector4 *pB, const _IVector4 *pC)
+{
+    HGint64 r64;
+    int r;
+
+    r64 = hgMul64(pB->m[0], (int)(2u * (unsigned int)pC->m[1]));
+    r = (int)hgMadd64h(r64, -pC->m[0], (int)(2u * (unsigned int)pB->m[1]));
+    r64 = hgMul64(r, pA->m[3]);
+    r64 = hgMadd64(r64, (int)hgMadd64h(hgMul64(pC->m[0], (int)(2u * (unsigned int)pA->m[1])),
+                                         -pA->m[0], (int)(2u * (unsigned int)pC->m[1])), pB->m[3]);
+    r64 = hgMadd64(r64, (int)hgMadd64h(hgMul64(pA->m[0], (int)(2u * (unsigned int)pB->m[1])),
+                                         -pB->m[0], (int)(2u * (unsigned int)pA->m[1])), pC->m[3]);
+    r = (int)hgGet64h(r64);
+    if (hgInRange32(r, -94, 93) != 0)
+        return 0;
+    return r;
+}
+
 void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
 {
-    if (i0 != i2 && i1 != i2 && i0 != i1)
-        grQueuePrimitive(state, i0, i1, i2, 3);
+    _grVertexCache *cache;
+    unsigned int *renderStack;
+    _grVertex *vertexBuffer;
+    int prev0, prev1, prev2;
+    int ci0, ci1, ci2, packed;
+    unsigned short cm0, cm1, cm2, maskAll;
+    _grVertex *v0, *v1, *v2;
+    unsigned int *cmd;
+    _grRect *sc;
+    int sx0, sx1, sx2, sy0, sy1, sy2, m, g;
+    HGint64 area;
+    int areaHi, areaSign, triSide, cull;
+
+    if (i0 == i2 || i1 == i2 || i0 == i1)
+        return;
+
+    cache = GR_VERTEX_CACHE(state);
+    renderStack = (unsigned int *)state->renderStack;
+    vertexBuffer = GR_VERTEX_BUFFER(state);
+    prev0 = cache->prevVertexIndices[0];
+    prev1 = cache->prevVertexIndices[1];
+    prev2 = cache->prevVertexIndices[2];
+
+    cache->prevVertexIndices[2] = i2;
+    ci2 = queueLookupCacheIndex(state, cache, i2, prev0, prev1, prev2);
+    cache->prevVertexIndices[1] = i1;
+    ci1 = queueLookupCacheIndex(state, cache, i1, prev0, prev1, prev2);
+    cache->prevVertexIndices[0] = i0;
+    ci0 = queueLookupCacheIndex(state, cache, i0, prev0, prev1, prev2);
+    cache->prevCacheIndices[0] = ci0;
+    cache->prevCacheIndices[1] = ci1;
+    cache->prevCacheIndices[2] = ci2;
+    packed = grSetIndices(ci0, ci1, ci2);
+    v0 = &vertexBuffer[ci0];
+    v1 = &vertexBuffer[ci1];
+    v2 = &vertexBuffer[ci2];
+
+    if ((ci0 != ci1 && ci0 != ci2 && ci1 != ci2) == 0 &&
+        grAssert("(ci0 != ci1) && (ci0 != ci2) && (ci1 != ci2)",
+                 "grApiFast.inl", 999) != 0)
+        grDie(0);
+    if (hgSignBit32((254 - GR_COMMAND_QUEUE_INDEX(state)) |
+                    (cache->totalFreeSlots - 3)) != 0)
+        grFlushPrimitiveBatch(state);
+    cm0 = v0->clipMask;
+    cm1 = v1->clipMask;
+    cm2 = v2->clipMask;
+    if ((cm0 & cm1 & cm2 & 0xFFC3u) != 0)
+        return;
+    maskAll = cm0 | cm1 | cm2;
+    if (grTestCapability(state, GR_CAPABILITY_CULL_FACE) != 0)
+    {
+        int stp = grApi_stp(&v0->clipPosition, &v1->clipPosition, &v2->clipPosition);
+
+        if (stp != 0 && (unsigned int)stp >> 31 == state->cullNegative)
+            return;
+    }
+    cmd = renderStack + GR_COMMAND_QUEUE_INDEX(state) + 42;
+    if ((maskAll & 0xFC3Fu) != 0)
+    {
+        cmd[0] = (unsigned int)packed | 0x10000000u;
+        cmd[1] = 0;
+        GR_COMMAND_QUEUE_INDEX(state) += 2;
+        return;
+    }
+
+    if ((v0->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+        grViewportTransformVertex(state, v0);
+    if ((v1->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+        grViewportTransformVertex(state, v1);
+    if ((v2->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+        grViewportTransformVertex(state, v2);
+
+    sc = &state->renderScissor;
+    sx0 = grSubpixelTrunc(v0->screenPosition[0]);
+    sx1 = grSubpixelTrunc(v1->screenPosition[0]);
+    sx2 = grSubpixelTrunc(v2->screenPosition[0]);
+    sy0 = grSubpixelTrunc(v0->screenPosition[1]);
+    sy1 = grSubpixelTrunc(v1->screenPosition[1]);
+    sy2 = grSubpixelTrunc(v2->screenPosition[1]);
+    m = (sx0 - sc->x0) & (sx1 - sc->x0) & (sx2 - sc->x0);
+    g = (sc->x1 - sx0) & (sc->x1 - sx1) & (sc->x1 - sx2);
+    m |= g;
+    g = (sy0 - sc->y0) & (sy1 - sc->y0) & (sy2 - sc->y0);
+    m |= g;
+    g = (sc->y1 - sy0) & (sc->y1 - sy1) & (sc->y1 - sy2);
+    m |= g;
+    if (hgSignBit32(m) != 0)
+        return;
+
+    area = hgMadd64(hgMul64(v1->screenPosition[0] - v0->screenPosition[0],
+                            v2->screenPosition[1] - v0->screenPosition[1]),
+                    v1->screenPosition[1] - v0->screenPosition[1],
+                    v0->screenPosition[0] - v2->screenPosition[0]);
+    areaHi = hgGet64h(area);
+    areaSign = (unsigned int)areaHi >> 31;
+    triSide = areaSign ^ grGetFrontFace(state);
+    cull = (areaSign ^ state->cullNegative) &
+           grTestCapability(state, GR_CAPABILITY_CULL_FACE);
+    if (cull == 0 && hgIsZero64(area) == 0)
+    {
+        unsigned int rArea;
+        if (areaHi < 0)
+        {
+            rArea = ((unsigned int)areaHi << 9) |
+                    ((unsigned int)hgGet64l(area) >> 23);
+        }
+        else
+        {
+            HGint64 neg = hgNeg64(area);
+            rArea = (unsigned int)(-(int)(((unsigned int)hgGet64h(neg) << 9) |
+                                          ((unsigned int)hgGet64l(neg) >> 23)));
+        }
+        cmd[0] = (unsigned int)packed | ((unsigned int)triSide << 24);
+        cmd[1] = rArea;
+        GR_COMMAND_QUEUE_INDEX(state) += 2;
+    }
 }
 
 void grQueuePrimitive2(Gerbera_s *state, int i0, int i1)
@@ -394,32 +533,83 @@ void grFlushPrimitiveBatch(Gerbera_s *state)
     HGint64 mask;
     int j;
 
-    grUpdateVertexPipeline(state);
-    while (cmd >= queue)
+    if (state->vertexPipelineDirty != 0 || state->primitiveType == 0 ||
+        grTestCapability(state, GR_CAPABILITY_LIGHTING) != 0 ||
+        grIsMatrixDirty(state, GR_MATRIXMODE_TEXTURE0) != 0 ||
+        grIsMatrixDirty(state, GR_MATRIXMODE_TEXTURE1) != 0 ||
+        (state->textureUnitEnabled[0] != 0 && state->vertexArray[6].data == NULL) ||
+        (state->textureUnitEnabled[1] != 0 && state->vertexArray[7].data == NULL))
+        grUpdateVertexPipeline(state);
+    if (primitiveVertices == 3 && smooth != 0)
     {
-        unsigned int packed = *cmd;
-        int first = 1;
-
-        cmd -= 2;
-        for (j = 0; j < primitiveVertices; ++j)
+        while (cmd >= queue)
         {
-            int idx = grUnpackIndex(packed, j);
-            _grVertex *vertex = &vertexBuffer[idx];
-            unsigned short sm = vertex->stateMask;
+            unsigned int packed = *cmd;
+            int idx0 = (int)(unsigned char)packed;
+            int idx1 = (int)(unsigned char)(packed >> 8);
+            int idx2 = (int)(unsigned char)(packed >> 16);
+            _grVertex *v0 = &vertexBuffer[idx0];
+            _grVertex *v1 = &vertexBuffer[idx1];
+            _grVertex *v2 = &vertexBuffer[idx2];
+            unsigned short sm0 = v0->stateMask;
+            unsigned short sm1 = v1->stateMask;
+            unsigned short sm2 = v2->stateMask;
 
-            if (first != 0 && (sm & 0x20) == 0)
+            cmd -= 2;
+            if ((sm0 & 0x30u) != 0x30u)
             {
-                sm |= 0x20;
-                vertex->stateMask = sm;
-                *smoothList++ = (unsigned char)idx;
+                v0->stateMask = (unsigned short)(sm0 | 0x30u);
+                if ((sm0 & 0x20u) == 0)
+                    *smoothList++ = (unsigned char)idx0;
+                if ((sm0 & 0x10u) == 0)
+                    *pipeList++ = (unsigned char)idx0;
             }
-            if ((sm & 0x10) == 0)
+            if ((sm1 & 0x30u) != 0x30u)
             {
-                sm |= 0x10;
-                vertex->stateMask = sm;
-                *pipeList++ = (unsigned char)idx;
+                v1->stateMask = (unsigned short)(sm1 | 0x30u);
+                if ((sm1 & 0x20u) == 0)
+                    *smoothList++ = (unsigned char)idx1;
+                if ((sm1 & 0x10u) == 0)
+                    *pipeList++ = (unsigned char)idx1;
             }
-            first = smooth;
+            if ((sm2 & 0x30u) != 0x30u)
+            {
+                v2->stateMask = (unsigned short)(sm2 | 0x30u);
+                if ((sm2 & 0x20u) == 0)
+                    *smoothList++ = (unsigned char)idx2;
+                if ((sm2 & 0x10u) == 0)
+                    *pipeList++ = (unsigned char)idx2;
+            }
+        }
+    }
+    else
+    {
+        while (cmd >= queue)
+        {
+            unsigned int packed = *cmd;
+            int first = 1;
+
+            cmd -= 2;
+            for (j = 0; j < primitiveVertices; ++j)
+            {
+                int idx = grUnpackIndex(packed, j);
+                _grVertex *vertex = &vertexBuffer[idx];
+                unsigned short sm = vertex->stateMask;
+
+                if (first != 0 && (sm & 0x20) == 0)
+                {
+                    sm |= 0x20;
+                    vertex->stateMask = sm;
+                    *smoothList++ = (unsigned char)idx;
+                }
+                if ((sm & 0x10) == 0)
+                {
+                    sm |= 0x10;
+                    vertex->stateMask = sm;
+                    *pipeList++ = (unsigned char)idx;
+                }
+                first = smooth;
+            }
         }
     }
     *smoothList = 0xFF;
@@ -445,31 +635,52 @@ void grFlushPrimitiveBatch(Gerbera_s *state)
         if (state->applyFog != NULL)
             state->applyFog(state, renderStack + 1196);
     }
-    for (dispatch = queue; dispatch < queueEnd; )
+    if (state->primitiveType == GR_PRIMITIVETYPE_TRIANGLE)
     {
-        _grClipTriangle tri;
-        unsigned int cmd0 = *dispatch++;
-        unsigned int cmd1 = *dispatch++;
-
-        if (dispatch > queueEnd &&
-            grAssert("cmdQueue <= cmdQueueEnd", "grApiFast.inl", 676) != 0)
-            grDie(0);
-        tri.indices = cmd0;
-        tri.area = (int)cmd1;
-        tri.side = (int)((cmd0 >> 24) & 1);
-        if ((cmd0 & 0x10000000u) != 0)
-            grClipPrimitive(state, cmd0, grGetPrimitiveVertices(state->primitiveType));
-        else if (state->primitiveType == GR_PRIMITIVETYPE_POINT)
-            grrDrawClippedPoint(state, &tri, cmd0);
-        else if (state->primitiveType == GR_PRIMITIVETYPE_LINE)
-            grrDrawClippedLine(state, &tri, cmd0);
-        else
+        for (dispatch = queue; dispatch < queueEnd; )
         {
-            if (state->primitiveType != GR_PRIMITIVETYPE_TRIANGLE &&
-                grAssert("state->primitiveType == GR_PRIMITIVETYPE_TRIANGLE",
-                         "grApiFast.inl", 687) != 0)
+            _grClipTriangle tri;
+            unsigned int cmd0 = *dispatch++;
+            unsigned int cmd1 = *dispatch++;
+
+            if (dispatch > queueEnd &&
+                grAssert("cmdQueue <= cmdQueueEnd", "grApiFast.inl", 676) != 0)
                 grDie(0);
-            grrDrawClippedTriangle(state, &tri, cmd0);
+            tri.indices = cmd0;
+            tri.area = (int)cmd1;
+            tri.side = (int)((cmd0 >> 24) & 1);
+            if ((cmd0 & 0x10000000u) != 0)
+                grClipPrimitive(state, cmd0, 3);
+            else
+                grrDrawClippedTriangle(state, &tri, cmd0);
+        }
+    }
+    else
+    {
+        for (dispatch = queue; dispatch < queueEnd; )
+        {
+            _grClipTriangle tri;
+            unsigned int cmd0 = *dispatch++;
+            unsigned int cmd1 = *dispatch++;
+
+            if (dispatch > queueEnd &&
+                grAssert("cmdQueue <= cmdQueueEnd", "grApiFast.inl", 676) != 0)
+                grDie(0);
+            tri.indices = cmd0;
+            tri.area = (int)cmd1;
+            tri.side = (int)((cmd0 >> 24) & 1);
+            if ((cmd0 & 0x10000000u) != 0)
+                grClipPrimitive(state, cmd0, grGetPrimitiveVertices(state->primitiveType));
+            else if (state->primitiveType == GR_PRIMITIVETYPE_POINT)
+                grrDrawClippedPoint(state, &tri, cmd0);
+            else
+            {
+                if (state->primitiveType != GR_PRIMITIVETYPE_LINE &&
+                    grAssert("state->primitiveType == GR_PRIMITIVETYPE_LINE",
+                             "grApiFast.inl", 687) != 0)
+                    grDie(0);
+                grrDrawClippedLine(state, &tri, cmd0);
+            }
         }
     }
     mask = hgSetBit64(hgSetBit64(hgSetBit64(hgZero64(), cache->prevCacheIndices[0]),
@@ -574,6 +785,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
         ok = 0;
     if (ok == 0)
         grDie(0);
+    state->transformVertexFast = grSelectFastVertexTransform(state);
     switch (fetchType)
     {
         case GR_FETCHTYPE_POINTSchar:
@@ -784,6 +996,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
             break;
     }
     grFlushPrimitiveBatch(state);
+    state->transformVertexFast = NULL;
 }
 
 /* --- grRenderElements (grApiFast.inl 1596; DLL 32936-33023) ----------------- */
