@@ -136,7 +136,7 @@ def main() -> None:
             command = [sys.executable, ARM / "replay_gles.py", trace,
                        "--frame", str(frame), "--width", str(args.width),
                        "--height", str(args.height), "--cpu", "arm1136",
-                       "--counter", "block", "--warm-runs", "2", "--bpp", "16",
+                       "--counter", "block", "--warm-runs", "2", "--bpp", "32",
                        "--output", directory]
             if args.profile:
                 command.append("--profile")
@@ -148,7 +148,7 @@ def main() -> None:
     parallel(args.jobs, tasks)
     rows = []
     for case, capture, directory in frames:
-        with (directory / "results_16.csv").open(newline="") as stream:
+        with (directory / "results_32.csv").open(newline="") as stream:
             for row in csv.DictReader(stream):
                 label = row["renderer"]
                 row.update(workload=case, time_ms=capture.get("time_ms", ""),

@@ -26,7 +26,7 @@ def main() -> None:
                         help="Replay through this frame in one context, retaining resources and the JIT cache")
     parser.add_argument("--width", type=int, help="Defaults to capture metadata")
     parser.add_argument("--height", type=int, help="Defaults to capture metadata")
-    parser.add_argument("--bpp", type=int, choices=(16, 32), default=16)
+    parser.add_argument("--bpp", type=int, choices=(16, 32), default=32)
     parser.add_argument("--window", action="store_true", help="Use native window-surface locking during replay")
     parser.add_argument("--cpu", choices=CPU_MODELS, default="arm1136")
     parser.add_argument("--counter", choices=("block", "instruction"), default="block")

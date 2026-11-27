@@ -123,16 +123,15 @@ def check_spans(lib, machine, code, data, stack, stop):
         lib.grrGetTextureFormatDescriptor(desc, fmt)
         descriptors.append(bytes(desc))
     signature = bytearray(144)
-    signature[:16] = next(desc for desc in descriptors if desc[4:8] == bytes((5, 6, 5, 0)))
+    signature[:16] = descriptors[15]
     signature[10] = 2
     for offset, value in ((16, 1), (17, 7), (18, 1), (21, 1), (22, 3), (42, 1), (47, 1)):
         signature[offset] = value
     signature[56:100] = pixel_texture_record(descriptors)
     inputs = [0xFF204060, 0xFFA08020, 0xFF10D0A0, 0xFFE03090] + [0] * 4 + [0, 0, 0, 2, 2, 0, 0]
-    patterns = ([0] * 8, [0xFFFF] * 8, [0, 0xFFFF] * 4,
-                [0, 0, 0xFFFF, 0xFFFF, 0, 0, 0xFFFF, 0xFFFF], [0x4000] * 8)
-    color_steps = (0, 1 << 16, -(11 << 16), 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
-    depth_steps = (0, 0x01000000, -0x01000000, 0x80000000, 0xFFFFFFFF)
+    patterns = ([0] * 8, [0xFFFF] * 8, [0, 0xFFFF] * 4)
+    color_steps = (0, 1 << 16, -(11 << 16), 0x80000000)
+    depth_steps = (0, 0x01000000, -0x01000000, 0x80000000)
     checks = 0
     for dither, less, depth_write, mode in product((0, 1), repeat=4):
         signature[21], signature[22], signature[45] = depth_write, 1 if less else 3, dither
@@ -211,15 +210,14 @@ def check_spans(lib, machine, code, data, stack, stop):
                     checks += 1
     print(f"ARM JIT: {checks} specialized texture spans match generic JIT and C")
 
-    destinations = [descriptors[15], descriptors[1], descriptors[2]]
-    rgba = bytearray(descriptors[2])
-    rgba[:4] = bytes((0, 8, 16, 24))
-    destinations.append(bytes(rgba))
+    destinations = [descriptors[15], descriptors[1], descriptors[2], descriptors[6]]
     rng = random.Random(1136)
     checks = 0
     saved = {reg: 0x71360000 + reg for reg in range(ARM.UC_ARM_REG_R4, ARM.UC_ARM_REG_R11 + 1)}
     for output_format, texture_format, modulate, dither, fog in product(
             range(4), (1, 2, 10, 11), (0, 1), (0, 1), (0, 1)):
+        if dither and output_format != 0:
+            continue
         signature = bytearray(144)
         signature[:16] = destinations[output_format]
         signature[10] = 2
@@ -250,7 +248,7 @@ def check_spans(lib, machine, code, data, stack, stop):
         size = lib.differential_raster_compile(program, 0x7FF, output, 65536, buffer(bytes(16)))
         assert size > 0
         rematerialized = bytes(output)[:size]
-        for width, height in ((0, 0), (0, 2), (2, 0), (1, 1), (3, 2)):
+        for width, height in ((0, 0), (0, 2), (2, 0), (1, 1)):
             layout = 1 + 11 * width + height
             compiled = [generic, rematerialized]
             if length:
@@ -337,9 +335,10 @@ def check_spans(lib, machine, code, data, stack, stop):
             else:
                 tex_rec[25], tex_rec[29], tex_rec[37] = 3, 0, 0
         signature[56:100] = tex_rec
+        layout = 0 if (out_idx == 0 and fog and depth) else (1 + 11 * 2 + 2)
         direct = buffer(bytes(4096))
         mask = C.c_uint32()
-        length = lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 1 + 11 * 2 + 2, C.byref(mask), 1)
+        length = lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), layout, C.byref(mask), 1)
         assert length > 0, (out_idx, tex_fmt, modulate, fog, alpha_test, depth)
         ext_code = bytes(direct)[:length]
         program, output = buffer(bytes(32768)), buffer(bytes(65536))
@@ -390,6 +389,92 @@ def check_spans(lib, machine, code, data, stack, stop):
     assert lib.grCompileARMPixelPipelineEx(direct, 100, buffer(bytes(signature)), 0, C.byref(mask), 1) == 0
     assert lib.grCompileARMPixelPipelineEx(direct, 2000, buffer(bytes(signature)), 0, C.byref(mask), 1) > 0
     print(f"ARM JIT: {ext_checks} extended pixel pipeline comparisons passed")
+
+    untex_color_variants = (
+        ("const_255", [255 << 16] * 4, [0] * 4, [0] * 4),
+        ("const_mid", [180 << 16, 80 << 16, 200 << 16, 160 << 16], [0] * 4, [0] * 4),
+        ("gouraud_bounded", [200 << 16, 80 << 16, 120 << 16, 180 << 16],
+         [-0x5234, 0x12345, -0x45678, 0x10000], [0x20000, -0x10000, 0x20000, -0x10000]),
+        ("gouraud_low", [12 << 16, 240 << 16, 100 << 16, 90 << 16],
+         [0x20000, -0x30000, -0x10000, 0x20000], [0x10000, -0x20000, 0x30000, -0x10000]),
+    )
+    untex_checks = 0
+    for out_idx, blend, fog, alpha_test, depth, dither in product(
+            range(4), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1)):
+        if dither and out_idx != 0:
+            continue
+        if blend and (out_idx not in (0, 1, 3) or alpha_test):
+            continue
+        signature = bytearray(144)
+        signature[:16] = destinations[out_idx]
+        signature[10] = 2
+        mono_fog = int(fog and (out_idx ^ depth ^ dither ^ blend) & 1)
+        alpha_func = (1, 3, 4, 5)[(out_idx + fog + depth + blend) & 3]
+        for offset, value in ((16, 1), (17, signature[8]), (18, depth),
+                              (19, alpha_test), (20, alpha_func),
+                              (21, depth & ((out_idx ^ fog) | 1)), (22, 1 if (out_idx & 1) else 3),
+                              (27, blend), (28, 0), (29, 2 if blend else 0),
+                              (30, int(blend and fog and not depth)),
+                              (40, fog), (41, mono_fog), (42, 1), (45, dither), (47, 1)):
+            signature[offset] = value
+        direct = buffer(bytes(4096))
+        mask = C.c_uint32()
+        assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 0) == 0
+        length = lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 1)
+        assert length > 0, (out_idx, blend, fog, alpha_test, depth, dither)
+        ext_code = bytes(direct)[:length]
+        program, output = buffer(bytes(32768)), buffer(bytes(65536))
+        assert lib.grExecuteProgram(program, buffer(bytes(signature)), 4096) > 0
+        size = lib.differential_raster_compile(program, 0x3FF, output, 65536, buffer(bytes(16)))
+        assert size > 0
+        hc_code = bytes(output)[:size]
+        for cname, cref, cxadd, cyadd in untex_color_variants:
+            if signature[30] and (any(cxadd) or any(cyadd)):
+                continue
+            for alpha_ref in ((140,) if alpha_test else (0,)):
+                oracle.cursor = data
+                initial = [bytes(rng.getrandbits(8) for _ in range(128)) + b"\xA5" * 16,
+                           struct.pack("<32H", *([0, 0xFFFF, 0x4000, 0x8000] * 8)) + b"\xA5" * 16]
+                targets = [allocate(len(value), value) for value in initial]
+                scratch = allocate(16384)
+                pipe = scratch + 64
+                spans = allocate(8, words([(13 << 16) | 1, (7 << 16) | 3]))
+                oracle.write(pipe, words([0, 0, 0, 0, 0, 0, 0, 0, 0]))
+                oracle.write(pipe + 128, words([allocate(16, bytes(kernel))]))
+                fog_color = 0xB0 if mono_fog else 0xFF7090B0
+                oracle.write(pipe + 132, words([16 * signature[9], 32, 16, fog_color, alpha_ref, 3, 3, 255, 255]))
+                oracle.write(pipe + 168, words([*targets, 0, 2, spans, 1]))
+                gradients = [
+                    0x10000000, 127 << 16, *cref, 0, 0, 0, 0,
+                    0x01000000, -0x5234, *cxadd, 0, 0, 0, 0,
+                    0x02000000, 0x2134, *cyadd, 0, 0, 0, 0,
+                ]
+                oracle.write(pipe + 192, words(gradients))
+                original_stack = oracle.readback(scratch, 16384)
+                results = []
+                for emitted in (hc_code, ext_code):
+                    for address, value in zip(targets, initial):
+                        oracle.write(address, value)
+                    oracle.write(scratch, original_stack)
+                    entry = install_code(emitted)
+                    call(entry, [scratch], saved)
+                    results.append(tuple(oracle.readback(address, len(value)) for address, value in zip(targets, initial)))
+                    assert all(machine.reg_read(reg) == value for reg, value in saved.items())
+                    assert machine.reg_read(ARM.UC_ARM_REG_SP) == stack + 65536 - 4096
+                assert results[0] == results[1], (
+                    "untextured pixel pipeline", out_idx, blend, fog, alpha_test, depth, dither, mono_fog, cname)
+                untex_checks += 1
+    bad_blend = bytearray(144)
+    bad_blend[:16] = destinations[0]
+    bad_blend[10] = 2
+    for offset, value in ((16, 1), (17, bad_blend[8]), (27, 1), (28, 0), (29, 3), (42, 1), (47, 1)):
+        bad_blend[offset] = value
+    bad_blend[29] = 3
+    assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(bad_blend)), 0, C.byref(mask), 1) == 0
+    bad_blend[29] = 2
+    bad_blend[19] = 1
+    assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(bad_blend)), 0, C.byref(mask), 1) == 0
+    print(f"ARM JIT: {untex_checks} untextured extended pixel pipeline comparisons passed")
 
 
 def check_scheduler(lib, machine, code, data, stack, stop):

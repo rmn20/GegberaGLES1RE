@@ -268,7 +268,7 @@ def render(renderer: str, bpp: int, events: list[dict], payload: bytes, capture_
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", type=Path, default=HERE / "classicube")
-    parser.add_argument("--bpp", type=int, choices=(16, 32), default=16)
+    parser.add_argument("--bpp", type=int, choices=(16, 32), default=32)
     parser.add_argument("--renderer", choices=("gerbera", "pixelflinger", "both"), default="both")
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=240)

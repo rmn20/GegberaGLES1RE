@@ -88,36 +88,70 @@ int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess)
     const unsigned char *row = (const unsigned char *)pipe->depthRow;
     unsigned int reference = (unsigned int)pipe->reference[GR_GRADIENT_DEPTH];
     int dx = pipe->xAdder[GR_GRADIENT_DEPTH];
-    int i;
+    int dy = pipe->yAdder[GR_GRADIENT_DEPTH];
+    int stride = pipe->checked.depthBufferStride;
+    int i = pipe->numScanlines;
+    unsigned int bias = (unsigned int)strictLess;
 
-    if (pipe->numScanlines <= 0 || row == NULL || pipe->checked.depthBufferStride <= 0 ||
-        (((uintptr_t)row | (unsigned int)pipe->checked.depthBufferStride) & 1u))
+    if (i <= 0 || row == NULL || stride <= 0 ||
+        (((uintptr_t)row | (unsigned int)stride) & 1u))
         return 0;
-    for (i = 0; i < pipe->numScanlines; ++i)
+    do
     {
-        unsigned int span = scan[i], count = span >> 16;
+        unsigned int span = *scan++, count = span >> 16;
         if (count != 0)
         {
             unsigned int x = span & 65535u;
             unsigned int first = reference + (unsigned int)dx * x;
-            int64_t last;
-            unsigned int nearest;
             const unsigned short *depth = (const unsigned short *)row + x;
+            unsigned int d0;
+
             if (first > maxDepth)
                 return 0;
-            last = (int64_t)first + (int64_t)dx * (int)(count - 1u);
-            if ((uint64_t)last > (uint64_t)maxDepth)
+            d0 = (first >> GR_DEPTH16_FRACTION_BITS) + bias;
+            if (*depth >= d0)
                 return 0;
-            nearest = (first < (unsigned int)last ? first : (unsigned int)last) >> GR_DEPTH16_FRACTION_BITS;
-            if (strictLess) ++nearest;
-            do
+            if (count > 1u)
             {
-                if (*depth++ >= nearest) return 0;
-            } while (--count != 0);
+                if (dx == 0)
+                {
+                    while (--count != 0)
+                    {
+                        if (*++depth >= d0)
+                            return 0;
+                    }
+                }
+                else if (dx > 0)
+                {
+                    int64_t last = (int64_t)first + (int64_t)dx * (int)(count - 1u);
+                    if ((uint64_t)last > (uint64_t)maxDepth)
+                        return 0;
+                    while (--count != 0)
+                    {
+                        if (*++depth >= d0)
+                            return 0;
+                    }
+                }
+                else
+                {
+                    int64_t last = (int64_t)first + (int64_t)dx * (int)(count - 1u);
+                    unsigned int nearest;
+                    if ((uint64_t)last > (uint64_t)maxDepth)
+                        return 0;
+                    nearest = ((unsigned int)last >> GR_DEPTH16_FRACTION_BITS) + bias;
+                    if (*depth >= nearest)
+                        return 0;
+                    while (--count != 0)
+                    {
+                        if (*++depth >= nearest)
+                            return 0;
+                    }
+                }
+            }
         }
-        row += pipe->checked.depthBufferStride;
-        reference += (unsigned int)pipe->yAdder[GR_GRADIENT_DEPTH];
-    }
+        row += stride;
+        reference += (unsigned int)dy;
+    } while (--i != 0);
     return 1;
 }
 

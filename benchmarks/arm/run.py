@@ -904,7 +904,7 @@ def main():
     parser.add_argument('--renderer', action='append', metavar='LABEL=ELF',
                         help='Named ELF; gerbera, pixelflinger and both select their default builds')
     parser.add_argument('--scenes', nargs='+', choices=SCENES, default=list(SCENES))
-    parser.add_argument('--bpp', type=int, nargs='+', default=[16,32], choices=[16,32])
+    parser.add_argument('--bpp', type=int, nargs='+', default=[32], choices=[16,32])
     parser.add_argument('--width', type=int, default=128)
     parser.add_argument('--height', type=int, default=96)
     parser.add_argument('--cpu', choices=CPU_MODELS, default='arm1136')
