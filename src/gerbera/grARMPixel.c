@@ -5,6 +5,9 @@
 #if GERBERA_ARMV6_JIT
 
 #if UINTPTR_MAX == 0xFFFFFFFFu
+typedef char _grArmPixel_check_lin[(offsetof(_grPixelPipe, textureUnit[0].linear) == 12) ? 1 : -1];
+typedef char _grArmPixel_check_sm[(offsetof(_grPixelPipe, textureUnit[0].sMask) == 16) ? 1 : -1];
+typedef char _grArmPixel_check_tm[(offsetof(_grPixelPipe, textureUnit[0].tMask) == 20) ? 1 : -1];
 typedef char _grArmPixel_check_fog[(offsetof(_grPixelPipe, checked.fogColor) == 144) ? 1 : -1];
 typedef char _grArmPixel_check_alp[(offsetof(_grPixelPipe, checked.alphaReference) == 148) ? 1 : -1];
 typedef char _grArmPixel_check_xadd[(offsetof(_grPixelPipe, xAdder) == 232) ? 1 : -1];
@@ -16,13 +19,23 @@ enum
     PA_ORR = 12, PA_MOV = 13, PA_BIC = 14,
     PA_LSL = 0, PA_LSR = 1, PA_ASR = 2, PA_ROR = 3,
     PA_EQ = 0, PA_NE = 1, PA_HS = 2, PA_LO = 3, PA_HI = 8, PA_LS = 9, PA_GE = 10, PA_AL = 14,
-    PA_TEXTURE = 4, PA_PALETTE = 8, PA_S_SHIFT = 24, PA_T_SHIFT = 28,
+    PA_TEXTURE = 4, PA_PALETTE = 8, PA_S_MASK = 16, PA_T_MASK = 20, PA_S_SHIFT = 24, PA_T_SHIFT = 28,
     PA_WIDTH_LOG = 32, PA_DITHER = 128, PA_COLOR_STRIDE = 132, PA_DEPTH_STRIDE = 136,
     PA_FOG_COLOR = 144, PA_ALPHA_REF = 148,
     PA_COLOR_ROW = 168, PA_DEPTH_ROW = 172, PA_ROWS = 180, PA_SPANS = 184, PA_Y = 188,
     PA_REFERENCE = 192, PA_X_ADDER = 232, PA_Y_ADDER = 272,
     PA_LAYOUT_DIM_COUNT = GR_MAX_TEXTURE_DIMENSION_LOG2 + 1,
     PA_LAYOUT_COUNT = PA_LAYOUT_DIM_COUNT * PA_LAYOUT_DIM_COUNT
+};
+
+enum
+{
+    PA_BLEND_NONE = 0,
+    PA_BLEND_SRC_ALPHA,
+    PA_BLEND_ZERO_SRC_COLOR,
+    PA_BLEND_DST_COLOR_ZERO,
+    PA_BLEND_ONE_ONE,
+    PA_BLEND_SRC_ALPHA_ONE
 };
 
 /* Byte fields in each signature texture record, after its surface descriptor. */
@@ -65,6 +78,11 @@ static void pixelArmWord(ARMPixelCode_s *c, unsigned int word)
 static unsigned int pixelArmShift(int reg, int kind, int amount)
 {
     return (unsigned int)reg | ((unsigned int)kind << 5) | ((unsigned int)(amount & 31) << 7);
+}
+
+static unsigned int pixelArmShiftReg(int reg, int kind, int shiftReg)
+{
+    return (unsigned int)reg | 0x10u | ((unsigned int)kind << 5) | ((unsigned int)shiftReg << 8);
 }
 
 static unsigned int pixelArmImmediate(unsigned int value)
@@ -131,7 +149,7 @@ static void pixelArmPKHBT(ARMPixelCode_s *c, int dst, int loSrc, int hiSrc, int 
 
 static void pixelArmUSAT8(ARMPixelCode_s *c, int dst, int src, int asrAmt)
 {
-    pixelArmWord(c, 0xE6E80050u | ((unsigned int)dst << 12) |
+    pixelArmWord(c, (asrAmt ? 0xE6E80050u : 0xE6E80010u) | ((unsigned int)dst << 12) |
                  ((unsigned int)(asrAmt & 31) << 7) | (unsigned int)src);
 }
 
@@ -434,28 +452,284 @@ static void pixelArmEmitAlphaScratch(ARMPixelCode_s *c, const _grSurfaceDescript
         pixelArmStore(c, dstReg, 0, -24);
 }
 
-static void pixelArmEmitBlendSrcAlpha32(ARMPixelCode_s *c, int alphaInR3, int preserveR12)
+static int pixelArmClassifyBlend(const _grSignature *sig)
+{
+    if (!sig->blendEnabled)
+        return PA_BLEND_NONE;
+    if (sig->srcFactor == GR_BLENDFACTOR_SRC_ALPHA &&
+        sig->dstFactor == GR_BLENDFACTOR_ONE_MINUS_SRC_ALPHA)
+        return PA_BLEND_SRC_ALPHA;
+    if (sig->srcFactor == GR_BLENDFACTOR_ZERO &&
+        sig->dstFactor == GR_BLENDFACTOR_SRC_COLOR)
+        return PA_BLEND_ZERO_SRC_COLOR;
+    if (sig->srcFactor == GR_BLENDFACTOR_DST_COLOR &&
+        sig->dstFactor == GR_BLENDFACTOR_ZERO)
+        return PA_BLEND_DST_COLOR_ZERO;
+    if (sig->srcFactor == GR_BLENDFACTOR_ONE &&
+        sig->dstFactor == GR_BLENDFACTOR_ONE)
+        return PA_BLEND_ONE_ONE;
+    if (sig->srcFactor == GR_BLENDFACTOR_SRC_ALPHA &&
+        sig->dstFactor == GR_BLENDFACTOR_ONE)
+        return PA_BLEND_SRC_ALPHA_ONE;
+    return -1;
+}
+
+static void pixelArmEmitBilinearTexel(ARMPixelCode_s *c, const _grSurfaceDescriptor *tex,
+                                      unsigned int textureLayout, int texReg, int clearByte3)
+{
+    /* Compute bilinearly filtered texel into texReg using r1, r2, r3, r12, r14 and [r0, #-32..-36].
+     * Preserves r4, r5, r6, r7, r8, r9, r10, r11. */
+    int width = textureLayout ? (int)((textureLayout - 1) / PA_LAYOUT_DIM_COUNT) : 0;
+    int height = textureLayout ? (int)((textureLayout - 1) % PA_LAYOUT_DIM_COUNT) : 0;
+    int pass;
+
+    if (textureLayout)
+    {
+        if (width == 0)
+        {
+            pixelArmOp(c, PA_MOV, 1, 0, pixelArmImmediate(0), 0);
+            pixelArmOp(c, PA_MOV, 2, 0, pixelArmImmediate(0), 0);
+        }
+        else
+        {
+            pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(5, PA_LSR, 32 - width), 0);
+            pixelArmOp(c, PA_ADD, 2, 1, pixelArmImmediate(1), 0);
+            pixelArmOp(c, PA_BIC, 2, 2, pixelArmImmediate(1u << width), 0);
+        }
+        if (height == 0)
+        {
+            pixelArmStore(c, 1, 0, -32);
+            pixelArmStore(c, 2, 0, -36);
+        }
+        else
+        {
+            pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(6, PA_LSR, 32 - height), 0);
+            pixelArmOp(c, PA_ADD, 12, 3, pixelArmImmediate(1), 0);
+            pixelArmOp(c, PA_BIC, 12, 12, pixelArmImmediate(1u << height), 0);
+            if (width == 0)
+            {
+                pixelArmStore(c, 12, 0, -32);
+                pixelArmStore(c, 12, 0, -36);
+                pixelArmOp(c, PA_MOV, 1, 0, 3, 0);
+                pixelArmOp(c, PA_MOV, 2, 0, 3, 0);
+            }
+            else
+            {
+                pixelArmOp(c, PA_ORR, 14, 1, pixelArmShift(12, PA_LSL, width), 0);
+                pixelArmStore(c, 14, 0, -32);
+                pixelArmOp(c, PA_ORR, 12, 2, pixelArmShift(12, PA_LSL, width), 0);
+                pixelArmStore(c, 12, 0, -36);
+                pixelArmOp(c, PA_ORR, 1, 1, pixelArmShift(3, PA_LSL, width), 0);
+                pixelArmOp(c, PA_ORR, 2, 2, pixelArmShift(3, PA_LSL, width), 0);
+            }
+        }
+    }
+    else
+    {
+        pixelArmLoad(c, 14, 0, PA_S_SHIFT);
+        pixelArmLoad(c, 12, 0, PA_S_MASK);
+        pixelArmOp(c, PA_MOV, 1, 0, pixelArmShiftReg(5, PA_LSR, 14), 0);
+        pixelArmOp(c, PA_ADD, 2, 1, pixelArmImmediate(1), 0);
+        pixelArmOp(c, PA_AND, 1, 1, 12, 0);
+        pixelArmOp(c, PA_AND, 2, 2, 12, 0);
+        pixelArmLoad(c, 14, 0, PA_T_SHIFT);
+        pixelArmLoad(c, 12, 0, PA_T_MASK);
+        pixelArmOp(c, PA_MOV, 3, 0, pixelArmShiftReg(6, PA_LSR, 14), 0);
+        pixelArmOp(c, PA_ADD, 14, 3, pixelArmImmediate(1), 0);
+        pixelArmOp(c, PA_AND, 3, 3, 12, 0);
+        pixelArmOp(c, PA_AND, 12, 14, 12, 0);
+        pixelArmLoad(c, 14, 0, PA_WIDTH_LOG);
+        pixelArmOp(c, PA_MOV, 3, 0, pixelArmShiftReg(3, PA_LSL, 14), 0);
+        pixelArmOp(c, PA_MOV, 12, 0, pixelArmShiftReg(12, PA_LSL, 14), 0);
+        pixelArmOp(c, PA_ORR, 14, 1, 12, 0);
+        pixelArmStore(c, 14, 0, -32);
+        pixelArmOp(c, PA_ORR, 12, 2, 12, 0);
+        pixelArmStore(c, 12, 0, -36);
+        pixelArmOp(c, PA_ORR, 1, 1, 3, 0);
+        pixelArmOp(c, PA_ORR, 2, 2, 3, 0);
+    }
+
+    for (pass = 0; pass < 2; ++pass)
+    {
+        if (tex->paletteFormat == GR_PALETTEFORMAT_8BIT)
+        {
+            pixelArmWord(c, 0xE7DB1001u); /* LDRB r1, [r11, r1] */
+            pixelArmWord(c, 0xE7DB2002u); /* LDRB r2, [r11, r2] */
+            if (pass == 0)
+            {
+                if (textureLayout)
+                {
+                    if (width == 0)
+                    {
+                        pixelArmOp(c, PA_MOV, 12, 0, pixelArmImmediate(0), 0);
+                    }
+                    else
+                    {
+                        pixelArmOp(c, PA_MOV, 12, 0, pixelArmShift(5, PA_LSR, 24 - width), 0);
+                        pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0xFFu), 0);
+                    }
+                }
+                else
+                {
+                    pixelArmLoad(c, 14, 0, PA_S_SHIFT);
+                    pixelArmOp(c, PA_SUB, 14, 14, pixelArmImmediate(8), 0);
+                    pixelArmOp(c, PA_MOV, 12, 0, pixelArmShiftReg(5, PA_ASR, 14), 0);
+                    pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0xFFu), 0);
+                }
+            }
+            pixelArmLoad(c, 14, 0, PA_PALETTE);
+            pixelArmWord(c, 0xE79E1101u); /* LDR r1, [r14, r1, LSL #2] */
+            pixelArmWord(c, 0xE79E2102u); /* LDR r2, [r14, r2, LSL #2] */
+        }
+        else
+        {
+            pixelArmWord(c, 0xE79B1101u); /* LDR r1, [r11, r1, LSL #2] */
+            pixelArmWord(c, 0xE79B2102u); /* LDR r2, [r11, r2, LSL #2] */
+            if (pass == 0)
+            {
+                if (textureLayout)
+                {
+                    if (width == 0)
+                    {
+                        pixelArmOp(c, PA_MOV, 12, 0, pixelArmImmediate(0), 0);
+                    }
+                    else
+                    {
+                        pixelArmOp(c, PA_MOV, 12, 0, pixelArmShift(5, PA_LSR, 24 - width), 0);
+                        pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0xFFu), 0);
+                    }
+                }
+                else
+                {
+                    pixelArmLoad(c, 14, 0, PA_S_SHIFT);
+                    pixelArmOp(c, PA_SUB, 14, 14, pixelArmImmediate(8), 0);
+                    pixelArmOp(c, PA_MOV, 12, 0, pixelArmShiftReg(5, PA_ASR, 14), 0);
+                    pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0xFFu), 0);
+                }
+            }
+        }
+        pixelArmOp(c, PA_RSB, 14, 12, pixelArmImmediate(256u), 0);
+        pixelArmUXTB16(c, 3, 1, 0);
+        pixelArmMul(c, 3, 3, 14);
+        if (clearByte3)
+            pixelArmUXTB(c, 1, 1, 8);
+        else
+            pixelArmUXTB16(c, 1, 1, 8);
+        pixelArmMul(c, 1, 1, 14);
+        pixelArmUXTB16(c, 14, 2, 0);
+        pixelArmMLA(c, 3, 14, 12, 3);
+        if (clearByte3)
+            pixelArmUXTB(c, 14, 2, 8);
+        else
+            pixelArmUXTB16(c, 14, 2, 8);
+        pixelArmMLA(c, 1, 14, 12, 1);
+        pixelArmUXTB16(c, 3, 3, 8);
+        if (clearByte3)
+            pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
+        else
+            pixelArmUXTB16(c, 1, 1, 8);
+        if (pass == 0)
+        {
+            pixelArmOp(c, PA_ORR, 3, 3, pixelArmShift(1, PA_LSL, 8), 0);
+            pixelArmLoad(c, 1, 0, -32);
+            pixelArmLoad(c, 2, 0, -36);
+            pixelArmStore(c, 3, 0, -32);
+        }
+    }
+
+    if (textureLayout)
+    {
+        if (height == 0)
+        {
+            pixelArmOp(c, PA_MOV, 12, 0, pixelArmImmediate(0), 0);
+        }
+        else
+        {
+            pixelArmOp(c, PA_MOV, 12, 0, pixelArmShift(6, PA_LSR, 24 - height), 0);
+            pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0xFFu), 0);
+        }
+    }
+    else
+    {
+        pixelArmLoad(c, 14, 0, PA_T_SHIFT);
+        pixelArmOp(c, PA_SUB, 14, 14, pixelArmImmediate(8), 0);
+        pixelArmOp(c, PA_MOV, 12, 0, pixelArmShiftReg(6, PA_ASR, 14), 0);
+        pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0xFFu), 0);
+    }
+    pixelArmLoad(c, 2, 0, -32);
+    pixelArmOp(c, PA_RSB, 14, 12, pixelArmImmediate(256u), 0);
+    pixelArmMul(c, 3, 3, 12);
+    pixelArmMul(c, 1, 1, 12);
+    pixelArmUXTB16(c, 12, 2, 0);
+    pixelArmMLA(c, 3, 12, 14, 3);
+    if (clearByte3)
+        pixelArmUXTB(c, 12, 2, 8);
+    else
+        pixelArmUXTB16(c, 12, 2, 8);
+    pixelArmMLA(c, 1, 12, 14, 1);
+    pixelArmUXTB16(c, 3, 3, 8);
+    if (clearByte3)
+        pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
+    else
+        pixelArmUXTB16(c, 1, 1, 8);
+    pixelArmOp(c, PA_ORR, texReg, 3, pixelArmShift(1, PA_LSL, 8), 0);
+}
+
+static void pixelArmEmitBlend32SWAR(ARMPixelCode_s *c, int blendMode, int dstAlpha,
+                                    int alphaInR3, int preserveR12)
 {
     /* Inputs: r1 = srcRB (0x00RR00BB or 0x00BB00RR matching dst R/B offsets), r2 = srcG (0..255),
      * r3 (when alphaInR3) or [r0, #-24] = srcA (0..255), r8 = dst ptr. Output: r3 = blended pixel. */
     if (!alphaInR3)
         pixelArmLoad(c, 3, 0, -24);
-    if (preserveR12)
+    if (dstAlpha)
+        pixelArmOp(c, PA_ORR, 2, 2, pixelArmShift(3, PA_LSL, 16), 0);
+
+    if (blendMode == PA_BLEND_SRC_ALPHA_ONE)
+    {
+        pixelArmMLA(c, 1, 3, 1, 1);
+        pixelArmMLA(c, 2, 3, 2, 2);
+        pixelArmUXTB16(c, 1, 1, 8);
+        if (dstAlpha)
+            pixelArmUXTB16(c, 2, 2, 8);
+        else
+            pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+        pixelArmOp(c, PA_ORR, 1, 1, pixelArmShift(2, PA_LSL, 8), 0);
+        pixelArmWord(c, 0xE5982000u); /* LDR r2, [r8] */
+        pixelArmUQADD8(c, 3, 1, 2);
+        if (!dstAlpha)
+            pixelArmOp(c, PA_BIC, 3, 3, pixelArmImmediate(0xFF000000u), 0);
+    }
+    else if (preserveR12)
     {
         pixelArmOp(c, PA_RSB, 14, 3, pixelArmImmediate(0x100u), 0);
         pixelArmMLA(c, 1, 3, 1, 1);
         pixelArmMLA(c, 2, 3, 2, 2);
         pixelArmUXTB16(c, 1, 1, 8);
-        pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+        if (dstAlpha)
+            pixelArmUXTB16(c, 2, 2, 8);
+        else
+            pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
         pixelArmWord(c, 0xE5983000u); /* LDR r3, [r8] */
-        pixelArmStore(c, 1, 0, -24);
-        pixelArmUXTB(c, 1, 3, 8);
+        pixelArmStore(c, 1, 0, -32);
+        if (dstAlpha)
+            pixelArmUXTB16(c, 1, 3, 8);
+        else
+            pixelArmUXTB(c, 1, 3, 8);
         pixelArmUXTB16(c, 3, 3, 0);
         pixelArmMul(c, 1, 1, 14);
         pixelArmMul(c, 3, 3, 14);
-        pixelArmOp(c, PA_ADD, 2, 2, pixelArmShift(1, PA_LSR, 8), 0);
+        if (dstAlpha)
+        {
+            pixelArmUXTB16(c, 1, 1, 8);
+            pixelArmOp(c, PA_ADD, 2, 2, 1, 0);
+        }
+        else
+        {
+            pixelArmOp(c, PA_ADD, 2, 2, pixelArmShift(1, PA_LSR, 8), 0);
+        }
         pixelArmUXTB16(c, 3, 3, 8);
-        pixelArmLoad(c, 1, 0, -24);
+        pixelArmLoad(c, 1, 0, -32);
         pixelArmOp(c, PA_ADD, 1, 1, 3, 0);
         pixelArmOp(c, PA_ORR, 3, 1, pixelArmShift(2, PA_LSL, 8), 0);
     }
@@ -465,25 +739,208 @@ static void pixelArmEmitBlendSrcAlpha32(ARMPixelCode_s *c, int alphaInR3, int pr
         pixelArmOp(c, PA_RSB, 14, 3, pixelArmImmediate(0x100u), 0);
         pixelArmMLA(c, 1, 3, 1, 1);
         pixelArmMLA(c, 2, 3, 2, 2);
-        pixelArmUXTB(c, 3, 12, 8);
+        if (dstAlpha)
+            pixelArmUXTB16(c, 3, 12, 8);
+        else
+            pixelArmUXTB(c, 3, 12, 8);
         pixelArmUXTB16(c, 12, 12, 0);
         pixelArmMul(c, 3, 3, 14);
         pixelArmMul(c, 12, 12, 14);
         pixelArmUXTB16(c, 1, 1, 8);
         pixelArmUXTB16(c, 12, 12, 8);
-        pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+        if (dstAlpha)
+        {
+            pixelArmUXTB16(c, 2, 2, 8);
+            pixelArmUXTB16(c, 3, 3, 8);
+            pixelArmOp(c, PA_ADD, 2, 2, 3, 0);
+        }
+        else
+        {
+            pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+            pixelArmOp(c, PA_ADD, 2, 2, pixelArmShift(3, PA_LSR, 8), 0);
+        }
         pixelArmOp(c, PA_ADD, 1, 1, 12, 0);
-        pixelArmOp(c, PA_ADD, 2, 2, pixelArmShift(3, PA_LSR, 8), 0);
         pixelArmOp(c, PA_ORR, 3, 1, pixelArmShift(2, PA_LSL, 8), 0);
     }
 }
 
+static void pixelArmEmitUnpackRGB565Dst(ARMPixelCode_s *c, int dstReg, int outReg, int channel)
+{
+    if (channel == 0)
+    {
+        pixelArmOp(c, PA_MOV, outReg, 0, pixelArmShift(dstReg, PA_LSR, 11), 0);
+        pixelArmOp(c, PA_ORR, outReg, outReg, pixelArmShift(outReg, PA_LSL, 5), 0);
+        pixelArmOp(c, PA_MOV, outReg, 0, pixelArmShift(outReg, PA_LSR, 2), 0);
+    }
+    else if (channel == 1)
+    {
+        pixelArmOp(c, PA_MOV, outReg, 0, pixelArmShift(dstReg, PA_LSR, 5), 0);
+        pixelArmOp(c, PA_AND, outReg, outReg, pixelArmImmediate(0x3Fu), 0);
+        pixelArmOp(c, PA_ORR, outReg, outReg, pixelArmShift(outReg, PA_LSL, 6), 0);
+        pixelArmOp(c, PA_MOV, outReg, 0, pixelArmShift(outReg, PA_LSR, 4), 0);
+    }
+    else
+    {
+        pixelArmOp(c, PA_AND, outReg, dstReg, pixelArmImmediate(0x1Fu), 0);
+        pixelArmOp(c, PA_ORR, outReg, outReg, pixelArmShift(outReg, PA_LSL, 5), 0);
+        pixelArmOp(c, PA_MOV, outReg, 0, pixelArmShift(outReg, PA_LSR, 2), 0);
+    }
+}
+
+static void pixelArmEmitBlendGeneral(ARMPixelCode_s *c, const _grSurfaceDescriptor *dst,
+                                     int rgb565, int dstAlpha, int dither, int blendMode,
+                                     int preserveR12)
+{
+    /* Inputs: r3 = srcR, r2 = srcG, r1 = srcB (0..255), [r0, #-24] = srcA when needed,
+     * r8 = dst ptr. Output: r3 = packed pixel. */
+    int ch;
+    if (preserveR12)
+        pixelArmStore(c, 12, 0, -40);
+    pixelArmWord(c, rgb565 ? 0xE1D8C0B0u : 0xE598C000u); /* LDRH/LDR ip, [r8] */
+
+    if (blendMode == PA_BLEND_ZERO_SRC_COLOR || blendMode == PA_BLEND_DST_COLOR_ZERO)
+    {
+        for (ch = 0; ch < 3; ++ch)
+        {
+            int srcReg = 3 - ch;
+            int addReg = (blendMode == PA_BLEND_ZERO_SRC_COLOR) ? 14 : srcReg;
+            if (rgb565)
+                pixelArmEmitUnpackRGB565Dst(c, 12, 14, ch);
+            else
+                pixelArmUXTB(c, 14, 12, dst->rgbaOffsets[ch]);
+            pixelArmMLA(c, srcReg, 14, srcReg, addReg);
+            pixelArmOp(c, PA_MOV, srcReg, 0, pixelArmShift(srcReg, PA_LSR, 8), 0);
+        }
+        pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
+        if (dstAlpha)
+        {
+            int addReg;
+            pixelArmLoad(c, 14, 0, -24);
+            pixelArmUXTB(c, 12, 12, dst->rgbaOffsets[3]);
+            addReg = (blendMode == PA_BLEND_ZERO_SRC_COLOR) ? 12 : 14;
+            pixelArmMLA(c, 14, 12, 14, addReg);
+            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 8), 0);
+            pixelArmPackChannel(c, dst, 3, 14, 3, 0);
+        }
+    }
+    else if (blendMode == PA_BLEND_ONE_ONE)
+    {
+        for (ch = 0; ch < 3; ++ch)
+        {
+            int srcReg = 3 - ch;
+            if (rgb565)
+                pixelArmEmitUnpackRGB565Dst(c, 12, 14, ch);
+            else
+                pixelArmUXTB(c, 14, 12, dst->rgbaOffsets[ch]);
+            pixelArmOp(c, PA_ADD, srcReg, srcReg, 14, 0);
+            pixelArmUSAT8(c, srcReg, srcReg, 0);
+        }
+        pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
+        if (dstAlpha)
+        {
+            pixelArmLoad(c, 14, 0, -24);
+            pixelArmUXTB(c, 12, 12, dst->rgbaOffsets[3]);
+            pixelArmOp(c, PA_ADD, 14, 14, 12, 0);
+            pixelArmUSAT8(c, 14, 14, 0);
+            pixelArmPackChannel(c, dst, 3, 14, 3, 0);
+        }
+    }
+    else if (blendMode == PA_BLEND_SRC_ALPHA_ONE)
+    {
+        pixelArmLoad(c, 14, 0, -24);
+        pixelArmMLA(c, 3, 14, 3, 3);
+        pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(3, PA_LSR, 8), 0);
+        pixelArmMLA(c, 2, 14, 2, 2);
+        pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+        pixelArmMLA(c, 1, 14, 1, 1);
+        pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
+        for (ch = 0; ch < 3; ++ch)
+        {
+            int srcReg = 3 - ch;
+            if (rgb565)
+                pixelArmEmitUnpackRGB565Dst(c, 12, 14, ch);
+            else
+                pixelArmUXTB(c, 14, 12, dst->rgbaOffsets[ch]);
+            pixelArmOp(c, PA_ADD, srcReg, srcReg, 14, 0);
+            pixelArmUSAT8(c, srcReg, srcReg, 0);
+        }
+        pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
+        if (dstAlpha)
+        {
+            pixelArmLoad(c, 14, 0, -24);
+            pixelArmMLA(c, 14, 14, 14, 14);
+            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 8), 0);
+            pixelArmUXTB(c, 12, 12, dst->rgbaOffsets[3]);
+            pixelArmOp(c, PA_ADD, 14, 14, 12, 0);
+            pixelArmUSAT8(c, 14, 14, 0);
+            pixelArmPackChannel(c, dst, 3, 14, 3, 0);
+        }
+    }
+    else /* PA_BLEND_SRC_ALPHA */
+    {
+        pixelArmLoad(c, 14, 0, -24);
+        pixelArmMLA(c, 3, 14, 3, 3);
+        pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(3, PA_LSR, 8), 0);
+        pixelArmMLA(c, 2, 14, 2, 2);
+        pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+        pixelArmMLA(c, 1, 14, 1, 1);
+        pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
+        pixelArmStore(c, 1, 0, -32);
+        if (dstAlpha)
+        {
+            pixelArmMLA(c, 1, 14, 14, 14);
+            pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
+            pixelArmStore(c, 1, 0, -24);
+        }
+        pixelArmOp(c, PA_RSB, 14, 14, pixelArmImmediate(0x100u), 0);
+        if (rgb565)
+            pixelArmEmitUnpackRGB565Dst(c, 12, 1, 0);
+        else
+            pixelArmUXTB(c, 1, 12, dst->rgbaOffsets[0]);
+        pixelArmMul(c, 1, 1, 14);
+        pixelArmOp(c, PA_ADD, 3, 3, pixelArmShift(1, PA_LSR, 8), 0);
+
+        if (rgb565)
+            pixelArmEmitUnpackRGB565Dst(c, 12, 1, 1);
+        else
+            pixelArmUXTB(c, 1, 12, dst->rgbaOffsets[1]);
+        pixelArmMul(c, 1, 1, 14);
+        pixelArmOp(c, PA_ADD, 2, 2, pixelArmShift(1, PA_LSR, 8), 0);
+
+        if (rgb565)
+            pixelArmEmitUnpackRGB565Dst(c, 12, 1, 2);
+        else
+            pixelArmUXTB(c, 1, 12, dst->rgbaOffsets[2]);
+        pixelArmMul(c, 1, 1, 14);
+        if (dstAlpha)
+        {
+            pixelArmUXTB(c, 12, 12, dst->rgbaOffsets[3]);
+            pixelArmMul(c, 12, 12, 14);
+            pixelArmLoad(c, 14, 0, -32);
+            pixelArmOp(c, PA_ADD, 1, 14, pixelArmShift(1, PA_LSR, 8), 0);
+            pixelArmLoad(c, 14, 0, -24);
+            pixelArmOp(c, PA_ADD, 14, 14, pixelArmShift(12, PA_LSR, 8), 0);
+        }
+        else
+        {
+            pixelArmLoad(c, 12, 0, -32);
+            pixelArmOp(c, PA_ADD, 1, 12, pixelArmShift(1, PA_LSR, 8), 0);
+        }
+        pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
+        if (dstAlpha)
+            pixelArmPackChannel(c, dst, 3, 14, 3, 0);
+    }
+
+    if (preserveR12)
+        pixelArmLoad(c, 12, 0, -40);
+}
+
 static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
                                 unsigned int textureLayout, int rgb565, int dstAlpha,
-                                int modulate, int alphaMode, int alphaTest,
+                                int isBilinear, int modulate, int alphaMode, int alphaTest,
                                 int alphaRejectCond, int fog, int depth,
                                 int rejectCondition, int dither, int colorShift,
-                                int blendSrcAlpha, int colorVariant, int lblBase,
+                                int blendMode, int colorVariant, int lblBase,
                                 int fallthroughReturn)
 {
     const _grSurfaceDescriptor *dst = &sig->descriptor;
@@ -500,24 +957,39 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
     int lblRejectLoop = lblBase + 5;
     int lblAlphaReject = lblBase + 6;
     int lblSpan = lblBase + 7;
-    int keepSTAdders = !blendSrcAlpha && !applyModulate && !fog && (!isConstRgb || isConstWhite) &&
-        (alphaTest ? (alphaMode == 1 || (isConstWhite && alphaMode == 3)) : alphaMode < 2);
-    int incFog = fog && !depth && !alphaTest && !applyModulate;
-    int packShiftsR12 = (textureLayout == 0 && !keepSTAdders &&
-                         ((!applyModulate && fog) || (applyModulate && isConstRgb && fog)));
-    int texReg = keepSTAdders ? 3 : (packShiftsR12 ? ((!applyModulate && !alphaTest) ? 1 : 14) : 12);
-    int gradTmp = packShiftsR12 ? 10 : 12;
-    int needAlphaScratch = (dstAlpha && (fog || (alphaTest && alphaMode == 3 && !isConstWhite) ||
-                                         (alphaTest && alphaMode == 2 && !isConstWhite))) ||
-                           blendSrcAlpha;
-    int blendAlphaInR3 = blendSrcAlpha && !fog && !applyModulate &&
-        ((tex->rgbaOffsets[0] ^ tex->rgbaOffsets[2]) == 16);
     int fastFog32 = !rgb565 && dst->rgbaOffsets[1] == 8 &&
         ((dst->rgbaOffsets[0] == 16 && dst->rgbaOffsets[2] == 0) ||
          (dst->rgbaOffsets[0] == 0 && dst->rgbaOffsets[2] == 16));
     int swapRB = fastFog32 && dst->rgbaOffsets[0] == 16;
+    int isBlendSWAR32 = (blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE) &&
+        fastFog32 && (!dstAlpha || dst->rgbaOffsets[3] == 24);
+    int isBlendOneOne32 = (blendMode == PA_BLEND_ONE_ONE) && fastFog32;
+    int isBlendGeneral = (blendMode != PA_BLEND_NONE) && !isBlendSWAR32 && !isBlendOneOne32;
+    int keepSTAdders = !isBilinear && (blendMode == PA_BLEND_NONE) && !applyModulate && !fog &&
+        (!isConstRgb || isConstWhite) &&
+        (alphaTest ? (alphaMode == 1 || (isConstWhite && alphaMode == 3)) : alphaMode < 2);
+    int incFog = fog && !depth && !alphaTest && !applyModulate;
+    int packShiftsR12 = (!isBilinear && textureLayout == 0 && !keepSTAdders &&
+                         ((!applyModulate && fog) || (applyModulate && isConstRgb && fog)));
+    int texReg = keepSTAdders ? 3 : (packShiftsR12 ? ((!applyModulate && !alphaTest) ? 1 : 14) : 12);
+    int gradTmp = packShiftsR12 ? 10 : 12;
+    int needAlphaScratch = (dstAlpha && (fog || (alphaTest && alphaMode >= 1 && !isConstWhite) ||
+                                         blendMode == PA_BLEND_ZERO_SRC_COLOR ||
+                                         blendMode == PA_BLEND_DST_COLOR_ZERO ||
+                                         isBlendGeneral)) ||
+        (blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE) ||
+        (dstAlpha && alphaTest);
+    int blendAlphaInR3 = isBlendSWAR32 && !fog && !applyModulate && !alphaTest &&
+        ((tex->rgbaOffsets[0] ^ tex->rgbaOffsets[2]) == 16);
     int preloadFogRB = fog && packShiftsR12 && fastFog32 && !sig->monochromeFog &&
         !depth && !dither && !alphaTest;
+    int emitAlphaScratch = !alphaTest &&
+        (blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE ||
+         (dstAlpha && (fog || isBlendGeneral)));
+    int haveR2Const = !isConstWhite && (alphaTest || emitAlphaScratch) && (alphaMode >= 2);
+    int bilinearClearByte3 = isBilinear && !dstAlpha && !alphaTest &&
+        blendMode != PA_BLEND_SRC_ALPHA && blendMode != PA_BLEND_SRC_ALPHA_ONE &&
+        tex->rgbaOffsets[0] <= 16 && tex->rgbaOffsets[1] <= 16 && tex->rgbaOffsets[2] <= 16;
     int channel, outputRegister;
 
     c->labels[lblRow] = c->count;
@@ -564,14 +1036,14 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
         pixelArmWord(c, 0xE88100E0u); /* STMIA r1, {r5, r6, r7} */
         if (alphaMode >= 2)
             pixelArmGradientEx(c, GR_GRADIENT_COLOR_A, gradTmp, 2, -16, gradTmp);
-        if (depth) pixelArmGradientEx(c, GR_GRADIENT_DEPTH, 7, 3, 0, gradTmp);
+        if (depth) pixelArmGradientEx(c, GR_GRADIENT_DEPTH, 7, 3, 0, (!dither && gradTmp != 10) ? 10 : gradTmp);
         pixelArmGradientEx(c, GR_GRADIENT_TEX0_S, 5, 3, 0, gradTmp);
         pixelArmGradientEx(c, GR_GRADIENT_TEX0_T, 6, 3, 0, gradTmp);
         if (fog) pixelArmGradientEx(c, GR_GRADIENT_FOG, gradTmp, 2, -20, gradTmp);
     }
     else
     {
-        if (depth) pixelArmGradientEx(c, GR_GRADIENT_DEPTH, 7, 3, 0, gradTmp);
+        if (depth) pixelArmGradientEx(c, GR_GRADIENT_DEPTH, 7, 3, 0, (!dither && gradTmp != 10) ? 10 : gradTmp);
         pixelArmGradientEx(c, GR_GRADIENT_TEX0_S, 5, 3, 0, gradTmp);
         pixelArmGradientEx(c, GR_GRADIENT_TEX0_T, 6, 3, 0, gradTmp);
         if (fog)
@@ -610,7 +1082,7 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
         pixelArmLoad(c, 7, 0, PA_X_ADDER + 4 * GR_GRADIENT_TEX0_S);
         pixelArmLoad(c, 9, 0, PA_X_ADDER + 4 * GR_GRADIENT_TEX0_T);
     }
-    if (depth && !dither) pixelArmLoad(c, 10, 0, PA_X_ADDER + 4 * GR_GRADIENT_DEPTH);
+    if (depth && !dither && gradTmp == 10) pixelArmLoad(c, 10, 0, PA_X_ADDER + 4 * GR_GRADIENT_DEPTH);
     if (!depth && !dither && alphaTest) pixelArmLoad(c, 10, 0, PA_ALPHA_REF);
     if (preloadFogRB)
     {
@@ -638,22 +1110,29 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
         c->labels[lblShade] = c->count;
     }
 
-    pixelArmTextureIndex(c, textureLayout, packShiftsR12);
-    if (tex->paletteFormat == GR_PALETTEFORMAT_8BIT)
+    if (isBilinear)
     {
-        pixelArmWord(c, 0xE7DB2002u); /* LDRB r2, [r11, r2]. */
-        pixelArmLoad(c, 1, 0, PA_PALETTE);
-        if (!alphaTest && keepSTAdders && !isConstWhite)
-        {
-            /* Step S/T during LDRB + PA_PALETTE latency before the dependent palette LDR. */
-            pixelArmOp(c, PA_ADD, 5, 5, 12, 0);
-            pixelArmOp(c, PA_ADD, 6, 6, 14, 0);
-        }
-        pixelArmWord(c, 0xE7910102u | ((unsigned int)texReg << 12));
+        pixelArmEmitBilinearTexel(c, tex, textureLayout, texReg, bilinearClearByte3);
     }
     else
     {
-        pixelArmWord(c, 0xE79B0102u | ((unsigned int)texReg << 12));
+        pixelArmTextureIndex(c, textureLayout, packShiftsR12);
+        if (tex->paletteFormat == GR_PALETTEFORMAT_8BIT)
+        {
+            pixelArmWord(c, 0xE7DB2002u); /* LDRB r2, [r11, r2]. */
+            pixelArmLoad(c, 1, 0, PA_PALETTE);
+            if (!alphaTest && keepSTAdders && !isConstWhite)
+            {
+                /* Step S/T during LDRB + PA_PALETTE latency before the dependent palette LDR. */
+                pixelArmOp(c, PA_ADD, 5, 5, 12, 0);
+                pixelArmOp(c, PA_ADD, 6, 6, 14, 0);
+            }
+            pixelArmWord(c, 0xE7910102u | ((unsigned int)texReg << 12));
+        }
+        else
+        {
+            pixelArmWord(c, 0xE79B0102u | ((unsigned int)texReg << 12));
+        }
     }
 
     /* When alphaTest is off there are no more branches before the pixel loop
@@ -773,13 +1252,13 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
         }
     }
 
-    if (!alphaTest && (blendSrcAlpha || (fog && dstAlpha)))
+    if (emitAlphaScratch)
         pixelArmEmitAlphaScratch(c, tex, alphaMode, texReg, isConstRgb, isConstWhite, blendAlphaInR3);
 
     outputRegister = 14;
     if (!fog)
     {
-        if (blendSrcAlpha)
+        if (isBlendSWAR32)
         {
             if (!applyModulate)
             {
@@ -797,7 +1276,7 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
             }
             else if (isConstRgb)
             {
-                if (alphaMode < 2) pixelArmLoad(c, 2, 0, -4);
+                if (!haveR2Const) pixelArmLoad(c, 2, 0, -4);
                 pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[0]);
                 pixelArmUXTB(c, 3, 2, 16);
                 pixelArmMLA(c, 1, 1, 3, 3);
@@ -838,6 +1317,53 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
                 pixelArmPKHBT(c, 1, swapRB ? 1 : 3, swapRB ? 3 : 1, 16);
             }
         }
+        else if (isBlendGeneral)
+        {
+            if (!applyModulate)
+            {
+                pixelArmUXTB(c, 3, texReg, tex->rgbaOffsets[0]);
+                pixelArmUXTB(c, 2, texReg, tex->rgbaOffsets[1]);
+                pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[2]);
+            }
+            else if (isConstRgb)
+            {
+                if (!haveR2Const) pixelArmLoad(c, 2, 0, -4);
+                pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[0]);
+                pixelArmUXTB(c, 3, 2, 16);
+                pixelArmMLA(c, 1, 1, 3, 3);
+                pixelArmUXTB(c, 14, texReg, tex->rgbaOffsets[1]);
+                pixelArmUXTB(c, 3, 2, 8);
+                pixelArmMLA(c, 14, 14, 3, 3);
+                pixelArmUXTB(c, 12, texReg, tex->rgbaOffsets[2]);
+                pixelArmOp(c, PA_AND, 2, 2, pixelArmImmediate(0xFFu), 0);
+                pixelArmMLA(c, 12, 12, 2, 2);
+                pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(1, PA_LSR, 8), 0);
+                pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(14, PA_LSR, 8), 0);
+                pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(12, PA_LSR, 8), 0);
+            }
+            else
+            {
+                pixelArmLoad(c, 14, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_R);
+                pixelArmWord(c, 0xE910000Eu); /* LDMDB r0, {r1, r2, r3}. */
+                pixelArmMLA(c, 3, 14, 4, 3);
+                pixelArmLoad(c, 14, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_G);
+                pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(3, PA_LSR, 16), 0);
+                pixelArmMLA(c, 2, 14, 4, 2);
+                pixelArmLoad(c, 14, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_B);
+                pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 16), 0);
+                pixelArmMLA(c, 1, 14, 4, 1);
+                pixelArmUXTB(c, 14, texReg, tex->rgbaOffsets[0]);
+                pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 16), 0);
+                pixelArmMLA(c, 3, 14, 3, 3);
+                pixelArmUXTB(c, 14, texReg, tex->rgbaOffsets[1]);
+                pixelArmMLA(c, 2, 14, 2, 2);
+                pixelArmUXTB(c, 14, texReg, tex->rgbaOffsets[2]);
+                pixelArmMLA(c, 1, 14, 1, 1);
+                pixelArmUSAT8(c, 3, 3, 8);
+                pixelArmUSAT8(c, 2, 2, 8);
+                pixelArmUSAT8(c, 1, 1, 8);
+            }
+        }
         else
         {
             int rbSwap32 = !applyModulate && !rgb565 &&
@@ -858,7 +1384,8 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
                 if (deferredZ) pixelArmOp(c, PA_ADD, 7, 7, 2, 0);
                 for (channel = 0; channel < (dstAlpha ? 4 : 3); ++channel)
                     unused &= ~(255u << dst->rgbaOffsets[channel]);
-                if (unused && !(t[PA_TEX_RAW_COPY] && !sig->perPixelPack))
+                if (unused && !(bilinearClearByte3 && unused == 0xFF000000u) &&
+                    !(t[PA_TEX_RAW_COPY] && !sig->perPixelPack))
                 {
                     pixelArmOp(c, PA_BIC, 2, texReg, pixelArmImmediate(unused), 0);
                     outputRegister = 2;
@@ -876,7 +1403,8 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
                     unused &= ~(255u << dst->rgbaOffsets[channel]);
                 pixelArmREV(c, 2, texReg);
                 pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_ROR, 8), 0);
-                if (unused && !(t[PA_TEX_RAW_COPY] && !sig->perPixelPack))
+                if (unused && !(bilinearClearByte3 && unused == 0xFF000000u) &&
+                    !(t[PA_TEX_RAW_COPY] && !sig->perPixelPack))
                     pixelArmOp(c, PA_BIC, 2, 2, pixelArmImmediate(unused), 0);
                 outputRegister = 2;
             }
@@ -950,7 +1478,7 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
             }
             else if (isConstRgb)
             {
-                if (!alphaTest || alphaMode == 1) pixelArmLoad(c, 2, 0, -4);
+                if (!haveR2Const) pixelArmLoad(c, 2, 0, -4);
                 for (channel = 0; channel < 3; ++channel)
                 {
                     int rot = 16 - 8 * channel;
@@ -1038,9 +1566,6 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
     }
     else /* fog == 1 */
     {
-        int haveR2Const = !isConstWhite &&
-            (alphaTest ? (alphaMode >= 2) : ((blendSrcAlpha || dstAlpha) && alphaMode >= 2));
-
         /* Produce r1 = 0x00BB00RR (or 0x00RR00BB when swapRB) and r14 = 0x000000GG. */
         if (!applyModulate)
         {
@@ -1177,37 +1702,69 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
                 pixelArmMLA(c, 1, 3, 2, 1);
             }
         }
-        if (blendSrcAlpha)
+        if (isBlendSWAR32)
         {
             pixelArmUXTB16(c, 1, 1, 8);
             pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(14, PA_LSR, 8), 0);
         }
-        else if (fastFog32)
+        else if (isBlendGeneral)
         {
-            pixelArmUXTB16(c, 3, 1, 8);
-            pixelArmOp(c, PA_AND, 2, 14, pixelArmImmediate(0xFF00u), 0);
-            pixelArmOp(c, PA_ORR, 3, 3, 2, 0);
+            if (swapRB)
+            {
+                pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(1, PA_LSR, 24), 0);
+                pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(14, PA_LSR, 8), 0);
+                pixelArmUXTB(c, 1, 1, 8);
+            }
+            else
+            {
+                pixelArmUXTB(c, 3, 1, 8);
+                pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(14, PA_LSR, 8), 0);
+                pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 24), 0);
+            }
         }
         else
         {
-            pixelArmUXTB(c, 3, 1, 8);
-            pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(14, PA_LSR, 8), 0);
-            pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 24), 0);
-            pixelArmPackChannel(c, dst, 0, 3, 3, dither);
-            pixelArmPackChannel(c, dst, 1, 2, 3, dither);
-            pixelArmPackChannel(c, dst, 2, 1, 3, dither);
+            if (fastFog32)
+            {
+                pixelArmUXTB16(c, 3, 1, 8);
+                pixelArmOp(c, PA_AND, 2, 14, pixelArmImmediate(0xFF00u), 0);
+                pixelArmOp(c, PA_ORR, 3, 3, 2, 0);
+            }
+            else
+            {
+                pixelArmUXTB(c, 3, 1, 8);
+                pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(14, PA_LSR, 8), 0);
+                pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 24), 0);
+                pixelArmPackChannel(c, dst, 0, 3, 3, dither);
+                pixelArmPackChannel(c, dst, 1, 2, 3, dither);
+                pixelArmPackChannel(c, dst, 2, 1, 3, dither);
+            }
+            if (dstAlpha)
+            {
+                pixelArmLoad(c, 14, 0, -24);
+                pixelArmPackChannel(c, dst, 3, 14, 3, 0);
+            }
+            outputRegister = 3;
         }
-        if (dstAlpha)
-        {
-            pixelArmLoad(c, 14, 0, -24);
-            pixelArmPackChannel(c, dst, 3, 14, 3, 0);
-        }
-        outputRegister = 3;
     }
 
-    if (blendSrcAlpha)
+    if (isBlendSWAR32)
     {
-        pixelArmEmitBlendSrcAlpha32(c, blendAlphaInR3, packShiftsR12);
+        pixelArmEmitBlend32SWAR(c, blendMode, dstAlpha, blendAlphaInR3, packShiftsR12);
+        outputRegister = 3;
+    }
+    else if (isBlendOneOne32)
+    {
+        int dstTmp = (outputRegister == 2) ? 1 : 2;
+        pixelArmWord(c, 0xE5980000u | ((unsigned int)dstTmp << 12)); /* LDR dstTmp, [r8] */
+        pixelArmUQADD8(c, 3, outputRegister, dstTmp);
+        if (!dstAlpha)
+            pixelArmOp(c, PA_BIC, 3, 3, pixelArmImmediate(0xFF000000u), 0);
+        outputRegister = 3;
+    }
+    else if (isBlendGeneral)
+    {
+        pixelArmEmitBlendGeneral(c, dst, rgb565, dstAlpha, dither, blendMode, packShiftsR12);
         outputRegister = 3;
     }
 
@@ -1300,7 +1857,7 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
                                     int rgb565, int dstAlpha, int alphaTest,
                                     int alphaRejectCond, int fog, int depth,
                                     int rejectCondition, int dither, int colorShift,
-                                    int blendZeroSrcColor, int isConstRgb,
+                                    int blendMode, int isConstRgb,
                                     int lblBase, int fallthroughReturn)
 {
     const _grSurfaceDescriptor *dst = &sig->descriptor;
@@ -1312,8 +1869,17 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
     int lblRejectLoop = lblBase + 5;
     int lblAlphaReject = lblBase + 6;
     int lblSpan = lblBase + 7;
-    int needAlpha = dstAlpha || alphaTest;
-    int needAlphaScratch = dstAlpha && (fog || alphaTest);
+    int fast32 = !rgb565 && dst->rgbaOffsets[1] == 8 &&
+        ((dst->rgbaOffsets[0] == 16 && dst->rgbaOffsets[2] == 0) ||
+         (dst->rgbaOffsets[0] == 0 && dst->rgbaOffsets[2] == 16));
+    int swapRB = fast32 && dst->rgbaOffsets[0] == 16;
+    int isBlendSWAR32 = (blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE) &&
+        fast32 && (!dstAlpha || dst->rgbaOffsets[3] == 24);
+    int isBlendOneOne32 = (blendMode == PA_BLEND_ONE_ONE) && fast32;
+    int isBlendGeneral = (blendMode != PA_BLEND_NONE) && !isBlendSWAR32 && !isBlendOneOne32;
+    int needSrcAlpha = dstAlpha || alphaTest ||
+        blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE;
+    int needAlphaScratch = needSrcAlpha && (fog || alphaTest || isBlendSWAR32 || isBlendGeneral);
     int incFog = fog && !depth && !alphaTest;
     int channel;
 
@@ -1349,10 +1915,10 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
         pixelArmOp(c, PA_ADD, 7, 7, 14, 0);
         pixelArmOp(c, PA_ADD, 1, 0, pixelArmImmediate(PA_REFERENCE + 4 * GR_GRADIENT_COLOR_R), 0);
         pixelArmWord(c, 0xE88100E0u); /* STMIA r1, {r5, r6, r7} */
-        if (needAlpha)
+        if (needSrcAlpha)
             pixelArmGradientEx(c, GR_GRADIENT_COLOR_A, 12, 2, -16, 12);
     }
-    if (depth) pixelArmGradientEx(c, GR_GRADIENT_DEPTH, 7, 3, 0, 12);
+    if (depth) pixelArmGradientEx(c, GR_GRADIENT_DEPTH, 7, 3, 0, !dither ? 10 : 12);
     if (fog)
     {
         pixelArmGradientEx(c, GR_GRADIENT_FOG, 6, incFog ? 3 : 2, 0, 12);
@@ -1364,7 +1930,6 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
         pixelArmLoad(c, 6, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_G);
     }
     if (dither) pixelArmEmitDitherRow(c);
-    if (depth && !dither) pixelArmLoad(c, 10, 0, PA_X_ADDER + 4 * GR_GRADIENT_DEPTH);
     if (!depth && !dither && alphaTest) pixelArmLoad(c, 10, 0, PA_ALPHA_REF);
     pixelArmOp(c, PA_RSB, 4, 4, pixelArmImmediate(0), 1);
     pixelArmBranch(c, PA_GE, lblRowEnd);
@@ -1412,7 +1977,7 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
             pixelArmWord(c, 0xE14910B2u); /* STRH r1, [r9, #-2]. */
         }
     }
-    else if (dstAlpha && fog)
+    else if (needAlphaScratch)
     {
         if (isConstRgb)
         {
@@ -1435,10 +2000,8 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
         pixelArmOp(c, PA_ADD, 7, 7, 10, 0);
 
     {
-        int fastFog32 = fog && !blendZeroSrcColor && !rgb565 && dst->rgbaOffsets[1] == 8 &&
-            ((dst->rgbaOffsets[0] == 16 && dst->rgbaOffsets[2] == 0) ||
-             (dst->rgbaOffsets[0] == 0 && dst->rgbaOffsets[2] == 16));
-        int swapRB = fastFog32 && dst->rgbaOffsets[0] == 16;
+        int fastFog32 = fog && fast32 && (blendMode == PA_BLEND_NONE || isBlendOneOne32 || isBlendSWAR32);
+        int fogSwapRB = fastFog32 && dst->rgbaOffsets[0] == 16;
 
         if (isConstRgb)
         {
@@ -1446,7 +2009,7 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
             if (depth && dither) pixelArmOp(c, PA_ADD, 7, 7, 14, 0);
             if (fastFog32 && !sig->monochromeFog)
             {
-                pixelArmUXTB16(c, 1, 12, swapRB ? 0 : 16);
+                pixelArmUXTB16(c, 1, 12, fogSwapRB ? 0 : 16);
                 pixelArmUXTB(c, 2, 12, 8);
             }
             else
@@ -1504,28 +2067,31 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
                 pixelArmMLA(c, 3, 3, 12, 14);
                 pixelArmMLA(c, 2, 2, 12, 14);
                 pixelArmMLA(c, 1, 1, 12, 14);
-                if (blendZeroSrcColor)
-                    pixelArmWord(c, rgb565 ? 0xE1D8C0B0u : 0xE598C000u); /* LDRH/LDR ip, [r8] */
                 pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(3, PA_LSR, 8), 0);
                 pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
                 pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
-                if (!blendZeroSrcColor)
+                if (isBlendSWAR32)
+                    pixelArmPKHBT(c, 1, swapRB ? 1 : 3, swapRB ? 3 : 1, 16);
+                else if (!isBlendGeneral)
                     pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
             }
             else
             {
                 if (!(isConstRgb && fastFog32))
-                    pixelArmPKHBT(c, 1, swapRB ? 1 : 3, swapRB ? 3 : 1, 16);
+                    pixelArmPKHBT(c, 1, fogSwapRB ? 1 : 3, fogSwapRB ? 3 : 1, 16);
                 pixelArmOp(c, PA_RSB, 14, 12, pixelArmImmediate(0x100u), 0);
                 pixelArmMul(c, 1, 1, 14);
                 pixelArmMul(c, 2, 2, 14);
                 pixelArmUXTB(c, 14, 11, 8);
                 pixelArmMLA(c, 2, 14, 12, 2);
-                pixelArmUXTB16(c, 14, 11, swapRB ? 16 : 0);
+                pixelArmUXTB16(c, 14, 11, fogSwapRB ? 16 : 0);
                 pixelArmMLA(c, 1, 14, 12, 1);
-                if (blendZeroSrcColor)
-                    pixelArmWord(c, rgb565 ? 0xE1D8C0B0u : 0xE598C000u); /* LDRH/LDR ip, [r8] */
-                if (fastFog32)
+                if (isBlendSWAR32)
+                {
+                    pixelArmUXTB16(c, 1, 1, 8);
+                    pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
+                }
+                else if (fastFog32)
                 {
                     pixelArmUXTB16(c, 3, 1, 8);
                     pixelArmOp(c, PA_AND, 2, 2, pixelArmImmediate(0xFF00u), 0);
@@ -1536,82 +2102,57 @@ static void pixelArmEmitUntextured(ARMPixelCode_s *c, const _grSignature *sig,
                     pixelArmUXTB(c, 3, 1, 8);
                     pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
                     pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 24), 0);
-                    if (!blendZeroSrcColor)
+                    if (!isBlendGeneral)
                         pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
                 }
             }
         }
-        else if (blendZeroSrcColor)
-        {
-            pixelArmWord(c, rgb565 ? 0xE1D8C0B0u : 0xE598C000u); /* LDRH/LDR ip, [r8] */
-        }
         else
         {
-            pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
+            if (isBlendSWAR32)
+                pixelArmPKHBT(c, 1, swapRB ? 1 : 3, swapRB ? 3 : 1, 16);
+            else if (!isBlendGeneral)
+                pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
         }
     }
 
-    if (blendZeroSrcColor)
+    if (isBlendSWAR32)
     {
-        if (rgb565)
-        {
-            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(12, PA_LSR, 11), 0);
-            pixelArmOp(c, PA_ORR, 14, 14, pixelArmShift(14, PA_LSL, 5), 0);
-            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 2), 0);
-            pixelArmMLA(c, 3, 14, 3, 14);
-            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(12, PA_LSR, 5), 0);
-            pixelArmOp(c, PA_AND, 14, 14, pixelArmImmediate(0x3Fu), 0);
-            pixelArmOp(c, PA_ORR, 14, 14, pixelArmShift(14, PA_LSL, 6), 0);
-            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 4), 0);
-            pixelArmMLA(c, 2, 14, 2, 14);
-            pixelArmOp(c, PA_AND, 12, 12, pixelArmImmediate(0x1Fu), 0);
-            pixelArmOp(c, PA_ORR, 12, 12, pixelArmShift(12, PA_LSL, 5), 0);
-            pixelArmOp(c, PA_MOV, 12, 0, pixelArmShift(12, PA_LSR, 2), 0);
-            pixelArmMLA(c, 1, 12, 1, 12);
-            pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(3, PA_LSR, 8), 0);
-            pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
-            pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
-        }
-        else
-        {
-            pixelArmUXTB(c, 14, 12, dst->rgbaOffsets[0]);
-            pixelArmMLA(c, 3, 14, 3, 14);
-            pixelArmUXTB(c, 14, 12, dst->rgbaOffsets[1]);
-            pixelArmMLA(c, 2, 14, 2, 14);
-            pixelArmUXTB(c, 14, 12, dst->rgbaOffsets[2]);
-            pixelArmMLA(c, 1, 14, 1, 14);
-            pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(3, PA_LSR, 8), 0);
-            pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 8), 0);
-            pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
-        }
-        pixelArmPackRGB32(c, dst, 3, 2, 1, 3, dither);
+        pixelArmEmitBlend32SWAR(c, blendMode, dstAlpha, 0, 0);
     }
-
-    if (dstAlpha)
+    else if (isBlendGeneral)
     {
-        if (fog || alphaTest)
+        pixelArmEmitBlendGeneral(c, dst, rgb565, dstAlpha, dither, blendMode, 0);
+    }
+    else
+    {
+        if (dstAlpha)
         {
-            pixelArmLoad(c, 14, 0, -24);
+            if (fog || alphaTest)
+            {
+                pixelArmLoad(c, 14, 0, -24);
+            }
+            else if (isConstRgb)
+            {
+                pixelArmLoad(c, 14, 0, -4);
+                pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 24), 0);
+            }
+            else
+            {
+                pixelArmLoad(c, 14, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_A);
+                pixelArmLoad(c, 2, 0, -16);
+                pixelArmMLA(c, 14, 14, 4, 2);
+                pixelArmUSAT8(c, 14, 14, 16);
+            }
+            pixelArmPackChannel(c, dst, 3, 14, 3, 0);
         }
-        else if (isConstRgb)
+        if (isBlendOneOne32)
         {
-            pixelArmLoad(c, 14, 0, -4);
-            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 24), 0);
+            pixelArmWord(c, 0xE5981000u); /* LDR r1, [r8] */
+            pixelArmUQADD8(c, 3, 3, 1);
+            if (!dstAlpha)
+                pixelArmOp(c, PA_BIC, 3, 3, pixelArmImmediate(0xFF000000u), 0);
         }
-        else
-        {
-            pixelArmLoad(c, 14, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_A);
-            pixelArmLoad(c, 2, 0, -16);
-            pixelArmMLA(c, 14, 14, 4, 2);
-            pixelArmUSAT8(c, 14, 14, 16);
-        }
-        if (blendZeroSrcColor && !rgb565)
-        {
-            pixelArmUXTB(c, 12, 12, dst->rgbaOffsets[3]);
-            pixelArmMLA(c, 14, 12, 14, 12);
-            pixelArmOp(c, PA_MOV, 14, 0, pixelArmShift(14, PA_LSR, 8), 0);
-        }
-        pixelArmPackChannel(c, dst, 3, 14, 3, 0);
     }
 
     if (rgb565) pixelArmWord(c, 0xE0C830B2u); /* STRH r3, [r8], #2 */
@@ -1692,9 +2233,9 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
     const _grSurfaceDescriptor *tex = (const _grSurfaceDescriptor *)sig->texture[0];
     const unsigned char *t = sig->texture[0];
     ARMPixelCode_s c;
-    int rgb565, dstAlpha, modulate, alphaMode, alphaTest, alphaRejectCond, fog;
+    int rgb565, dstAlpha, isBilinear, modulate, alphaMode, alphaTest, alphaRejectCond, fog;
     int depth, rejectCondition, dither, colorShift, needColA, emitConstVariant, emitWhiteVariant;
-    int blendZeroSrcColor, blendSrcAlpha;
+    int blendMode;
     int i;
     unsigned int mask;
     unsigned int whiteMask;
@@ -1723,6 +2264,10 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
         (sig->depthFunc != GR_FUNC_LESS && sig->depthFunc != GR_FUNC_LEQUAL)))
         return 0;
 
+    blendMode = pixelArmClassifyBlend(sig);
+    if (blendMode < 0 || (!allowExtended && blendMode != PA_BLEND_NONE))
+        return 0;
+
     dither = rgb565 && sig->dither;
     colorShift = rgb565 ? 1 : 2;
     rejectCondition = sig->depthFunc == GR_FUNC_LESS ? PA_HS : PA_HI;
@@ -1730,12 +2275,10 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
     if (!t[PA_TEX_ENABLED])
     {
         if (!allowExtended) return 0;
-        blendZeroSrcColor = sig->blendEnabled != 0;
-        if (blendZeroSrcColor &&
-            (alphaTest ||
-             sig->srcFactor != GR_BLENDFACTOR_ZERO || sig->dstFactor != GR_BLENDFACTOR_SRC_COLOR))
+        if (blendMode == PA_BLEND_ZERO_SRC_COLOR && alphaTest)
             return 0;
-        needColA = dstAlpha || alphaTest;
+        needColA = dstAlpha || alphaTest ||
+            blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE;
         emitConstVariant = capacity >= 1600;
 
         mask = 7u << GR_GRADIENT_COLOR_R;
@@ -1799,11 +2342,11 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
 
             pixelArmEmitUntextured(&c, sig, rgb565, dstAlpha, alphaTest, alphaRejectCond,
                                    fog, depth, rejectCondition, dither, colorShift,
-                                   blendZeroSrcColor, 1, PA_C_ROW, 0);
+                                   blendMode, 1, PA_C_ROW, 0);
         }
         pixelArmEmitUntextured(&c, sig, rgb565, dstAlpha, alphaTest, alphaRejectCond,
                                fog, depth, rejectCondition, dither, colorShift,
-                               blendZeroSrcColor, 0, PA_G_ROW, 1);
+                               blendMode, 0, PA_G_ROW, 1);
         if (c.count > c.capacity) return 0;
         for (i = 0; i < c.numBranches; ++i)
             c.words[c.branches[i]] |= (unsigned int)(c.labels[c.targets[i]] - c.branches[i] - 2) & 0xFFFFFFu;
@@ -1811,22 +2354,15 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
         return c.count * 4;
     }
 
-    if (t[PA_TEX_MAG_LINEAR] || t[PA_TEX_MIN_LINEAR] ||
+    if (t[PA_TEX_MAG_LINEAR] != t[PA_TEX_MIN_LINEAR] ||
+        (!allowExtended && (t[PA_TEX_MAG_LINEAR] || t[PA_TEX_MIN_LINEAR])) ||
         t[PA_TEX_WRAP_S] != GR_WRAPMODE_REPEAT || t[PA_TEX_WRAP_T] != GR_WRAPMODE_REPEAT ||
         !pixelArmByteChannels(tex, 0) ||
         (tex->paletteFormat != GR_PALETTEFORMAT_NONE && tex->paletteFormat != GR_PALETTEFORMAT_8BIT) ||
         t[PA_TEX_RGB_OPERAND0] != GR_TEXENVCOMBOPERAND_SRC_COLOR || t[PA_TEX_RGB_SCALE] || t[PA_TEX_ALPHA_SCALE])
         return 0;
 
-    blendSrcAlpha = sig->blendEnabled != 0;
-    if (blendSrcAlpha &&
-        (!allowExtended || rgb565 || dstAlpha || alphaTest ||
-         dst->rgbaOffsets[1] != 8 ||
-         !((dst->rgbaOffsets[0] == 16 && dst->rgbaOffsets[2] == 0) ||
-           (dst->rgbaOffsets[0] == 0 && dst->rgbaOffsets[2] == 16)) ||
-         sig->srcFactor != GR_BLENDFACTOR_SRC_ALPHA ||
-         sig->dstFactor != GR_BLENDFACTOR_ONE_MINUS_SRC_ALPHA))
-        return 0;
+    isBilinear = (allowExtended && t[PA_TEX_MAG_LINEAR]) ? 1 : 0;
 
     modulate = t[PA_TEX_RGB_FUNCTION] == GR_TEXENVCOMBFUNC_MODULATE &&
         t[PA_TEX_RGB_SOURCE0] == GR_TEXENVCOMBSRC_PREVIOUS &&
@@ -1838,7 +2374,8 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
         return 0;
 
     alphaMode = 0;
-    if (dstAlpha || alphaTest || blendSrcAlpha)
+    if (dstAlpha || alphaTest ||
+        blendMode == PA_BLEND_SRC_ALPHA || blendMode == PA_BLEND_SRC_ALPHA_ONE)
     {
         if (t[PA_TEX_ALPHA_FUNCTION] == GR_TEXENVCOMBFUNC_REPLACE &&
             t[PA_TEX_ALPHA_OPERAND0] == GR_TEXENVCOMBOPERAND_SRC_ALPHA)
@@ -1869,17 +2406,9 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
             return 0;
     }
 
-    depth = sig->depthTest != 0;
-    if (depth && (dst->depthBytes != 2 || sig->constantDepth || sig->depthClampMin || sig->depthClampMax ||
-        (sig->depthFunc != GR_FUNC_LESS && sig->depthFunc != GR_FUNC_LEQUAL)))
-        return 0;
-
-    dither = rgb565 && sig->dither;
-    colorShift = rgb565 ? 1 : 2;
-    rejectCondition = sig->depthFunc == GR_FUNC_LESS ? PA_HS : PA_HI;
     needColA = alphaMode >= 2;
-    emitConstVariant = (modulate || needColA) && capacity >= 1600;
-    emitWhiteVariant = modulate && capacity >= 2400;
+    emitConstVariant = (modulate || needColA) && capacity >= (isBilinear ? 2400 : 1600);
+    emitWhiteVariant = modulate && capacity >= (isBilinear ? 3600 : 2400);
 
     whiteMask = (1u << tex->rgbaOffsets[0]) | (1u << tex->rgbaOffsets[1]) | (1u << tex->rgbaOffsets[2]);
     if (alphaMode == 3)
@@ -1983,12 +2512,12 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
     }
 
     if (emitConstVariant)
-        pixelArmEmitVariant(&c, sig, textureLayout, rgb565, dstAlpha, modulate, alphaMode,
+        pixelArmEmitVariant(&c, sig, textureLayout, rgb565, dstAlpha, isBilinear, modulate, alphaMode,
                             alphaTest, alphaRejectCond, fog, depth, rejectCondition,
-                            dither, colorShift, blendSrcAlpha, 1, PA_C_ROW, 0);
-    pixelArmEmitVariant(&c, sig, textureLayout, rgb565, dstAlpha, modulate, alphaMode,
+                            dither, colorShift, blendMode, 1, PA_C_ROW, 0);
+    pixelArmEmitVariant(&c, sig, textureLayout, rgb565, dstAlpha, isBilinear, modulate, alphaMode,
                         alphaTest, alphaRejectCond, fog, depth, rejectCondition,
-                        dither, colorShift, blendSrcAlpha, 0, PA_G_ROW, !emitWhiteVariant);
+                        dither, colorShift, blendMode, 0, PA_G_ROW, !emitWhiteVariant);
     if (emitWhiteVariant)
     {
         c.labels[PA_W_CHECK_256] = c.count;
@@ -2012,9 +2541,9 @@ int grCompileARMPixelPipelineEx(void *output, int capacity, const _grSignature *
         pixelArmOp(&c, PA_MOV, 1, 0, pixelArmImmediate(0), 0);
         pixelArmStore(&c, 1, 0, -4);
 
-        pixelArmEmitVariant(&c, sig, textureLayout, rgb565, dstAlpha, modulate, alphaMode,
+        pixelArmEmitVariant(&c, sig, textureLayout, rgb565, dstAlpha, isBilinear, modulate, alphaMode,
                             alphaTest, alphaRejectCond, fog, depth, rejectCondition,
-                            dither, colorShift, blendSrcAlpha, 2, PA_W_ROW, 1);
+                            dither, colorShift, blendMode, 2, PA_W_ROW, 1);
     }
 
     if (c.count > c.capacity) return 0;
