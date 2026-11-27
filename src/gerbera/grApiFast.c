@@ -66,7 +66,12 @@ void grVertexCacheInvalidate(Gerbera_s *state)
  * assert 830 guards the returned cache index range. */
 
 #if defined(__GNUC__)
-__attribute__((noinline))
+static void grVertexCacheTransformSlow(Gerbera_s *state, _grVertex *v, int vtxIndex)
+#if defined(__arm__) && !defined(__thumb__)
+    __asm__("grVertexCacheTransformSlow_asm")
+#endif
+    ;
+__attribute__((noinline, used))
 #endif
 static void grVertexCacheTransformSlow(Gerbera_s *state, _grVertex *v, int vtxIndex)
 {
@@ -86,6 +91,145 @@ static void grVertexCacheTransformSlow(Gerbera_s *state, _grVertex *v, int vtxIn
     }
 }
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+typedef char gr_check_arm_vc_rs_[__builtin_offsetof(Gerbera_s, renderStack) == 5240 ? 1 : -1];
+typedef char gr_check_arm_vc_vc_[__builtin_offsetof(Gerbera_s, vertexCache) == 5248 ? 1 : -1];
+typedef char gr_check_arm_vc_tv_[__builtin_offsetof(Gerbera_s, transformVertexFast) == 8528 ? 1 : -1];
+typedef char gr_check_arm_vc_bm_[__builtin_offsetof(_grVertexCache, batchLockMask) == 0 ? 1 : -1];
+typedef char gr_check_arm_vc_fs_[__builtin_offsetof(_grVertexCache, totalFreeSlots) == 8 ? 1 : -1];
+typedef char gr_check_arm_vc_ci_[__builtin_offsetof(_grVertexCache, cacheIndices) == 40 ? 1 : -1];
+typedef char gr_check_arm_vc_sz_[sizeof(_grVertex) == 128 ? 1 : -1];
+typedef char gr_check_arm_vc_vi_[__builtin_offsetof(_grVertex, index) == 0 ? 1 : -1];
+typedef char gr_check_arm_vc_vm_[__builtin_offsetof(_grVertex, stateMask) == 4 ? 1 : -1];
+
+__attribute__((naked)) int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
+{
+    (void)state;
+    (void)vtxIndex;
+    __asm__ volatile(
+        "add   r2, r0, #4096\n\t"
+        "eor   ip, r1, r1, asr #3\n\t"
+        "ldr   r3, [r2, #1152]\n\t"
+        "ldr   r2, [r2, #1144]\n\t"
+        "eor   ip, ip, r1, asr #5\n\t"
+        "and   ip, ip, #31\n\t"
+        "add   r2, r2, #1328\n\t"
+        "add   r3, r3, ip, lsl #2\n\t"
+        "add   r2, r2, #4\n\t"
+        "ldr   r3, [r3, #40]\n\t"
+        "and   ip, r3, #255\n\t"
+        "ldr   ip, [r2, ip, lsl #7]\n\t"
+        "cmp   r1, ip\n\t"
+        "beq   3f\n\t"
+        "mov   ip, r3, lsr #8\n\t"
+        "and   ip, ip, #255\n\t"
+        "ldr   ip, [r2, ip, lsl #7]\n\t"
+        "cmp   r1, ip\n\t"
+        "moveq r3, r3, ror #8\n\t"
+        "beq   2f\n\t"
+        "mov   ip, r3, lsr #16\n\t"
+        "and   ip, ip, #255\n\t"
+        "ldr   ip, [r2, ip, lsl #7]\n\t"
+        "cmp   r1, ip\n\t"
+        "moveq r3, r3, ror #16\n\t"
+        "beq   2f\n\t"
+        "mov   ip, r3, lsr #24\n\t"
+        "ldr   ip, [r2, ip, lsl #7]\n\t"
+        "cmp   r1, ip\n\t"
+        "bne   1f\n\t"
+        "mov   r3, r3, ror #24\n\t"
+        "2:\n\t"
+        "add   r2, r0, #4096\n\t"
+        "eor   ip, r1, r1, asr #3\n\t"
+        "ldr   r2, [r2, #1152]\n\t"
+        "eor   ip, ip, r1, asr #5\n\t"
+        "and   ip, ip, #31\n\t"
+        "add   ip, r2, ip, lsl #2\n\t"
+        "str   r3, [ip, #40]\n\t"
+        "b     4f\n\t"
+        "3:\n\t"
+        "add   r2, r0, #4096\n\t"
+        "ldr   r2, [r2, #1152]\n\t"
+        "4:\n\t"
+        "and   r0, r3, #255\n\t"
+        "and   r1, r0, #32\n\t"
+        "and   r3, r0, #31\n\t"
+        "mov   ip, #1\n\t"
+        "mov   ip, ip, lsl r3\n\t"
+        "ldr   r3, [r2, r1, lsr #3]\n\t"
+        "tst   r3, ip\n\t"
+        "bxne  lr\n\t"
+        "orr   r3, r3, ip\n\t"
+        "str   r3, [r2, r1, lsr #3]\n\t"
+        "ldr   r3, [r2, #8]\n\t"
+        "sub   r3, r3, #1\n\t"
+        "str   r3, [r2, #8]\n\t"
+        "bx    lr\n\t"
+        "1:\n\t"
+        "stmfd sp!, {r4, r5, r6, r7, r8, lr}\n\t"
+        "add   ip, r0, #4096\n\t"
+        "eor   r5, r1, r1, asr #3\n\t"
+        "ldr   r4, [ip, #1152]\n\t"
+        "eor   r5, r5, r1, asr #5\n\t"
+        "and   r6, r5, #63\n\t"
+        "and   r5, r5, #31\n\t"
+        "and   ip, r6, #32\n\t"
+        "mov   ip, ip, lsr #3\n\t"
+        "ldr   lr, [r4, ip]\n\t"
+        "mov   r7, #1\n\t"
+        "mov   r7, r7, lsl r5\n\t"
+        "tst   lr, r7\n\t"
+        "bne   11f\n\t"
+        "orr   lr, lr, r7\n\t"
+        "str   lr, [r4, ip]\n\t"
+        "12:\n\t"
+        "ldr   r7, [r4, #8]\n\t"
+        "orr   r3, r6, r3, lsl #8\n\t"
+        "add   r5, r4, r5, lsl #2\n\t"
+        "sub   r7, r7, #1\n\t"
+        "str   r3, [r5, #40]\n\t"
+        "str   r7, [r4, #8]\n\t"
+        "add   r5, r2, r6, lsl #7\n\t"
+        "mov   ip, #0\n\t"
+        "str   r1, [r5, #0]\n\t"
+        "mov   r2, r1\n\t"
+        "mov   r1, r5\n\t"
+        "strh  ip, [r5, #4]\n\t"
+        "add   ip, r0, #8192\n\t"
+        "ldr   r3, [ip, #336]\n\t"
+        "cmp   r3, #0\n\t"
+        "beq   13f\n\t"
+        "blx   r3\n\t"
+        "mov   r0, r6\n\t"
+        "ldmfd sp!, {r4, r5, r6, r7, r8, pc}\n\t"
+        "13:\n\t"
+        "bl    grVertexCacheTransformSlow_asm\n\t"
+        "mov   r0, r6\n\t"
+        "ldmfd sp!, {r4, r5, r6, r7, r8, pc}\n\t"
+        "11:\n\t"
+        "ldr   r7, [r4, #4]\n\t"
+        "mvn   r7, r7\n\t"
+        "cmp   r7, #0\n\t"
+        "ldreq r7, [r4, #0]\n\t"
+        "mvneq r7, r7\n\t"
+        "moveq lr, #32\n\t"
+        "movne lr, #0\n\t"
+        "clz   r7, r7\n\t"
+        "add   r7, r7, lr\n\t"
+        "rsb   r6, r7, #63\n\t"
+        "and   ip, r6, #32\n\t"
+        "and   lr, r6, #31\n\t"
+        "mov   ip, ip, lsr #3\n\t"
+        "ldr   r7, [r4, ip]\n\t"
+        "mov   r8, #1\n\t"
+        "mov   r8, r8, lsl lr\n\t"
+        "orr   r7, r7, r8\n\t"
+        "str   r7, [r4, ip]\n\t"
+        "b     12b\n\t");
+}
+#else
 int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
 {
     _grVertexCache *cache = GR_VERTEX_CACHE(state);
@@ -218,6 +362,7 @@ int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
     }
     return slot;
 }
+#endif
 
 /* --- grComputeTriangleArea (grRasterizer.inl; DLL 25943-25983) --------------
  * Signed screen-space area of the triangle over the vertex cache records'
@@ -455,7 +600,10 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
         return;
 
     cache = GR_VERTEX_CACHE(state);
-    vertexBuffer = GR_VERTEX_BUFFER(state);
+    unsigned int *rs = (unsigned int *)state->renderStack;
+    int *queueIndexPtr = (int *)((unsigned char *)rs + GR_RENDER_STACK_COMMAND_QUEUE_INDEX);
+
+    vertexBuffer = (_grVertex *)((unsigned char *)rs + 1332);
     prev0 = cache->prevVertexIndices[0];
     prev1 = cache->prevVertexIndices[1];
     prev2 = cache->prevVertexIndices[2];
@@ -478,7 +626,7 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
         grAssert("(ci0 != ci1) && (ci0 != ci2) && (ci1 != ci2)",
                  "grApiFast.inl", 999) != 0)
         grDie(0);
-    if (hgSignBit32((254 - GR_COMMAND_QUEUE_INDEX(state)) |
+    if (hgSignBit32((254 - *queueIndexPtr) |
                     (cache->totalFreeSlots - 3)) != 0)
         grFlushPrimitiveBatch(state);
     cm0 = v0->clipMask;
@@ -496,13 +644,12 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
     }
     if ((maskAll & 0xFC3Fu) != 0)
     {
-        unsigned int *rs = (unsigned int *)state->renderStack;
-        int idx = GR_COMMAND_QUEUE_INDEX(state);
+        int idx = *queueIndexPtr;
         unsigned int *cmd = rs + idx + 42;
 
         cmd[0] = (unsigned int)packed | 0x10000000u;
         cmd[1] = 0;
-        GR_COMMAND_QUEUE_INDEX(state) = idx + 2;
+        *queueIndexPtr = idx + 2;
         return;
     }
 
@@ -543,8 +690,7 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
         if (((areaSign ^ state->cullNegative) &
              grTestCapability(state, GR_CAPABILITY_CULL_FACE)) == 0)
         {
-            unsigned int *rs = (unsigned int *)state->renderStack;
-            int idx = GR_COMMAND_QUEUE_INDEX(state);
+            int idx = *queueIndexPtr;
             unsigned int *cmd = rs + idx + 42;
             int triSide = areaSign ^ grGetFrontFace(state);
             unsigned int rArea;
@@ -562,7 +708,7 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
             }
             cmd[0] = (unsigned int)packed | ((unsigned int)triSide << 24);
             cmd[1] = rArea;
-            GR_COMMAND_QUEUE_INDEX(state) = idx + 2;
+            *queueIndexPtr = idx + 2;
         }
     }
 }

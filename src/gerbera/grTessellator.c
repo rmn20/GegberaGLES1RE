@@ -40,6 +40,9 @@ static const signed char g_tessNextLut[3] = { 1, 2, 0 };
 /* --- grFracDiv (grTessellator.inl 49; DLL 26703-26725) -----------------------
  * a/b as an IUNIT fraction ([0, IUNITSCALAR_ONE]; a <= b asserted). */
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
 int grFracDiv(int a, int b)
 {
     HGint64 reciprocal;
@@ -188,14 +191,15 @@ int grSplitEdge(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
         dist = hgMin32(dist, 0x2000);
         t17 = hgGet64l(hgMul64(dist, 0x10000));
     }
-    fdw2 = 0;
-    if (w1 + v0->normal[2] != 0)
-        fdw2 = grFracDiv(v0->normal[2], w1 + v0->normal[2]);
-    factor1 = hgMax32(2 * t17 - 0x20000000, 0);
-    t = (factor1 != 0)
-      ? (0x10000000 + hgLsl64h_0_31(hgMul64(factor1, fdw2 - 0x10000000), 3))
-      : 0x10000000;
-    dst->normal[2] = grLerp(v0->normal[2], w1, fdw2);
+    {
+        int w0Orig = v0->normal[2];
+        fdw2 = (w1 + w0Orig != 0) ? grFracDiv(w0Orig, w1 + w0Orig) : 0;
+        factor1 = hgMax32(2 * t17 - 0x20000000, 0);
+        t = (factor1 != 0)
+          ? (0x10000000 + hgLsl64h_0_31(hgMul64(factor1, fdw2 - 0x10000000), 3))
+          : 0x10000000;
+        dst->normal[2] = grLerp(w0Orig, w1, fdw2);
+    }
     grLerpClipFactor((_grClipVertex *)&dst->normal[0],
                      (_grClipVertex *)&v0->normal[0],
                      (_grClipVertex *)&v1->normal[0], t);
@@ -222,14 +226,11 @@ static void grTessellateTriangleSubdivide(Gerbera_s *state, _grClipTriangle *tri
                                           unsigned int origIndices, int level)
 {
     _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
-    int splitBits[3];
+    unsigned int splitMask = 0;
     int numSplits = 0;
     int forceSplit = 0;
     int j;
 
-    splitBits[0] = 0;
-    splitBits[1] = 0;
-    splitBits[2] = 0;
     for (j = 2; j >= 0; --j)
     {
         int dstIndex = j + 3 * level + 68;
@@ -238,10 +239,11 @@ static void grTessellateTriangleSubdivide(Gerbera_s *state, _grClipTriangle *tri
         _grVertex *vb = vertexBuffer +
             grUnpackIndex(tri->indices, g_tessNextLut[j]);
         int split = grSplitEdge(dst, va, vb, forceSplit);
+        int bit = forceSplit | split;
 
-        splitBits[j] = forceSplit | split;
-        numSplits += splitBits[j];
-        if (splitBits[j] != 0)
+        splitMask |= (unsigned int)bit << j;
+        numSplits += bit;
+        if (bit != 0)
         {
             int emptyBits = 7 - level;
             int x = dst->screenPosition[0];
@@ -299,8 +301,8 @@ static void grTessellateTriangleSubdivide(Gerbera_s *state, _grClipTriangle *tri
             }
             case 2:
             {
-                int rel = (splitBits[0] != 0)
-                        ? ((splitBits[1] != 0) ? 2 : 1)
+                int rel = ((splitMask & 1u) != 0)
+                        ? (((splitMask & 2u) != 0) ? 2 : 1)
                         : 0;
                 int next = (rel + 1 <= 2) ? (rel + 1) : 0;
                 int prev = (rel - 1 >= 0) ? (rel - 1) : 2;
@@ -323,8 +325,8 @@ static void grTessellateTriangleSubdivide(Gerbera_s *state, _grClipTriangle *tri
             }
             case 1:
             {
-                int rel = (splitBits[0] != 0) ? 0
-                        : ((splitBits[1] != 0) ? 1 : 2);
+                int rel = ((splitMask & 1u) != 0) ? 0
+                        : (((splitMask & 2u) != 0) ? 1 : 2);
                 int prev = (rel - 1 >= 0) ? (rel - 1) : 2;
                 int next = (rel + 1 <= 2) ? (rel + 1) : 0;
                 _grClipTriangle child;

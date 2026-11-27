@@ -406,11 +406,23 @@ int IVector4_stp(_IVector4 *pA, _IVector4 *pB, _IVector4 *pC)
 static inline int iv4_mulLsl32h(int a, int b, unsigned int sh)
 {
 #if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
-    unsigned int lo;
-    int hi;
-    unsigned int rsh = 31u - sh;
-    __asm__("smull %0, %1, %2, %3" : "=&r"(lo), "=&r"(hi) : "r"(a), "r"(b));
-    return (int)(((unsigned int)hi << sh) | ((lo >> 1) >> rsh));
+    if (__builtin_constant_p(sh))
+    {
+        return hgLsl64h_0_31(hgMul64(a, b), (int)sh);
+    }
+    else
+    {
+        unsigned int lo;
+        int hi;
+        unsigned int rsh = 32u - sh;
+        __asm__(
+            "smull %0, %1, %2, %3\n\t"
+            "mov   %1, %1, lsl %4\n\t"
+            "orr   %1, %1, %0, lsr %5"
+            : "=&r"(lo), "=&r"(hi)
+            : "r"(a), "r"(b), "r"(sh), "r"(rsh));
+        return hi;
+    }
 #else
     return hgLsl64h_0_31(hgMul64(a, b), (int)sh);
 #endif
