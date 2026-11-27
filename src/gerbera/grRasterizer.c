@@ -46,23 +46,31 @@ void grSetupGradient(const _grGradientInfo *info, int gradient, int g01, int g02
     pPP = info->pPP;
     if (g01 != 0 || g02 != 0)   /* __PAIR64__(g02, g01) != 0 */
     {
-        HGint64 xAdd64 = hgMul64(info->v01syPerArea, g02);
-        HGint64 xAdd64a;
-        HGint64 yAdd64 = hgMul64(info->v02sxPerArea, g01);
-        HGint64 yAdd64a;
+        HGint64 xRaw = hgMadd64(hgMul64(info->v01syPerArea, g02), info->v02syPerArea,
+                                (int)(0u - (unsigned int)g01));
+        HGint64 yRaw = hgMadd64(hgMul64(info->v02sxPerArea, g01), info->v01sxPerArea,
+                                (int)(0u - (unsigned int)g02));
+        int sh = info->shift + 14;
         int xHi, yHi, refSub;
 
-        /* ARM RSB wraps before the signed long multiply, including INT_MIN. */
-        xAdd64a = hgAsr64(hgMadd64(xAdd64, info->v02syPerArea,
-                                  (int)(0u - (unsigned int)g01)),
-                          info->shift + 14);
-        xAdd32 = hgGet64l(xAdd64a);
-        xHi = hgGet64h(xAdd64a);
-        yAdd64a = hgAsr64(hgMadd64(yAdd64, info->v01sxPerArea,
-                                  (int)(0u - (unsigned int)g02)),
-                          info->shift + 14);
-        yAdd32 = hgGet64l(yAdd64a);
-        yHi = hgGet64h(yAdd64a);
+        if (__builtin_expect(sh < 32, 1))
+        {
+            int rsh = 32 - sh;
+            xAdd32 = (int)(((unsigned int)hgGet64l(xRaw) >> sh) |
+                           ((unsigned int)hgGet64h(xRaw) << rsh));
+            xHi = hgGet64h(xRaw) >> sh;
+            yAdd32 = (int)(((unsigned int)hgGet64l(yRaw) >> sh) |
+                           ((unsigned int)hgGet64h(yRaw) << rsh));
+            yHi = hgGet64h(yRaw) >> sh;
+        }
+        else
+        {
+            int sh2 = sh - 32;
+            xAdd32 = hgGet64h(xRaw) >> sh2;
+            xHi = hgGet64h(xRaw) >> 31;
+            yAdd32 = hgGet64h(yRaw) >> sh2;
+            yHi = hgGet64h(yRaw) >> 31;
+        }
 #if defined(__GNUC__)
         if (__builtin_expect(((xHi ^ (xAdd32 >> 31)) | (yHi ^ (yAdd32 >> 31))) == 0, 1))
 #else
@@ -84,6 +92,8 @@ void grSetupGradient(const _grGradientInfo *info, int gradient, int g01, int g02
         }
         else
         {
+            HGint64 xAdd64a = hgAsr64(xRaw, sh);
+            HGint64 yAdd64a = hgAsr64(yRaw, sh);
             HGint64 xAdd64b = hgMul64x32(xAdd64a, info->v0sx);
             HGint64 yAdd64b = hgMul64x32(yAdd64a, info->v0sy);
             refSub = hgLsl64h_0_31(hgAdd64(xAdd64b, yAdd64b), 20);
@@ -120,13 +130,7 @@ void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02
         sxDelta = hgMul64(info->v02sxPerArea, g01);
         sxDelta = hgMadd64(sxDelta, info->v01sxPerArea,
                            (int)(0u - (unsigned int)g02));
-        if (info->shift + 14 >= 32)
-        {
-            int sh = info->shift - 18;
-            xAdder = hgGet64h(syDelta) >> sh;
-            yAdder = hgGet64h(sxDelta) >> sh;
-        }
-        else
+        if (__builtin_expect(info->shift < 18, 1))
         {
             int sh = 18 - info->shift; /* 1..18 because info->shift in 0..17 */
             int rsh = 32 - sh;         /* 14..31 */
@@ -134,6 +138,12 @@ void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02
                            ((unsigned int)hgGet64l(syDelta) >> rsh));
             yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
                            ((unsigned int)hgGet64l(sxDelta) >> rsh));
+        }
+        else
+        {
+            int sh = info->shift - 18;
+            xAdder = hgGet64h(syDelta) >> sh;
+            yAdder = hgGet64h(sxDelta) >> sh;
         }
     }
     info->pPP->xAdder[gradient] = xAdder;
@@ -148,6 +158,9 @@ void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02
  * unit, coord 1..0 (T then S) - gradient index = coord + 2*texIndex + 6.
  */
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
                               int flatShadeIndex, unsigned int gradientMask, int rejectDepth)
 {
@@ -324,55 +337,47 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
                 grDie(0);
             if (grTestCapability(state, GR_CAPABILITY_SMOOTH_SHADING) != 0)
             {
-                if (side == GR_SIDE_FRONT && (gradientMask & 0x3Cu) == 0x3Cu)
-                {
-                    unsigned int rg0, rg1, rg2, ba0, ba1, ba2;
-                    __builtin_memcpy(&rg0, &v0->color.final[0][0], sizeof(rg0));
-                    __builtin_memcpy(&rg1, &v1->color.final[0][0], sizeof(rg1));
-                    __builtin_memcpy(&rg2, &v2->color.final[0][0], sizeof(rg2));
-                    __builtin_memcpy(&ba0, &v0->color.final[0][2], sizeof(ba0));
-                    __builtin_memcpy(&ba1, &v1->color.final[0][2], sizeof(ba1));
-                    __builtin_memcpy(&ba2, &v2->color.final[0][2], sizeof(ba2));
-                    if (rg0 == rg1 && rg0 == rg2 && ba0 == ba1 && ba0 == ba2)
-                    {
-                        const unsigned short *c = &v0->color.final[0][0];
-                        pixelPipe->reference[GR_GRADIENT_COLOR_R] = ((int)c[0] << 8) + 0x8000;
-                        pixelPipe->reference[GR_GRADIENT_COLOR_G] = ((int)c[1] << 8) + 0x8000;
-                        pixelPipe->reference[GR_GRADIENT_COLOR_B] = ((int)c[2] << 8) + 0x8000;
-                        pixelPipe->reference[GR_GRADIENT_COLOR_A] = ((int)c[3] << 8) + 0x8000;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_R] = 0;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_G] = 0;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_B] = 0;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_A] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_R] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_G] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_B] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_A] = 0;
-                        return 1;
-                    }
-                }
-                else if (side == GR_SIDE_FRONT && (gradientMask & 0x3Cu) == 0x1Cu)
+                if (side == GR_SIDE_FRONT && (gradientMask & 0x1Cu) == 0x1Cu)
                 {
                     unsigned int rg0, rg1, rg2;
-                    unsigned short b0 = v0->color.final[0][2];
-                    unsigned short b1 = v1->color.final[0][2];
-                    unsigned short b2 = v2->color.final[0][2];
                     __builtin_memcpy(&rg0, &v0->color.final[0][0], sizeof(rg0));
                     __builtin_memcpy(&rg1, &v1->color.final[0][0], sizeof(rg1));
                     __builtin_memcpy(&rg2, &v2->color.final[0][0], sizeof(rg2));
-                    if (rg0 == rg1 && rg0 == rg2 && b0 == b1 && b0 == b2)
+                    if (rg0 == rg1 && rg0 == rg2)
                     {
                         const unsigned short *c = &v0->color.final[0][0];
-                        pixelPipe->reference[GR_GRADIENT_COLOR_R] = ((int)c[0] << 8) + 0x8000;
-                        pixelPipe->reference[GR_GRADIENT_COLOR_G] = ((int)c[1] << 8) + 0x8000;
-                        pixelPipe->reference[GR_GRADIENT_COLOR_B] = ((int)c[2] << 8) + 0x8000;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_R] = 0;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_G] = 0;
-                        pixelPipe->xAdder[GR_GRADIENT_COLOR_B] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_R] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_G] = 0;
-                        pixelPipe->yAdder[GR_GRADIENT_COLOR_B] = 0;
-                        return 1;
+                        int sameAll;
+                        if (gradientMask & 0x20u)
+                        {
+                            unsigned int ba0, ba1, ba2;
+                            __builtin_memcpy(&ba0, &v0->color.final[0][2], sizeof(ba0));
+                            __builtin_memcpy(&ba1, &v1->color.final[0][2], sizeof(ba1));
+                            __builtin_memcpy(&ba2, &v2->color.final[0][2], sizeof(ba2));
+                            sameAll = (ba0 == ba1 && ba0 == ba2);
+                            if (sameAll)
+                            {
+                                pixelPipe->reference[GR_GRADIENT_COLOR_A] = ((int)c[3] << 8) + 0x8000;
+                                pixelPipe->xAdder[GR_GRADIENT_COLOR_A] = 0;
+                                pixelPipe->yAdder[GR_GRADIENT_COLOR_A] = 0;
+                            }
+                        }
+                        else
+                        {
+                            sameAll = (c[2] == v1->color.final[0][2] && c[2] == v2->color.final[0][2]);
+                        }
+                        if (sameAll)
+                        {
+                            pixelPipe->reference[GR_GRADIENT_COLOR_R] = ((int)c[0] << 8) + 0x8000;
+                            pixelPipe->reference[GR_GRADIENT_COLOR_G] = ((int)c[1] << 8) + 0x8000;
+                            pixelPipe->reference[GR_GRADIENT_COLOR_B] = ((int)c[2] << 8) + 0x8000;
+                            pixelPipe->xAdder[GR_GRADIENT_COLOR_R] = 0;
+                            pixelPipe->xAdder[GR_GRADIENT_COLOR_G] = 0;
+                            pixelPipe->xAdder[GR_GRADIENT_COLOR_B] = 0;
+                            pixelPipe->yAdder[GR_GRADIENT_COLOR_R] = 0;
+                            pixelPipe->yAdder[GR_GRADIENT_COLOR_G] = 0;
+                            pixelPipe->yAdder[GR_GRADIENT_COLOR_B] = 0;
+                            return 1;
+                        }
                     }
                 }
                 for (coord = GR_GRADIENT_COLOR_R; coord >= GR_GRADIENT_DEPTH; --coord)
@@ -450,6 +455,9 @@ void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
 
 /* --- grDivsu (grScanConvert.inl 29; DLL 24922-24932) ------------------------- */
 
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 int grDivsu(int a, int b)
 {
     if (b <= 0 && grAssert("b > 0", "grScanConvert.inl", 29) != 0)
@@ -636,6 +644,9 @@ void grScanConvertWithoutXScissoring(_grEdgePair *edgePairs,
  * {yStart, numScanlines, scanlineInfo} into the pixel pipe (+188/+180/+184).
  * Returns the final scanline count (0 when the triangle degenerates). */
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
                           _grRasterPoint *p1, _grRasterPoint *p2,
                           int emptyBits)
@@ -644,24 +655,20 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
     if ((p0->y >> 12) >= (p2->y >> 12) ||
         (p2->y >> 12) <= scissor->y0 || (p0->y >> 12) >= scissor->y1)
         return 0;
-    int d10x = (p1->x - p0->x) >> emptyBits;   /* 12.4 pixel deltas */
-    int d10y = (p1->y - p0->y) >> emptyBits;
-    int d20x = (p2->x - p0->x) >> emptyBits;
-    int d20y = (p2->y - p0->y) >> emptyBits;
-    int d21x = (p2->x - p1->x) >> emptyBits;
-    int d21y = (p2->y - p1->y) >> emptyBits;
-    int v0xT = grSubpixelTrunc(p0->x);         /* pixel-rounded vertices */
     int v0yT = grSubpixelTrunc(p0->y);
-    int v1xT = grSubpixelTrunc(p1->x);
     int v1yT = grSubpixelTrunc(p1->y);
-    int v2xT = grSubpixelTrunc(p2->x);
     int v2yT = grSubpixelTrunc(p2->y);
     int v0yTop = hgMin32(v0yT, scissor->y1);
     int v1yTop = hgMin32(v1yT, scissor->y1);
     int v2yTop = hgMin32(v2yT, scissor->y1);
-    int v0yBottom = hgMax32(v0yT, scissor->y0);
     int topHeight = v1yTop - v0yTop;           /* scanlines above the middle */
     int btmHeight = v2yTop - v1yTop;           /* scanlines below the middle */
+    int d20x = (p2->x - p0->x) >> emptyBits;
+    int d20y = (p2->y - p0->y) >> emptyBits;
+    int v0xT = grSubpixelTrunc(p0->x);         /* pixel-rounded vertices */
+    int v1xT = grSubpixelTrunc(p1->x);
+    int v2xT = grSubpixelTrunc(p2->x);
+    int v0yBottom = hgMax32(v0yT, scissor->y0);
     int minX = hgMin32(hgMin32(v0xT, v1xT), v2xT);
     int maxX = hgMax32(hgMax32(v0xT, v1xT), v2xT);
     int needsXScissoring = minX < scissor->x0 || maxX > scissor->x1;
@@ -726,6 +733,8 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         }
         if (topHeight > 0)
         {
+            int d10x = (p1->x - p0->x) >> emptyBits;
+            int d10y = (p1->y - p0->y) >> emptyBits;
             int slope01 = GR_DIVIDE_EDGE(state, imLsl32OF(d10x, 14), d10y);
             int shortAtV0 = 4 * p0->x + (int)(((long long)fracV0y * slope01) >> 12);
             int lx0 = longOnRight ? shortAtV0 : longAtV0;
@@ -744,6 +753,8 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         }
         if (btmHeight > 0)
         {
+            int d21x = (p2->x - p1->x) >> emptyBits;
+            int d21y = (p2->y - p1->y) >> emptyBits;
             int slope12 = GR_DIVIDE_EDGE(state, imLsl32OF(d21x, 14), d21y);
             int shortAtV1 = 4 * p1->x + (int)(((long long)fracV1y * slope12) >> 12);
             int lx1 = longOnRight ? shortAtV1 : longAtV1;
@@ -769,7 +780,11 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         scanInfo = (unsigned int *)((unsigned char *)state->renderStack +
                                     GR_RENDER_STACK_SCANLINE_INFO);
         scanCursor = scanInfo;
+#if defined(__GNUC__)
+        if (__builtin_expect(needsXScissoring, 0))
+#else
         if (needsXScissoring)
+#endif
         {
             int x0 = scissor->x0;
             int x1 = scissor->x1;
@@ -1313,6 +1328,9 @@ void grSetupTextureUnit(Gerbera_s * restrict state, int texIndex, int (* restric
         grAssert("mipmap->log2Dim[GR_TEXCOORD_T] >= 0", "grRasterizer.inl", 154) != 0)
         grDie(0);
 
+#if defined(__GNUC__) && !defined(__clang__)
+    #pragma GCC unroll 0
+#endif
     for (i = 1; i >= 0; --i)
     {
         if (((64 << (i + 2 * texIndex)) & (int)activeGradMask) != 0)
@@ -1327,8 +1345,9 @@ void grSetupTextureUnit(Gerbera_s * restrict state, int texIndex, int (* restric
                 int g0val = g0[i][0];
                 int g0sh = g0[i][1];
                 int ref;
-                int lsh = 0;
-                int baseShift = 0;
+                int lsh;
+                int baseShift;
+                unsigned int wrap = (unsigned int)texture->wrapMode[i];
 
                 if (linear)
                 {
@@ -1336,26 +1355,23 @@ void grSetupTextureUnit(Gerbera_s * restrict state, int texIndex, int (* restric
                     bias = (int)(relShift >= 0 ? 0x100000u >> relShift : 0x100000u << -relShift);
                 }
 
-                ref = (int)((unsigned int)g0val +
-                    (unsigned int)grComputeGradientReference(v0sx, v0sy, xAdd, yAdd) -
-                    (unsigned int)bias);
-                switch (texture->wrapMode[i])
                 {
-                case GR_WRAPMODE_REPEAT:
-                    lsh = 11 - g0sh;
-                    baseShift = 32;
-                    break;
-                case GR_WRAPMODE_CLAMP_TO_EDGE:
+                    HGint64 v5 = hgMadd64(hgMul64(v0sx, xAdd), v0sy, yAdd);
+                    ref = (int)((unsigned int)g0val -
+                                (unsigned int)hgLsl64h_0_31(v5, 20) -
+                                (unsigned int)bias);
+                }
+                if (wrap == GR_WRAPMODE_CLAMP_TO_EDGE)
+                {
                     lsh = 0;
                     baseShift = g0sh + 21;
-                    break;
-                case GR_WRAPMODE_MIRRORED_REPEAT:
-                    lsh = 10 - g0sh;
-                    baseShift = 31;
-                    break;
-                default:
-                    imAssert("0", "grRasterizer.inl", 183);
-                    break;
+                }
+                else
+                {
+                    if (wrap > GR_WRAPMODE_MIRRORED_REPEAT)
+                        imAssert("0", "grRasterizer.inl", 183);
+                    baseShift = 32 - (int)(wrap >> 1);
+                    lsh = baseShift - 21 - g0sh;
                 }
                 pipe->xAdder[gradIdx] = (int)((unsigned int)xAdd << lsh);
                 pipe->yAdder[gradIdx] = (int)((unsigned int)yAdd << lsh);

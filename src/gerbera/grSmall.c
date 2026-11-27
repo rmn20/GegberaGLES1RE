@@ -79,6 +79,9 @@ const unsigned char g_mutableParamsMask[12] =
 
 /* A row is hidden when its nearest interpolated depth is behind every
  * stored sample. Validate the endpoint range before using that bound. */
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess)
 {
     enum { GR_DEPTH16_FRACTION_BITS = 14 };
