@@ -75,7 +75,11 @@ static inline int grTexCoordUnitFloatFast(int value)
     unsigned int e = (unsigned int)(unsigned char)((unsigned int)value >> 23);
     int sign, mag, mantissa, rshift;
 
+#if defined(__GNUC__)
+    if (__builtin_expect((unsigned int)(e - 1u) >= 254u, 0))
+#else
     if ((unsigned int)(e - 1u) >= 254u)
+#endif
         return 0;
     sign = value >> 31;
     mag = (int)(((unsigned int)value & 0x7FFFFFu) | 0x800000u) << 3;
@@ -83,13 +87,21 @@ static inline int grTexCoordUnitFloatFast(int value)
     rshift = 132 - (int)e;
     if (rshift >= 0)
     {
+#if defined(__GNUC__)
+        if (__builtin_expect(rshift > 31, 0))
+#else
         if (rshift > 31)
+#endif
             rshift = 31;
         return mantissa >> rshift;
     }
     {
         int lshift = -rshift;
+#if defined(__GNUC__)
+        if (__builtin_expect(lshift > 31, 0))
+#else
         if (lshift > 31)
+#endif
             lshift = 31;
         return (int)((unsigned int)mantissa << lshift);
     }

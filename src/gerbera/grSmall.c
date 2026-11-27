@@ -80,82 +80,84 @@ const unsigned char g_mutableParamsMask[12] =
 /* A row is hidden when its nearest interpolated depth is behind every
  * stored sample. Validate the endpoint range before using that bound. */
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
-__attribute__((optimize("O3")))
+__attribute__((noinline, optimize("O3")))
 #endif
-int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess)
+int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsigned int reference)
 {
     enum { GR_DEPTH16_FRACTION_BITS = 14 };
     const unsigned int maxDepth = ((unsigned int)UINT16_MAX << GR_DEPTH16_FRACTION_BITS) |
                                   ((1u << GR_DEPTH16_FRACTION_BITS) - 1u);
     const unsigned int *scan = pipe->scanlineInfo;
     const unsigned char *row = (const unsigned char *)pipe->depthRow;
-    unsigned int reference = (unsigned int)pipe->reference[GR_GRADIENT_DEPTH];
     int dx = pipe->xAdder[GR_GRADIENT_DEPTH];
-    int dy = pipe->yAdder[GR_GRADIENT_DEPTH];
+    int yAdd = pipe->yAdder[GR_GRADIENT_DEPTH];
     int stride = pipe->checked.depthBufferStride;
-    int i = pipe->numScanlines;
-    unsigned int bias = (unsigned int)strictLess;
+    int n = pipe->numScanlines;
 
-    if (i <= 0 || row == NULL || stride <= 0 ||
-        (((uintptr_t)row | (unsigned int)stride) & 1u))
-        return 0;
-    do
+    for (;;)
     {
-        unsigned int span = *scan++, count = span >> 16;
+        unsigned int span = *scan++;
+        unsigned int count = span >> 16;
         if (count != 0)
         {
             unsigned int x = span & 65535u;
             unsigned int first = reference + (unsigned int)dx * x;
             const unsigned short *depth = (const unsigned short *)row + x;
-            unsigned int d0;
-
+            unsigned int fBound, d0;
             if (first > maxDepth)
                 return 0;
-            d0 = (first >> GR_DEPTH16_FRACTION_BITS) + bias;
-            if (*depth >= d0)
+            fBound = (first >> GR_DEPTH16_FRACTION_BITS) + (unsigned int)strictLess;
+            d0 = *depth++;
+            if (d0 >= fBound)
                 return 0;
             if (count > 1u)
             {
-                if (dx == 0)
+                unsigned int rem = count - 1u;
+                if (dx != 0)
                 {
-                    while (--count != 0)
+                    uint64_t last = (uint64_t)((int64_t)dx * (int)rem) + first;
+                    if ((((unsigned int)(last >> 32)) | ((unsigned int)last >> 30)) != 0u)
+                        return 0;
+                    if (dx < 0)
                     {
-                        if (*++depth >= d0)
+                        fBound = ((unsigned int)last >> GR_DEPTH16_FRACTION_BITS) + (unsigned int)strictLess;
+                        if (d0 >= fBound)
                             return 0;
                     }
                 }
-                else if (dx > 0)
                 {
-                    int64_t last = (int64_t)first + (int64_t)dx * (int)(count - 1u);
-                    if ((uint64_t)last > (uint64_t)maxDepth)
-                        return 0;
-                    while (--count != 0)
+                    const unsigned short *end = depth + rem;
+                    do
                     {
-                        if (*++depth >= d0)
+                        if (*depth++ >= fBound)
                             return 0;
-                    }
-                }
-                else
-                {
-                    int64_t last = (int64_t)first + (int64_t)dx * (int)(count - 1u);
-                    unsigned int nearest;
-                    if ((uint64_t)last > (uint64_t)maxDepth)
-                        return 0;
-                    nearest = ((unsigned int)last >> GR_DEPTH16_FRACTION_BITS) + bias;
-                    if (*depth >= nearest)
-                        return 0;
-                    while (--count != 0)
-                    {
-                        if (*++depth >= nearest)
-                            return 0;
-                    }
+                    } while (depth != end);
                 }
             }
         }
+        if (--n == 0)
+            break;
         row += stride;
-        reference += (unsigned int)dy;
-    } while (--i != 0);
+        reference += (unsigned int)yAdd;
+    }
     return 1;
+}
+
+int grDepthSpansOccludedFast(const _grPixelPipe *pipe, int strictLess)
+{
+    return grDepthSpansOccludedFastRef(pipe, strictLess, (unsigned int)pipe->reference[GR_GRADIENT_DEPTH]);
+}
+
+int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess)
+{
+    const unsigned char *row = (const unsigned char *)pipe->depthRow;
+    int stride = pipe->checked.depthBufferStride;
+    int n = pipe->numScanlines;
+
+    if (n <= 0 || row == NULL || stride <= 0 ||
+        (((uintptr_t)row | (unsigned int)stride) & 1u))
+        return 0;
+    return grDepthSpansOccludedFastRef(pipe, strictLess, (unsigned int)pipe->reference[GR_GRADIENT_DEPTH]);
 }
 
 /* --- grDrawClippedTriangle (grSmall.c 254; DLL 26251-26388) ------------------
@@ -177,6 +179,9 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                            unsigned int origIndices, int emptyBits)
 {
     _grVertex *vertexBuffer = (_grVertex *)((unsigned char *)state->renderStack + 1332);
+    _grVertex *v0 = vertexBuffer + grUnpackIndex(tri->indices, 0);
+    _grVertex *v1 = vertexBuffer + grUnpackIndex(tri->indices, 1);
+    _grVertex *v2 = vertexBuffer + grUnpackIndex(tri->indices, 2);
     _grVertex *sorted[3];
     _grVertex *swap;
     unsigned int magic0 = GR_STACK_CHECK_MAGIC0;
@@ -187,9 +192,9 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
 
     (void)magic0;
     (void)magic1;
-    sorted[0] = vertexBuffer + grUnpackIndex(tri->indices, 0);
-    sorted[1] = vertexBuffer + grUnpackIndex(tri->indices, 1);
-    sorted[2] = vertexBuffer + grUnpackIndex(tri->indices, 2);
+    sorted[0] = v0;
+    sorted[1] = v1;
+    sorted[2] = v2;
     /* y-sort (record +32 = screenPosition[1]); stable 3-sort keeping the
      * original order for equal y */
     swap = sorted[0];
@@ -235,16 +240,8 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
         pixelPipe->depthRow = (void *)((char *)state->drawSurface.buffers[1].data +
                                        state->drawSurface.buffers[1].stride * yStart);
 #if GERBERA_ARMV6_JIT
-        int rejectDepth = state->primitiveType == GR_PRIMITIVETYPE_TRIANGLE &&
-            state->capabilities[GR_CAPABILITY_DEPTH_TEST] &&
-            !state->capabilities[GR_CAPABILITY_STENCIL_TEST] &&
-            !(state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_FILL] |
-              state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_LINE] |
-              state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_POINT]) &&
-            state->viewportScale.normal[2] != 0 && (activeGradientMask & 1u) &&
-            state->drawSurface.depthBytes == 2 &&
-            ((state->depthFunc & ~2) == GR_FUNC_LESS);
-        if (!grSetupTriangleGradientsVisible(state, tri, flatShadeIndex, activeGradientMask, rejectDepth))
+        int rejectDepth = state->fastDepthReject;
+        if (!grSetupTriangleGradientsVisibleVerts(state, tri, v0, v1, v2, flatShadeIndex, activeGradientMask, rejectDepth))
             goto done;
 #else
         grSetupTriangleGradients(state, tri, flatShadeIndex, activeGradientMask);

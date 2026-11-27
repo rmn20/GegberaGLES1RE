@@ -69,9 +69,23 @@ int grLerp(int a, int b, int factor)
     if (hgInRange32(factor, 0, IUNITSCALAR_ONE) == 0 &&
         grAssert("hgInRange32(factor, 0, IUNITSCALAR_ONE)", "grTessellator.inl", 70) != 0)
         grDie(0);
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
+    (void)v;
+    {
+        unsigned int lo;
+        int hi;
+        int oneMinus = IUNITSCALAR_ONE - factor;
+        __asm__("smull %0, %1, %2, %3\n\t"
+                "smlal %0, %1, %4, %5"
+                : "=&r"(lo), "=&r"(hi)
+                : "r"(oneMinus), "r"(a), "r"(factor), "r"(b));
+        return (int)(((unsigned int)hi << 3) | (lo >> 29));
+    }
+#else
     v = hgMul64(IUNITSCALAR_ONE - factor, a);
     v = hgMadd64(v, factor, b);
     return hgLsl64h_0_31(v, 3);
+#endif
 }
 
 /* --- grClassifyTriangle (grTessellator.inl 92; DLL 26745-26841) --------------

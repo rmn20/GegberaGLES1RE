@@ -21,9 +21,23 @@ HGint32 IUnitScalar_lerp(HGint32 s0, HGint32 s1, HGint32 factor)
         imAssert("hgInRange32(s0, 0, IUNITSCALAR_ONE)", "IUnitScalar.c", 37);
     if (hgInRange32(s1, 0, IUNITSCALAR_ONE) == 0)
         imAssert("hgInRange32(s1, 0, IUNITSCALAR_ONE)", "IUnitScalar.c", 38);
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__)
+    (void)v;
+    {
+        unsigned int lo;
+        int hi;
+        int oneMinus = IUNITSCALAR_ONE - factor;
+        __asm__("smull %0, %1, %2, %3\n\t"
+                "smlal %0, %1, %4, %5"
+                : "=&r"(lo), "=&r"(hi)
+                : "r"(oneMinus), "r"(s0), "r"(factor), "r"(s1));
+        result = (int)(((unsigned int)hi << 3) | (lo >> 29));
+    }
+#else
     v = hgMul64(IUNITSCALAR_ONE - factor, s0);
     v = hgMadd64(v, factor, s1);
     result = hgLsl64h_0_31(v, 3);
+#endif
     if (hgInRange32(result, 0, IUNITSCALAR_ONE) == 0)
         imAssert("hgInRange32(result, 0, IUNITSCALAR_ONE)", "IUnitScalar.c", 42);
     return result;

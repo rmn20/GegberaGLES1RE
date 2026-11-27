@@ -96,7 +96,7 @@ static void grVertexCacheTransformSlow(Gerbera_s *state, _grVertex *v, int vtxIn
     (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
 typedef char gr_check_arm_vc_rs_[__builtin_offsetof(Gerbera_s, renderStack) == 5240 ? 1 : -1];
 typedef char gr_check_arm_vc_vc_[__builtin_offsetof(Gerbera_s, vertexCache) == 5248 ? 1 : -1];
-typedef char gr_check_arm_vc_tv_[__builtin_offsetof(Gerbera_s, transformVertexFast) == 8528 ? 1 : -1];
+typedef char gr_check_arm_vc_tv_[__builtin_offsetof(Gerbera_s, transformVertexFast) == 8016 ? 1 : -1];
 typedef char gr_check_arm_vc_bm_[__builtin_offsetof(_grVertexCache, batchLockMask) == 0 ? 1 : -1];
 typedef char gr_check_arm_vc_fs_[__builtin_offsetof(_grVertexCache, totalFreeSlots) == 8 ? 1 : -1];
 typedef char gr_check_arm_vc_ci_[__builtin_offsetof(_grVertexCache, cacheIndices) == 40 ? 1 : -1];
@@ -109,124 +109,111 @@ __attribute__((naked)) int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
     (void)state;
     (void)vtxIndex;
     __asm__ volatile(
-        "add   r2, r0, #4096\n\t"
-        "eor   ip, r1, r1, asr #3\n\t"
-        "ldr   r3, [r2, #1152]\n\t"
-        "ldr   r2, [r2, #1144]\n\t"
-        "eor   ip, ip, r1, asr #5\n\t"
-        "and   ip, ip, #31\n\t"
-        "add   r2, r2, #1328\n\t"
-        "add   r3, r3, ip, lsl #2\n\t"
-        "add   r2, r2, #4\n\t"
-        "ldr   r3, [r3, #40]\n\t"
+        "stmfd sp!, {r4, r5, r6, r7, lr}\n\t"
+        "add   ip, r0, #4096\n\t"
+        "eor   r7, r1, r1, asr #3\n\t"
+        "ldr   r4, [ip, #1152]\n\t"
+        "ldr   r6, [ip, #1144]\n\t"
+        "eor   r7, r7, r1, asr #5\n\t"
+        "and   ip, r7, #31\n\t"
+        "add   r6, r6, #1328\n\t"
+        "add   r5, r4, ip, lsl #2\n\t"
+        "add   r6, r6, #4\n\t"
+        "ldr   r3, [r5, #40]\n\t"
         "and   ip, r3, #255\n\t"
-        "ldr   ip, [r2, ip, lsl #7]\n\t"
+        "ldr   ip, [r6, ip, lsl #7]\n\t"
         "cmp   r1, ip\n\t"
         "beq   3f\n\t"
+#if __ARM_ARCH >= 6
+        "uxtb  ip, r3, ror #8\n\t"
+#else
         "mov   ip, r3, lsr #8\n\t"
         "and   ip, ip, #255\n\t"
-        "ldr   ip, [r2, ip, lsl #7]\n\t"
+#endif
+        "ldr   ip, [r6, ip, lsl #7]\n\t"
         "cmp   r1, ip\n\t"
         "moveq r3, r3, ror #8\n\t"
         "beq   2f\n\t"
+#if __ARM_ARCH >= 6
+        "uxtb  ip, r3, ror #16\n\t"
+#else
         "mov   ip, r3, lsr #16\n\t"
         "and   ip, ip, #255\n\t"
-        "ldr   ip, [r2, ip, lsl #7]\n\t"
+#endif
+        "ldr   ip, [r6, ip, lsl #7]\n\t"
         "cmp   r1, ip\n\t"
         "moveq r3, r3, ror #16\n\t"
         "beq   2f\n\t"
         "mov   ip, r3, lsr #24\n\t"
-        "ldr   ip, [r2, ip, lsl #7]\n\t"
+        "ldr   ip, [r6, ip, lsl #7]\n\t"
         "cmp   r1, ip\n\t"
         "bne   1f\n\t"
         "mov   r3, r3, ror #24\n\t"
         "2:\n\t"
-        "add   r2, r0, #4096\n\t"
-        "eor   ip, r1, r1, asr #3\n\t"
-        "ldr   r2, [r2, #1152]\n\t"
-        "eor   ip, ip, r1, asr #5\n\t"
-        "and   ip, ip, #31\n\t"
-        "add   ip, r2, ip, lsl #2\n\t"
-        "str   r3, [ip, #40]\n\t"
-        "b     4f\n\t"
+        "str   r3, [r5, #40]\n\t"
         "3:\n\t"
-        "add   r2, r0, #4096\n\t"
-        "ldr   r2, [r2, #1152]\n\t"
-        "4:\n\t"
         "and   r0, r3, #255\n\t"
         "and   r1, r0, #32\n\t"
         "and   r3, r0, #31\n\t"
         "mov   ip, #1\n\t"
         "mov   ip, ip, lsl r3\n\t"
-        "ldr   r3, [r2, r1, lsr #3]\n\t"
+        "ldr   r3, [r4, r1, lsr #3]\n\t"
         "tst   r3, ip\n\t"
-        "bxne  lr\n\t"
+        "ldmnefd sp!, {r4, r5, r6, r7, pc}\n\t"
         "orr   r3, r3, ip\n\t"
-        "str   r3, [r2, r1, lsr #3]\n\t"
-        "ldr   r3, [r2, #8]\n\t"
+        "str   r3, [r4, r1, lsr #3]\n\t"
+        "ldr   r3, [r4, #8]\n\t"
         "sub   r3, r3, #1\n\t"
-        "str   r3, [r2, #8]\n\t"
-        "bx    lr\n\t"
+        "str   r3, [r4, #8]\n\t"
+        "ldmfd sp!, {r4, r5, r6, r7, pc}\n\t"
         "1:\n\t"
-        "stmfd sp!, {r4, r5, r6, r7, r8, lr}\n\t"
-        "add   ip, r0, #4096\n\t"
-        "eor   r5, r1, r1, asr #3\n\t"
-        "ldr   r4, [ip, #1152]\n\t"
-        "eor   r5, r5, r1, asr #5\n\t"
-        "and   r6, r5, #63\n\t"
-        "and   r5, r5, #31\n\t"
-        "and   ip, r6, #32\n\t"
-        "mov   ip, ip, lsr #3\n\t"
-        "ldr   lr, [r4, ip]\n\t"
-        "mov   r7, #1\n\t"
-        "mov   r7, r7, lsl r5\n\t"
-        "tst   lr, r7\n\t"
+        "and   r7, r7, #63\n\t"
+        "and   r2, r7, #31\n\t"
+        "mov   ip, #1\n\t"
+        "mov   ip, ip, lsl r2\n\t"
+        "and   r2, r7, #32\n\t"
+        "add   r2, r4, r2, lsr #3\n\t"
+        "ldr   lr, [r2]\n\t"
+        "tst   lr, ip\n\t"
         "bne   11f\n\t"
-        "orr   lr, lr, r7\n\t"
-        "str   lr, [r4, ip]\n\t"
+        "orr   lr, lr, ip\n\t"
+        "str   lr, [r2]\n\t"
         "12:\n\t"
-        "ldr   r7, [r4, #8]\n\t"
-        "orr   r3, r6, r3, lsl #8\n\t"
-        "add   r5, r4, r5, lsl #2\n\t"
-        "sub   r7, r7, #1\n\t"
+        "ldr   r2, [r4, #8]\n\t"
+        "orr   r3, r7, r3, lsl #8\n\t"
+        "sub   r2, r2, #1\n\t"
         "str   r3, [r5, #40]\n\t"
-        "str   r7, [r4, #8]\n\t"
-        "add   r5, r2, r6, lsl #7\n\t"
+        "str   r2, [r4, #8]\n\t"
+        "add   r5, r6, r7, lsl #7\n\t"
         "mov   ip, #0\n\t"
         "str   r1, [r5, #0]\n\t"
-        "mov   r2, r1\n\t"
         "mov   r1, r5\n\t"
         "strh  ip, [r5, #4]\n\t"
-        "add   ip, r0, #8192\n\t"
-        "ldr   r3, [ip, #336]\n\t"
+        "add   ip, r0, #4096\n\t"
+        "ldr   r3, [ip, #3920]\n\t"
         "cmp   r3, #0\n\t"
         "beq   13f\n\t"
         "blx   r3\n\t"
-        "mov   r0, r6\n\t"
-        "ldmfd sp!, {r4, r5, r6, r7, r8, pc}\n\t"
+        "mov   r0, r7\n\t"
+        "ldmfd sp!, {r4, r5, r6, r7, pc}\n\t"
         "13:\n\t"
+        "ldr   r2, [r1, #0]\n\t"
         "bl    grVertexCacheTransformSlow_asm\n\t"
-        "mov   r0, r6\n\t"
-        "ldmfd sp!, {r4, r5, r6, r7, r8, pc}\n\t"
+        "mov   r0, r7\n\t"
+        "ldmfd sp!, {r4, r5, r6, r7, pc}\n\t"
         "11:\n\t"
-        "ldr   r7, [r4, #4]\n\t"
-        "mvn   r7, r7\n\t"
-        "cmp   r7, #0\n\t"
-        "ldreq r7, [r4, #0]\n\t"
-        "mvneq r7, r7\n\t"
-        "moveq lr, #32\n\t"
-        "movne lr, #0\n\t"
-        "clz   r7, r7\n\t"
-        "add   r7, r7, lr\n\t"
-        "rsb   r6, r7, #63\n\t"
-        "and   ip, r6, #32\n\t"
-        "and   lr, r6, #31\n\t"
-        "mov   ip, ip, lsr #3\n\t"
-        "ldr   r7, [r4, ip]\n\t"
-        "mov   r8, #1\n\t"
-        "mov   r8, r8, lsl lr\n\t"
-        "orr   r7, r7, r8\n\t"
-        "str   r7, [r4, ip]\n\t"
+        "ldr   lr, [r4, #4]\n\t"
+        "mov   ip, #0x80000000\n\t"
+        "mvns  r2, lr\n\t"
+        "moveq r7, #0\n\t"
+        "ldreq lr, [r4, #0]\n\t"
+        "mvneq r2, lr\n\t"
+        "movne r7, #4\n\t"
+        "clz   r2, r2\n\t"
+        "orr   lr, lr, ip, lsr r2\n\t"
+        "str   lr, [r4, r7]\n\t"
+        "rsb   r2, r2, #31\n\t"
+        "orr   r7, r2, r7, lsl #3\n\t"
         "b     12b\n\t");
 }
 #else
@@ -584,6 +571,8 @@ static inline int grApi_stp(const _IVector4 *pA, const _IVector4 *pB, const _IVe
     return r;
 }
 
+#define grApi_stp_v(v0, v1, v2) grApi_stp(&(v0)->clipPosition, &(v1)->clipPosition, &(v2)->clipPosition)
+
 void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
 {
     _grVertexCache *cache;
@@ -617,7 +606,6 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
     cache->prevCacheIndices[0] = ci0;
     cache->prevCacheIndices[1] = ci1;
     cache->prevCacheIndices[2] = ci2;
-    packed = grSetIndices(ci0, ci1, ci2);
     v0 = &vertexBuffer[ci0];
     v1 = &vertexBuffer[ci1];
     v2 = &vertexBuffer[ci2];
@@ -637,11 +625,12 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
     maskAll = cm0 | cm1 | cm2;
     if (grTestCapability(state, GR_CAPABILITY_CULL_FACE) != 0)
     {
-        int stp = grApi_stp(&v0->clipPosition, &v1->clipPosition, &v2->clipPosition);
+        int stp = grApi_stp_v(v0, v1, v2);
 
-        if (stp != 0 && (unsigned int)stp >> 31 == state->cullNegative)
+        if ((unsigned int)(stp + 94) > 187u && (unsigned int)stp >> 31 == state->cullNegative)
             return;
     }
+    packed = grSetIndices(ci0, ci1, ci2);
     if ((maskAll & 0xFC3Fu) != 0)
     {
         int idx = *queueIndexPtr;
@@ -664,22 +653,29 @@ void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
     x0 = v0->screenPosition[0];
     x1 = v1->screenPosition[0];
     x2 = v2->screenPosition[0];
+    {
+        int sx0 = sc->x0, sx1 = sc->x1;
+        if (hgSignBit32(((grSubpixelTrunc(x0) - sx0) &
+                         (grSubpixelTrunc(x1) - sx0) &
+                         (grSubpixelTrunc(x2) - sx0)) |
+                        ((sx1 - grSubpixelTrunc(x0)) &
+                         (sx1 - grSubpixelTrunc(x1)) &
+                         (sx1 - grSubpixelTrunc(x2)))) != 0)
+            return;
+    }
     y0 = v0->screenPosition[1];
     y1 = v1->screenPosition[1];
     y2 = v2->screenPosition[1];
-    if (hgSignBit32(((grSubpixelTrunc(x0) - sc->x0) &
-                     (grSubpixelTrunc(x1) - sc->x0) &
-                     (grSubpixelTrunc(x2) - sc->x0)) |
-                    ((sc->x1 - grSubpixelTrunc(x0)) &
-                     (sc->x1 - grSubpixelTrunc(x1)) &
-                     (sc->x1 - grSubpixelTrunc(x2))) |
-                    ((grSubpixelTrunc(y0) - sc->y0) &
-                     (grSubpixelTrunc(y1) - sc->y0) &
-                     (grSubpixelTrunc(y2) - sc->y0)) |
-                    ((sc->y1 - grSubpixelTrunc(y0)) &
-                     (sc->y1 - grSubpixelTrunc(y1)) &
-                     (sc->y1 - grSubpixelTrunc(y2)))) != 0)
-        return;
+    {
+        int sy0 = sc->y0, sy1 = sc->y1;
+        if (hgSignBit32(((grSubpixelTrunc(y0) - sy0) &
+                         (grSubpixelTrunc(y1) - sy0) &
+                         (grSubpixelTrunc(y2) - sy0)) |
+                        ((sy1 - grSubpixelTrunc(y0)) &
+                         (sy1 - grSubpixelTrunc(y1)) &
+                         (sy1 - grSubpixelTrunc(y2)))) != 0)
+            return;
+    }
 
     area = hgMadd64(hgMul64(x1 - x0, y2 - y0), y1 - y0, x0 - x2);
     if (hgIsZero64(area) == 0)
@@ -852,6 +848,28 @@ void grFlushPrimitiveBatch(Gerbera_s *state)
     }
     if (state->primitiveType == GR_PRIMITIVETYPE_TRIANGLE)
     {
+#if GERBERA_ARMV6_JIT
+        if (state->capabilities[GR_CAPABILITY_DEPTH_TEST] &&
+            !state->capabilities[GR_CAPABILITY_STENCIL_TEST] &&
+            !(state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_FILL] |
+              state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_LINE] |
+              state->capabilities[GR_CAPABILITY_DEPTH_OFFSET_POINT]) &&
+            state->viewportScale.normal[2] != 0 &&
+            ((unsigned int)state->activeGradientMask & 1u) &&
+            state->drawSurface.depthBytes == 2 &&
+            state->drawSurface.buffers[1].data != NULL &&
+            state->drawSurface.buffers[1].stride > 0 &&
+            ((((uintptr_t)state->drawSurface.buffers[1].data |
+               (unsigned int)state->drawSurface.buffers[1].stride) & 1u) == 0) &&
+            ((state->depthFunc & ~2) == GR_FUNC_LESS))
+        {
+            state->fastDepthReject = (unsigned char)(state->depthFunc == GR_FUNC_LESS ? 2 : 1);
+        }
+        else
+        {
+            state->fastDepthReject = 0;
+        }
+#endif
         for (dispatch = queue; dispatch < queueEnd; )
         {
             _grClipTriangle tri;
@@ -869,6 +887,9 @@ void grFlushPrimitiveBatch(Gerbera_s *state)
             else
                 grrDrawClippedTriangle(state, &tri, cmd0);
         }
+#if GERBERA_ARMV6_JIT
+        state->fastDepthReject = 0;
+#endif
     }
     else
     {

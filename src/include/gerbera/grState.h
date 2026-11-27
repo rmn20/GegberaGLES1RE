@@ -25,7 +25,7 @@ HG_EXTERN_C_BEGIN
 #define GR_MAX_LIGHTS 8
 #define GR_MAX_USER_CLIP_PLANES 6
 #define GR_MAX_DISPLAY_DIMENSION 2048
-#define GR_EDGE_SLOPE_CACHE_SIZE 64
+#define GR_EDGE_SLOPE_CACHE_SIZE 256
 #define GR_MAX_VIEWPORT_DIMENSION 2048
 #define GR_CLEAR_BUFFER_SIZE 4
 #if GERBERA_ARMV6_JIT
@@ -1047,6 +1047,7 @@ struct Gerbera_s
     unsigned char cullNegative;
     unsigned char lightingSideMask;
     unsigned char constWhiteModulate;
+    unsigned char fastDepthReject;
 
     /* --- global ambient -------------------------------------------------------- */
     _XColor3 ambientColor;
@@ -1062,17 +1063,17 @@ struct Gerbera_s
                                      * (grUpdateLights) */
     int baseColorDirty;
     void *surfaceTlsState;         /* eglState_s borrowed for the active draw call */
-    struct
-    {
-        unsigned int divisor;     /* zero marks an unused entry */
-        unsigned int reciprocal;
-    } edgeSlopeCache[GR_EDGE_SLOPE_CACHE_SIZE];
     _IFVertexTransformPlan floatTransformPlan[2];
     unsigned int floatTransformRecent;
     unsigned int floatTransformMisses;
     _ICommonVertexTransform commonTransform;
     unsigned int pixelTextureLayout; /* dimensions and wrap modes of specialized code */
     void (*transformVertexFast)(struct Gerbera_s *state, _grVertex *vertex);
+    struct
+    {
+        unsigned int divisor;     /* zero marks an unused entry */
+        unsigned int reciprocal;
+    } edgeSlopeCache[GR_EDGE_SLOPE_CACHE_SIZE];
 };
 
 void (*grSelectFastVertexTransform(Gerbera_s *state))(Gerbera_s *state, _grVertex *vertex);
@@ -1250,9 +1251,13 @@ void grRenderArrays(Gerbera_s *state, int primitiveType, int vertexCount, int ba
 void grSetupGradient(const _grGradientInfo *info, int gradient, int g01, int g02,
                      int reference);
 void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02);
-int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
+int  grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
                                     int flatShadeIndex, unsigned int gradientMask,
                                     int rejectDepth);
+int  grSetupTriangleGradientsVisibleVerts(Gerbera_s *state, _grClipTriangle *tri,
+                                         _grVertex *v0, _grVertex *v1, _grVertex *v2,
+                                         int flatShadeIndex, unsigned int gradientMask,
+                                         int rejectDepth);
 void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
                               int flatShadeIndex, unsigned int gradientMask);
 void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*pairs)[2],
@@ -1283,6 +1288,8 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
 void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                            unsigned int origIndices, int emptyBits);
 int grDepthSpansOccluded(const _grPixelPipe *pipe, int strictLess);
+int grDepthSpansOccludedFast(const _grPixelPipe *pipe, int strictLess);
+int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsigned int reference);
 void grExecutePixelPipeline(Gerbera_s *state);
 void grICacheFlush(void *start, unsigned int numBytes);
 int grIsStencilMaskFull(Gerbera_s *state, unsigned int stencilMask);

@@ -31,19 +31,17 @@ int grSubpixelTrunc(int i);   /* grClipper.c (grUtil.h; DLL 004214A0) */
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3,no-ipa-sra")))
 #endif
-void grSetupGradient(const _grGradientInfo *info, int gradient, int g01, int g02,
+void grSetupGradient(const _grGradientInfo * restrict info, int gradient, int g01, int g02,
                      int reference)
 {
+    _grPixelPipe * restrict pPP = info->pPP;
     int xAdd32 = 0;
     int yAdd32 = 0;
-
-    _grPixelPipe *pPP;
 
     if (hgInRange32(info->shift, 0, 31) == 0)
         imAssert("hgInRange32(info->shift, 0, 31)", "grRasterizer.inl", 500);
     if (info == NULL)
         imAssert("info", "grRasterizer.inl", 501);
-    pPP = info->pPP;
     if (g01 != 0 || g02 != 0)   /* __PAIR64__(g02, g01) != 0 */
     {
         HGint64 xRaw = hgMadd64(hgMul64(info->v01syPerArea, g02), info->v02syPerArea,
@@ -161,8 +159,9 @@ void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3")))
 #endif
-int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
-                              int flatShadeIndex, unsigned int gradientMask, int rejectDepth)
+int grSetupTriangleGradientsVisibleVerts(Gerbera_s *state, _grClipTriangle *tri,
+                                         _grVertex *v0, _grVertex *v1, _grVertex *v2,
+                                         int flatShadeIndex, unsigned int gradientMask, int rejectDepth)
 {
     int ok = 1;
 
@@ -182,9 +181,6 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
     {
         _grPixelPipe *pixelPipe = GR_PIXEL_PIPE(state);
         _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
-        _grVertex *v0 = vertexBuffer + grUnpackIndex(tri->indices, 0);
-        _grVertex *v1 = vertexBuffer + grUnpackIndex(tri->indices, 1);
-        _grVertex *v2 = vertexBuffer + grUnpackIndex(tri->indices, 2);
         HGint64 reciprocal;
         int recipShift;
         int signedRecip;
@@ -245,17 +241,13 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
             if (grIsDepthOffsetEnabled(state, state->primitiveType) != 0)
                 grComputeDepthOffset(state);
         }
-        /* Test the exact depth plane before preparing shading attributes.
-         * References remain relative to the origin for the draw's row advance. */
+        /* Test the exact depth plane before preparing shading attributes. */
         if (rejectDepth && (gradientMask & (1u << GR_GRADIENT_DEPTH)))
         {
-            int reference = pixelPipe->reference[GR_GRADIENT_DEPTH];
-            int hidden;
-            pixelPipe->reference[GR_GRADIENT_DEPTH] = (int)((unsigned int)reference +
-                (unsigned int)pixelPipe->yAdder[GR_GRADIENT_DEPTH] * (unsigned int)pixelPipe->yStart);
-            hidden = grDepthSpansOccluded(pixelPipe, state->depthFunc == GR_FUNC_LESS);
-            pixelPipe->reference[GR_GRADIENT_DEPTH] = reference;
-            if (hidden) return 0;
+            unsigned int depthRef = (unsigned int)pixelPipe->reference[GR_GRADIENT_DEPTH] +
+                (unsigned int)pixelPipe->yAdder[GR_GRADIENT_DEPTH] * (unsigned int)pixelPipe->yStart;
+            if (grDepthSpansOccludedFastRef(pixelPipe, rejectDepth >> 1, depthRef))
+                return 0;
         }
 
         /* texcoord gradients (texIndex 1..0) */
@@ -447,6 +439,16 @@ int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
     return 1;
 }
 
+int grSetupTriangleGradientsVisible(Gerbera_s *state, _grClipTriangle *tri,
+                                    int flatShadeIndex, unsigned int gradientMask, int rejectDepth)
+{
+    _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
+    _grVertex *v0 = vertexBuffer + grUnpackIndex(tri->indices, 0);
+    _grVertex *v1 = vertexBuffer + grUnpackIndex(tri->indices, 1);
+    _grVertex *v2 = vertexBuffer + grUnpackIndex(tri->indices, 2);
+    return grSetupTriangleGradientsVisibleVerts(state, tri, v0, v1, v2, flatShadeIndex, gradientMask, rejectDepth);
+}
+
 void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
                               int flatShadeIndex, unsigned int gradientMask)
 {
@@ -497,7 +499,7 @@ static inline int grDivideEdgeSlopeCached(Gerbera_s *state, int numerator, int d
     if (denominator == 1)
         return numerator;
     divisor = (unsigned int)denominator;
-    slot = (divisor ^ (divisor >> 6)) & (GR_EDGE_SLOPE_CACHE_SIZE - 1u);
+    slot = (divisor ^ (divisor >> 8)) & (GR_EDGE_SLOPE_CACHE_SIZE - 1u);
     reciprocal = state->edgeSlopeCache[slot].reciprocal;
     if (state->edgeSlopeCache[slot].divisor != divisor)
     {

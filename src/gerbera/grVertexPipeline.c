@@ -479,32 +479,38 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
     (void)state;
     (void)vertexList;
     __asm__ __volatile__(
-        "stmfd sp!, {r4-r11, ip, lr}\n\t"
-        "sub   sp, sp, #40\n\t"
-        "mov   r6, r0\n\t"
-        "mov   r4, r1\n\t"
-        "add   ip, r6, #4096\n\t"
-        "ldr   r5, [ip, #1144]\n\t"
-        "ldr   r0, [ip, #1308]\n\t"
-        "ldr   r1, [ip, #1316]\n\t"
-        "ldr   r2, [r6, #1256]\n\t"
-        "ldr   r3, [r6, #1272]\n\t"
-        "ldr   r7, [ip, #1856]\n\t"
-        "ldr   r8, [ip, #1860]\n\t"
-        "mov   r3, r3, asr #3\n\t"
+        "stmfd sp!, {r4-r11, lr}\n\t"
+        "sub   sp, sp, #44\n\t"
+        "str   r0, [sp, #40]\n\t"       /* [sp+40] = state (for rare slow path) */
+        "mov   r4, r1\n\t"              /* r4 = vertexList */
+        "add   ip, r0, #4096\n\t"
+        "ldr   r5, [ip, #1144]\n\t"     /* renderStack */
+        "ldr   r6, [ip, #1308]\n\t"     /* r6 = stride */
+        "ldr   r7, [ip, #1316]\n\t"     /* r7 = data */
+        "add   r1, r0, #1024\n\t"
+        "add   r1, r1, #232\n\t"
+        "ldmia r1, {r2, r3, r8, r9, r10}\n\t" /* exps, m0, m1, m2, m3 */
+        "ldr   r0, [ip, #1856]\n\t"     /* fogEnd */
+        "ldr   r1, [ip, #1860]\n\t"     /* fogOORange */
+        "mov   r10, r10, asr #3\n\t"    /* m3_shr3 */
         "add   r5, r5, #1328\n\t"
-        "mov   r9, r7, lsl #9\n\t"
+        "add   r5, r5, #4\n\t"          /* r5 = vertexBuffer */
+        "str   r3, [sp, #0]\n\t"        /* [sp+0] = m0 */
+        "str   r8, [sp, #4]\n\t"        /* [sp+4] = m1 */
+        "str   r9, [sp, #8]\n\t"        /* [sp+8] = m2 */
+        "str   r2, [sp, #12]\n\t"       /* [sp+12] = exps */
+        "str   r10, [sp, #16]\n\t"      /* [sp+16] = m3_shr3 */
+        "mov   r9, r0, lsl #9\n\t"
         "mov   r9, r9, lsr #2\n\t"
-        "orr   r9, r9, #0x40000000\n\t"
-        "mov   r10, r8, lsl #8\n\t"
-        "orr   r10, r10, #0x80000000\n\t"
-        "mov   r11, r8, lsr #23\n\t"
-        "mov   ip, r7, lsr #23\n\t"
-        "add   r5, r5, #4\n\t"
-        "stmia sp, {r0, r1, r2, r3, r7, ip}\n\t"
-        "add   r0, sp, #24\n\t"
-        "stmia r0, {r9, r10, r11}\n\t"
-        "str   r8, [sp, #36]\n\t"
+        "orr   r9, r9, #0x40000000\n\t" /* fogEndMant */
+        "mov   r10, r1, lsl #8\n\t"
+        "orr   r10, r10, #0x80000000\n\t" /* fogOORangeMant */
+        "mov   r8, r0, lsr #23\n\t"     /* fogEndExp */
+        "rsb   r11, r8, #268\n\t"
+        "sub   r11, r11, r1, lsr #23\n\t" /* kFog = 268 - fogEndExp - fogOORangeExp */
+        "add   ip, sp, #20\n\t"
+        "stmia ip, {r0, r9, r10, r11}\n\t"
+        "str   r1, [sp, #36]\n\t"       /* fogOORange */
         "ldrb  r0, [r4], #1\n\t"
         "add   r9, r5, r0, lsl #7\n\t"
 
@@ -512,148 +518,138 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
         "ldrh  r0, [r9, #4]\n\t"
         "movs  r0, r0, lsr #14\n\t"
         "bne   8f\n\t"
-        "ldmia sp, {r7, r8}\n\t"
         "ldr   r0, [r9, #0]\n\t"
-        "mla   r3, r7, r0, r8\n\t"
-        "ldmia r3, {r0, r1, r2}\n\t"
+        "mla   r3, r6, r0, r7\n\t"
+        "ldmia r3, {r0, r1, r2}\n\t"    /* r0=x, r1=y, r2=z (kept live!) */
         "mov   ip, #255\n\t"
         "and   r10, ip, r0, lsr #23\n\t"
-        "cmp   r10, #255\n\t"
-        "andne r11, ip, r1, lsr #23\n\t"
-        "cmpne r11, #255\n\t"
-        "andne lr,  ip, r2, lsr #23\n\t"
-        "cmpne lr,  #255\n\t"
-        "beq   8f\n\t"
+        "and   r11, ip, r1, lsr #23\n\t"
+        "and   lr,  ip, r2, lsr #23\n\t"
+        "sub   r3, r10, #1\n\t"
+        "cmp   r3, #254\n\t"
+        "sublo r3, r11, #1\n\t"
+        "cmplo r3, #254\n\t"
+        "sublo r3, lr, #1\n\t"
+        "cmplo r3, #254\n\t"
+        "bhs   12f\n\t"
 
-        "ldr   ip, [sp, #8]\n\t"
-        "and   r0, ip, #255\n\t"
-        "cmp   r10, #0\n\t"
-        "cmpne r0, #0\n\t"
-        "addne r10, r10, r0\n\t"
-        "moveq r10, #0\n\t"
-        "and   r0, ip, #0xFF00\n\t"
-        "movs  r0, r0, lsr #8\n\t"
-        "cmpne r11, #0\n\t"
-        "addne r11, r11, r0\n\t"
-        "moveq r11, #0\n\t"
-        "mov   r0, ip, lsr #16\n\t"
-        "ands  r0, r0, #255\n\t"
-        "cmpne lr, #0\n\t"
-        "addne lr, lr, r0\n\t"
-        "moveq lr, #0\n\t"
-        "movs  ip, ip, lsr #24\n\t"
-        "addne ip, ip, #127\n\t"
-        "mov   r2, ip\n\t"
-        "cmp   r2, r10\n\t"
-        "movlt r2, r10\n\t"
-        "cmp   r2, r11\n\t"
-        "movlt r2, r11\n\t"
-        "cmp   r2, lr\n\t"
-        "movlt r2, lr\n\t"
+        "ldr   r8, [sp, #12]\n\t"       /* exps (ea0, ea1, ea2 non-zero) */
+        "and   r3, r8, #255\n\t"
+        "add   r10, r10, r3\n\t"
+#if defined(__ARM_ARCH) && __ARM_ARCH >= 6
+        "uxtb  r3, r8, ror #8\n\t"
+        "add   r11, r11, r3\n\t"
+        "uxtb  r3, r8, ror #16\n\t"
+        "add   lr,  lr,  r3\n\t"
+#else
+        "and   r3, r8, #0xFF00\n\t"
+        "add   r11, r11, r3, lsr #8\n\t"
+        "mov   r3, r8, lsr #16\n\t"
+        "and   r3, r3, #255\n\t"
+        "add   lr,  lr,  r3\n\t"
+#endif
+        "movs  r8, r8, lsr #24\n\t"
+        "addne r8, r8, #127\n\t"        /* ea3 */
+        "mov   ip, r8\n\t"
+        "cmp   ip, r10\n\t"
+        "movlt ip, r10\n\t"
+        "cmp   ip, r11\n\t"
+        "movlt ip, r11\n\t"
+        "cmp   ip, lr\n\t"
+        "movlt ip, lr\n\t"              /* ip = maxExp */
+        "orr   r11, r11, lr, lsl #16\n\t" /* r11 = eY | (eZ << 16); lr free */
 
-        "ldr   r1, [sp, #12]\n\t"
-        "sub   ip, r2, ip\n\t"
-        "cmp   ip, #31\n\t"
-        "movgt ip, #31\n\t"
-        "mov   r1, r1, asr ip\n\t"
+        "ldr   r3, [sp, #16]\n\t"       /* m3_shr3 */
+        "sub   r8, ip, r8\n\t"
+        "cmp   r8, #31\n\t"
+        "movgt r8, #31\n\t"
+        "mov   r3, r3, asr r8\n\t"      /* r3 = sum */
 
-        "cmp   r10, #0\n\t"
-        "beq   2f\n\t"
-        "sub   r10, r2, r10\n\t"
+        "sub   r10, ip, r10\n\t"
         "cmp   r10, #31\n\t"
         "movgt r10, #31\n\t"
-        "ldr   r7, [r3, #0]\n\t"
-        "ldr   r8, [r6, #1260]\n\t"
-        "orr   r0, r7, #0x00800000\n\t"
+        "ldr   r8, [sp, #0]\n\t"        /* m0 */
+        "cmp   r0, #0\n\t"
+        "orr   r0, r0, #0x00800000\n\t"
         "mov   r0, r0, lsl #8\n\t"
         "mov   r0, r0, lsr #2\n\t"
-        "cmp   r7, #0\n\t"
         "rsbmi r0, r0, #0\n\t"
-        "smull r7, ip, r8, r0\n\t"
-        "add   r1, r1, ip, asr r10\n\t"
-    "2:\n\t"
-        "cmp   r11, #0\n\t"
-        "beq   3f\n\t"
-        "sub   r11, r2, r11\n\t"
-        "cmp   r11, #31\n\t"
-        "movgt r11, #31\n\t"
-        "ldr   r7, [r3, #4]\n\t"
-        "ldr   r8, [r6, #1264]\n\t"
-        "orr   r0, r7, #0x00800000\n\t"
-        "mov   r0, r0, lsl #8\n\t"
-        "mov   r0, r0, lsr #2\n\t"
-        "cmp   r7, #0\n\t"
-        "rsbmi r0, r0, #0\n\t"
-        "smull r7, ip, r8, r0\n\t"
-        "add   r1, r1, ip, asr r11\n\t"
-    "3:\n\t"
-        "cmp   lr, #0\n\t"
-        "beq   4f\n\t"
-        "sub   lr, r2, lr\n\t"
+        "smull lr, r0, r8, r0\n\t"
+        "add   r3, r3, r0, asr r10\n\t"
+
+        "mov   r0, r11, lsl #16\n\t"
+        "sub   r0, ip, r0, lsr #16\n\t"
+        "cmp   r0, #31\n\t"
+        "movgt r0, #31\n\t"
+        "ldr   r8, [sp, #4]\n\t"        /* m1 */
+        "cmp   r1, #0\n\t"
+        "orr   r1, r1, #0x00800000\n\t"
+        "mov   r1, r1, lsl #8\n\t"
+        "mov   r1, r1, lsr #2\n\t"
+        "rsbmi r1, r1, #0\n\t"
+        "smull lr, r1, r8, r1\n\t"
+        "add   r3, r3, r1, asr r0\n\t"
+
+        "mov   lr, r11, lsr #16\n\t"
+        "sub   lr, ip, lr\n\t"
         "cmp   lr, #31\n\t"
         "movgt lr, #31\n\t"
-        "ldr   r7, [r3, #8]\n\t"
-        "ldr   r8, [r6, #1268]\n\t"
-        "orr   r0, r7, #0x00800000\n\t"
-        "mov   r0, r0, lsl #8\n\t"
-        "mov   r0, r0, lsr #2\n\t"
-        "cmp   r7, #0\n\t"
-        "rsbmi r0, r0, #0\n\t"
-        "smull r7, ip, r8, r0\n\t"
-        "add   r1, r1, ip, asr lr\n\t"
-    "4:\n\t"
-        "cmp   r1, #0\n\t"
-        "beq   7f\n\t"
-        "rsblt r1, r1, #0\n\t"
-        "clz   r3, r1\n\t"
-        "sub   r3, r3, #1\n\t"
-        "sub   r2, r2, r3\n\t"
-        "sub   r2, r2, #124\n\t"
+        "ldr   r8, [sp, #8]\n\t"        /* m2 */
         "cmp   r2, #0\n\t"
-        "ble   7f\n\t"
-        "cmp   r2, #254\n\t"
-        "bgt   6f\n\t"
+        "orr   r2, r2, #0x00800000\n\t"
+        "mov   r2, r2, lsl #8\n\t"
+        "mov   r2, r2, lsr #2\n\t"
+        "rsbmi r2, r2, #0\n\t"
+        "smull r10, r2, r8, r2\n\t"
+        "add   r3, r3, r2, asr lr\n\t"
+    "4:\n\t"
         "cmp   r3, #0\n\t"
-        "movge r1, r1, lsl r3\n\t"
-        "movge r1, r1, lsr #1\n\t"
-        "movlt r1, r1, lsr #2\n\t"
-        "mov   r0, r1, lsl #3\n\t"
+        "beq   7f\n\t"
+        "rsblt r3, r3, #0\n\t"
+        "clz   r1, r3\n\t"
+        "sub   r1, r1, #1\n\t"
+        "sub   ip, ip, r1\n\t"
+        "sub   ip, ip, #124\n\t"
+        "cmp   ip, #0\n\t"
+        "ble   7f\n\t"
+        "cmp   ip, #254\n\t"
+        "bgt   6f\n\t"
+        "cmp   r1, #0\n\t"
+        "movge r3, r3, lsl r1\n\t"
+        "movlt r3, r3, lsr #1\n\t"
+        "mov   r0, r3, lsl #2\n\t"
         "mov   r0, r0, lsr #9\n\t"
-        "orr   r0, r0, r2, lsl #23\n\t"
-        "ldr   r10, [sp, #16]\n\t"
+        "orr   r0, r0, ip, lsl #23\n\t"
+        "ldr   r10, [sp, #20]\n\t"      /* fogEnd */
         "cmp   r0, r10\n\t"
         "bhs   6f\n\t"
 
-        "ldr   r0, [sp, #20]\n\t"
-        "sub   r3, r0, r2\n\t"
-        "cmp   r3, #31\n\t"
-        "movhi r3, #31\n\t"
-        "mov   r1, r1, lsl #1\n\t"
-        "bic   r1, r1, #0x7F\n\t"
-        "mov   r11, r1, lsr r3\n\t"
-        "cmp   r1, r11, lsl r3\n\t"
+        "mov   r0, r10, lsr #23\n\t"    /* fogEndExp */
+        "sub   r1, r0, ip\n\t"
+        "cmp   r1, #31\n\t"
+        "movhi r1, #31\n\t"
+        "bic   r3, r3, #0x7F\n\t"
+        "mov   r11, r3, lsr r1\n\t"
+        "cmp   r3, r11, lsl r1\n\t"
         "addne r11, r11, #1\n\t"
-        "add   ip, sp, #24\n\t"
-        "ldmia ip, {r7, r8, r10}\n\t"
-        "sub   r1, r7, r11\n\t"
-        "clz   r2, r1\n\t"
-        "sub   r2, r2, #1\n\t"
-        "subs  r0, r0, r2\n\t"
+        "add   r2, sp, #24\n\t"
+        "ldmia r2, {r8, r10, lr}\n\t"   /* fogEndMant, fogOORangeMant, kFog */
+        "sub   r3, r8, r11\n\t"
+        "clz   ip, r3\n\t"
+        "sub   ip, ip, #1\n\t"
+        "subs  r0, r0, ip\n\t"
         "ble   6f\n\t"
-        "mov   r1, r1, lsl r2\n\t"
-        "mov   r1, r1, lsl #1\n\t"
-        "bic   r1, r1, #0xFF\n\t"
-        "umull r3, r11, r1, r8\n\t"
-        "add   r0, r0, r10\n\t"
+        "mov   r3, r3, lsl ip\n\t"
+        "mov   r3, r3, lsl #1\n\t"
+        "bic   r3, r3, #0xFF\n\t"
+        "umull r1, r11, r3, r10\n\t"
+        "add   r0, lr, ip\n\t"
         "cmp   r11, #0\n\t"
-        "sublt r0, r0, #126\n\t"
+        "sublt r0, r0, #1\n\t"
         "movlt r11, r11, lsr #1\n\t"
-        "subge r0, r0, #127\n\t"
         "bic   r11, r11, #0x7F\n\t"
-        "rsbs  r0, r0, #141\n\t"
-        "bmi   5f\n\t"
         "cmp   r0, #31\n\t"
-        "bgt   6f\n\t"
+        "bhi   5f\n\t"
         "mov   r11, r11, lsr r0\n\t"
         "movs  r0, r11, lsr #16\n\t"
         "mvn   r11, r11\n\t"
@@ -664,10 +660,13 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
         "cmp   r0, #255\n\t"
         "addne r9, r5, r0, lsl #7\n\t"
         "bne   1b\n\t"
-        "add   sp, sp, #40\n\t"
-        "ldmfd sp!, {r4-r11, ip, pc}\n\t"
+        "add   sp, sp, #44\n\t"
+        "ldmfd sp!, {r4-r11, pc}\n\t"
+
     "5:\n\t"
-        "mov   r0, #0\n\t"
+        "cmp   r0, #0\n\t"
+        "movlt r0, #0\n\t"
+        "mvnge r0, #0\n\t"
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
     "6:\n\t"
@@ -675,17 +674,96 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
     "7:\n\t"
-        "ldr   r0, [sp, #16]\n\t"
+        "ldr   r0, [sp, #20]\n\t"
         "ldr   r1, [sp, #36]\n\t"
         "bl    grApplyFogLINEAR_zeroZ_asm\n\t"
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
     "8:\n\t"
-        "mov   r0, r6\n\t"
+        "ldr   r0, [sp, #40]\n\t"
         "mov   r1, r9\n\t"
         "bl    grApplyFogLINEAR_slow_asm\n\t"
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
+
+    "12:\n\t"
+        "cmp   r10, #255\n\t"
+        "cmpne r11, #255\n\t"
+        "cmpne lr,  #255\n\t"
+        "beq   8b\n\t"
+        "ldr   r8, [sp, #12]\n\t"
+        "and   r3, r8, #255\n\t"
+        "cmp   r10, #0\n\t"
+        "cmpne r3, #0\n\t"
+        "addne r10, r10, r3\n\t"
+        "moveq r10, #0\n\t"
+        "and   r3, r8, #0xFF00\n\t"
+        "movs  r3, r3, lsr #8\n\t"
+        "cmpne r11, #0\n\t"
+        "addne r11, r11, r3\n\t"
+        "moveq r11, #0\n\t"
+        "mov   r3, r8, lsr #16\n\t"
+        "ands  r3, r3, #255\n\t"
+        "cmpne lr, #0\n\t"
+        "addne lr, lr, r3\n\t"
+        "moveq lr, #0\n\t"
+        "movs  r8, r8, lsr #24\n\t"
+        "addne r8, r8, #127\n\t"
+        "mov   ip, r8\n\t"
+        "cmp   ip, r10\n\t"
+        "movlt ip, r10\n\t"
+        "cmp   ip, r11\n\t"
+        "movlt ip, r11\n\t"
+        "cmp   ip, lr\n\t"
+        "movlt ip, lr\n\t"
+        "orr   r11, r11, lr, lsl #16\n\t"
+        "ldr   r3, [sp, #16]\n\t"
+        "sub   r8, ip, r8\n\t"
+        "cmp   r8, #31\n\t"
+        "movgt r8, #31\n\t"
+        "mov   r3, r3, asr r8\n\t"
+        "cmp   r10, #0\n\t"
+        "beq   2f\n\t"
+        "sub   r10, ip, r10\n\t"
+        "cmp   r10, #31\n\t"
+        "movgt r10, #31\n\t"
+        "ldr   r8, [sp, #0]\n\t"
+        "cmp   r0, #0\n\t"
+        "orr   r0, r0, #0x00800000\n\t"
+        "mov   r0, r0, lsl #8\n\t"
+        "mov   r0, r0, lsr #2\n\t"
+        "rsbmi r0, r0, #0\n\t"
+        "smull lr, r0, r8, r0\n\t"
+        "add   r3, r3, r0, asr r10\n\t"
+    "2:\n\t"
+        "movs  r0, r11, lsl #16\n\t"
+        "beq   3f\n\t"
+        "sub   r0, ip, r0, lsr #16\n\t"
+        "cmp   r0, #31\n\t"
+        "movgt r0, #31\n\t"
+        "ldr   r8, [sp, #4]\n\t"
+        "cmp   r1, #0\n\t"
+        "orr   r1, r1, #0x00800000\n\t"
+        "mov   r1, r1, lsl #8\n\t"
+        "mov   r1, r1, lsr #2\n\t"
+        "rsbmi r1, r1, #0\n\t"
+        "smull lr, r1, r8, r1\n\t"
+        "add   r3, r3, r1, asr r0\n\t"
+    "3:\n\t"
+        "movs  lr, r11, lsr #16\n\t"
+        "beq   4b\n\t"
+        "sub   lr, ip, lr\n\t"
+        "cmp   lr, #31\n\t"
+        "movgt lr, #31\n\t"
+        "ldr   r8, [sp, #8]\n\t"
+        "cmp   r2, #0\n\t"
+        "orr   r2, r2, #0x00800000\n\t"
+        "mov   r2, r2, lsl #8\n\t"
+        "mov   r2, r2, lsr #2\n\t"
+        "rsbmi r2, r2, #0\n\t"
+        "smull r10, r2, r8, r2\n\t"
+        "add   r3, r3, r2, asr lr\n\t"
+        "b     4b\n\t"
     );
 }
 #endif
@@ -716,9 +794,16 @@ void grApplyFogLINEAR(Gerbera_s *state, unsigned char *vertexList)
      defined(__ARM_ARCH_6__) || defined(__ARM_ARCH_6J__) || \
      (defined(__ARM_ARCH) && __ARM_ARCH >= 5)) && \
     !HG_ASSERT_ENABLED
-            grApplyFogLINEAR_float3Fast(state, vertexList);
-            return;
-#else
+            unsigned int paeFast = state->modelviewTransform.v[2].e;
+            if ((paeFast & 0xFFu) != 0u &&
+                (paeFast & 0xFF00u) != 0u &&
+                (paeFast & 0xFF0000u) != 0u)
+            {
+                grApplyFogLINEAR_float3Fast(state, vertexList);
+                return;
+            }
+#endif
+            {
             const _grVertexArray *array = &state->vertexArray[0];
             const unsigned char *vbase = (const unsigned char *)array->data;
             int vstride = array->stride;
@@ -867,7 +952,7 @@ void grApplyFogLINEAR(Gerbera_s *state, unsigned char *vertexList)
                 vertex = &vertexBuffer[*vertexLista];
             } while (*vertexLista++ != 0xFF);
             return;
-#endif
+            }
         }
     }
 
@@ -1029,6 +1114,9 @@ void grFetchVertexColorDEFAULT(Gerbera_s *state, unsigned char *vertexList)
     } while (*vertexLista++ != 0xFF);
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 void grFetchVertexColorFastUINT8(Gerbera_s *state, unsigned char *vertexList)
 {
     _grVertexArray *colorArray = &state->vertexArray[2];
@@ -1040,6 +1128,37 @@ void grFetchVertexColorFastUINT8(Gerbera_s *state, unsigned char *vertexList)
     GR_FETCH_CHECK(vertexList, 1336);
     vertexBuffer = GR_VERTEX_BUFFER(state);
     slot = *vertexList++;
+#if defined(__GNUC__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if ((((uintptr_t)ptr | (unsigned int)stride) & 3u) == 0u)
+    {
+        do
+        {
+            _grVertex *vertex = &vertexBuffer[slot];
+            unsigned int rgba = *(const unsigned int *)&ptr[stride * vertex->index];
+            unsigned int rg, ba;
+#if defined(__arm__) && !defined(__thumb__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+            unsigned int rb, ga;
+            __asm__("uxtb16 %0, %2\n\t"
+                    "uxtb16 %1, %2, ror #8\n\t"
+                    "mov    %3, %0, lsl #8\n\t"
+                    "pkhbt  %3, %3, %1, lsl #24\n\t"
+                    "mov    %1, %1, lsl #8\n\t"
+                    "pkhtb  %4, %1, %0, asr #8"
+                    : "=&r"(rb), "=&r"(ga), "+r"(rgba), "=&r"(rg), "=&r"(ba));
+#else
+            rg = ((rgba & 0xFFu) << 8) | ((rgba & 0xFF00u) << 16);
+            ba = ((rgba >> 8) & 0xFF00u) | (rgba & 0xFF000000u);
+#endif
+            __builtin_memcpy(&vertex->color.final[0][0], &rg, sizeof(rg));
+            __builtin_memcpy(&vertex->color.final[0][2], &ba, sizeof(ba));
+            __builtin_memcpy(&vertex->color.final[1][0], &rg, sizeof(rg));
+            /* Back alpha is the fog field and must not be overwritten. */
+            vertex->color.final[1][2] = (unsigned short)ba;
+            slot = *vertexList++;
+        } while (slot != 0xff);
+        return;
+    }
+#endif
     do
     {
         _grVertex *vertex = &vertexBuffer[slot];
@@ -1446,6 +1565,9 @@ void grTransformTexCoordDEFAULT(Gerbera_s *state, unsigned char *vertexList, int
     } while (*vertexLista++ != 0xFF);
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+__attribute__((optimize("O3")))
+#endif
 void grTransformTexCoordFLOATx4(Gerbera_s *state, unsigned char *vertexList, int texUnit)
 {
     _grVertexArray *array = &state->vertexArray[6 + texUnit];
@@ -1460,18 +1582,100 @@ void grTransformTexCoordFLOATx4(Gerbera_s *state, unsigned char *vertexList, int
     vertexBuffer = GR_VERTEX_BUFFER(state);
     vertexLista = vertexList + 1;
     vertex = &vertexBuffer[*vertexList];
-    if (size == 2 && (unsigned int)state->texCoordTransform[texUnit].cl == 0x80200802u)
+    if (__builtin_expect(size == 2 && (unsigned int)state->texCoordTransform[texUnit].cl == 0x80200802u, 1))
     {
+#if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && !defined(__thumb__)
+        register unsigned char *vbuf __asm__("r4") = (unsigned char *)vertexBuffer;
+        register unsigned char *v __asm__("r5") = (unsigned char *)vertex;
+        register unsigned char *p __asm__("r6") = ptr;
+        register int st __asm__("r7") = stride;
+        register unsigned char *vl __asm__("r8") = vertexLista;
+        register int toff __asm__("r9") = (int)((const unsigned char *)&vertexBuffer[0].texCoord[texUnit] - (const unsigned char *)vertexBuffer);
+        __asm__ volatile(
+            "1:\n\t"
+            "ldr   r0, [%[v]]\n\t"
+            "mla   ip, r0, %[st], %[p]\n\t"
+            "ldmia ip, {r2, r3}\n\t"
+            "mov   r0, r2, lsl #1\n\t"
+            "mov   r0, r0, lsr #24\n\t"
+            "rsbs  r1, r0, #132\n\t"
+            "blt   2f\n\t"
+            "orr   ip, r2, #0x00800000\n\t"
+            "mov   ip, ip, lsl #8\n\t"
+            "mov   ip, ip, lsr #5\n\t"
+            "cmp   r2, #0\n\t"
+            "rsbmi ip, ip, #0\n\t"
+            "cmp   r0, #0\n\t"
+            "moveq ip, #0\n\t"
+            "mov   r2, ip, asr r1\n\t"
+            "3:\n\t"
+            "mov   r0, r3, lsl #1\n\t"
+            "mov   r0, r0, lsr #24\n\t"
+            "rsbs  r1, r0, #132\n\t"
+            "blt   4f\n\t"
+            "orr   ip, r3, #0x00800000\n\t"
+            "mov   ip, ip, lsl #8\n\t"
+            "mov   ip, ip, lsr #5\n\t"
+            "cmp   r3, #0\n\t"
+            "rsbmi ip, ip, #0\n\t"
+            "cmp   r0, #0\n\t"
+            "moveq ip, #0\n\t"
+            "mov   r3, ip, asr r1\n\t"
+            "5:\n\t"
+            "add   %[v], %[v], %[toff]\n\t"
+            "stmia %[v], {r2, r3}\n\t"
+            "ldrb  r0, [%[vl]], #1\n\t"
+            "cmp   r0, #255\n\t"
+            "addne %[v], %[vbuf], r0, lsl #7\n\t"
+            "bne   1b\n\t"
+            "b     9f\n\t"
+            "2:\n\t"
+            "cmp   r0, #255\n\t"
+            "moveq r2, #0\n\t"
+            "beq   3b\n\t"
+            "orr   ip, r2, #0x00800000\n\t"
+            "mov   ip, ip, lsl #8\n\t"
+            "mov   ip, ip, lsr #5\n\t"
+            "cmp   r2, #0\n\t"
+            "rsbmi ip, ip, #0\n\t"
+            "rsb   r1, r1, #0\n\t"
+            "cmp   r1, #31\n\t"
+            "movgt r1, #31\n\t"
+            "mov   r2, ip, lsl r1\n\t"
+            "b     3b\n\t"
+            "4:\n\t"
+            "cmp   r0, #255\n\t"
+            "moveq r3, #0\n\t"
+            "beq   5b\n\t"
+            "orr   ip, r3, #0x00800000\n\t"
+            "mov   ip, ip, lsl #8\n\t"
+            "mov   ip, ip, lsr #5\n\t"
+            "cmp   r3, #0\n\t"
+            "rsbmi ip, ip, #0\n\t"
+            "rsb   r1, r1, #0\n\t"
+            "cmp   r1, #31\n\t"
+            "movgt r1, #31\n\t"
+            "mov   r3, ip, lsl r1\n\t"
+            "b     5b\n\t"
+            "9:\n\t"
+            : [v] "+r"(v), [vl] "+r"(vl)
+            : [vbuf] "r"(vbuf), [p] "r"(p), [st] "r"(st), [toff] "r"(toff)
+            : "r0", "r1", "r2", "r3", "ip", "cc", "memory");
+#else
         do
         {
             const int *src = (const int *)&ptr[stride * vertex->index];
+            int s0, s1;
             if (grIsAligned(src, 4) == 0 &&
                 grAssert("grIsAligned(ptr + stride*vertex->index, 4)", "grVertexPipeline.inl", 1868) != 0)
                 grDie(0);
-            vertex->texCoord[texUnit].x = grTexCoordUnitFloatFast(src[0]);
-            vertex->texCoord[texUnit].y = grTexCoordUnitFloatFast(src[1]);
+            s0 = src[0];
+            s1 = src[1];
+            vertex->texCoord[texUnit].x = grTexCoordUnitFloatFast(s0);
+            vertex->texCoord[texUnit].y = grTexCoordUnitFloatFast(s1);
             vertex = &vertexBuffer[*vertexLista];
         } while (*vertexLista++ != 0xFF);
+#endif
         return;
     }
     do
@@ -2183,7 +2387,7 @@ static void grTransformVertexFloat3Fallback(Gerbera_s *state, _grVertex *vertex,
 typedef char gr_check_arm_vp_offsets_[
     (offsetof(Gerbera_s, vertexArray[0].stride) == 5404 &&
      offsetof(Gerbera_s, vertexArray[0].data) == 5412 &&
-     offsetof(Gerbera_s, commonTransform) == 8452 &&
+     offsetof(Gerbera_s, commonTransform) == 7940 &&
      offsetof(_ICommonVertexTransform, exponent) == 64 &&
      offsetof(_grVertex, index) == 0 &&
      offsetof(_grVertex, stateMask) == 4 &&
@@ -2201,7 +2405,7 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
     (void)state;
     (void)vertex;
     __asm__ __volatile__(
-        "stmfd sp!, {r4-r11, lr}\n\t"
+        "stmfd sp!, {r0, r4-r11, lr}\n\t"
         "add   r2, r0, #4096\n\t"
         "ldr   r3, [r2, #1308]\n\t"
         "ldr   ip, [r2, #1316]\n\t"
@@ -2265,23 +2469,21 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
         "mov   r5, #0x20000000\n\t"
         "mov   r5, r5, lsr r6\n\t"
 
-        "add   r8, r0, #8192\n\t"
-        "add   r8, r8, #260\n\t"
+        "add   r8, r0, #7936\n\t"
+        "add   r8, r8, #4\n\t"
         "add   r12, r8, #48\n\t"
-        "ldmia r12!, {r6, r11}\n\t"
+        "ldmia r12, {r6, r9, r10, r11}\n\t"
         "smull lr, r7, r6, r2\n\t"
-        "smlal lr, r7, r11, r3\n\t"
-        "ldmia r12, {r6, r11}\n\t"
-        "smlal lr, r7, r6, r4\n\t"
+        "smlal lr, r7, r9, r3\n\t"
+        "smlal lr, r7, r10, r4\n\t"
         "smlal lr, r7, r11, r5\n\t"
         "cmp   r7, #0x20000\n\t"
         "blt   1f\n\t"
 
-        "ldmia r8!, {r6, r11}\n\t"
-        "smull r12, r9, r6, r2\n\t"
-        "smlal r12, r9, r11, r3\n\t"
-        "ldmia r8!, {r6, r11}\n\t"
-        "smlal r12, r9, r6, r4\n\t"
+        "ldmia r8!, {r0, r6, r10, r11}\n\t"
+        "smull r12, r9, r0, r2\n\t"
+        "smlal r12, r9, r6, r3\n\t"
+        "smlal r12, r9, r10, r4\n\t"
         "smlal r12, r9, r11, r5\n\t"
         "eor   r6, r9, r9, asr #31\n\t"
         "sub   r6, r6, r9, asr #31\n\t"
@@ -2291,6 +2493,7 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
         "sub   r11, r6, r11\n\t"
         "cmp   r11, #64\n\t"
         "blo   1f\n\t"
+        "orr   r0, r7, r6\n\t"
 
         "ldmia r8!, {r6, r11}\n\t"
         "smull r12, r10, r6, r2\n\t"
@@ -2306,6 +2509,7 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
         "sub   r11, r6, r11\n\t"
         "cmp   r11, #64\n\t"
         "blo   1f\n\t"
+        "orr   r0, r0, r6\n\t"
 
         "ldmia r8!, {r6, r11}\n\t"
         "smull r12, lr, r6, r2\n\t"
@@ -2321,19 +2525,12 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
         "blo   1f\n\t"
 
         "clz   r6, r5\n\t"
-        "add   r6, r6, #125\n\t"
-        "orr   r2, r7, r11\n\t"
-        "eor   r3, r9, r9, asr #31\n\t"
-        "sub   r3, r3, r9, asr #31\n\t"
-        "orr   r2, r2, r3\n\t"
-        "eor   r3, r10, r10, asr #31\n\t"
-        "sub   r3, r3, r10, asr #31\n\t"
-        "orr   r2, r2, r3\n\t"
+        "orr   r2, r0, r11\n\t"
         "clz   r2, r2\n\t"
         "sub   r2, r2, #2\n\t"
         "ldr   r3, [r8, #24]\n\t"
         "add   r3, r3, r6\n\t"
-        "sub   r3, r3, #124\n\t"
+        "add   r3, r3, #1\n\t"
         "sub   r3, r3, r2\n\t"
         "sub   r4, r3, #2\n\t"
         "cmp   r4, #252\n\t"
@@ -2363,15 +2560,17 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
         "mov   r12, r7, lsl r2\n\t"
         "add   r1, r1, #8\n\t"
         "stmia r1, {r3, r9, r10, r11, r12}\n\t"
+        "add   sp, sp, #4\n\t"
         "ldmfd sp!, {r4-r11, pc}\n\t"
 
     "1:\n\t"
+        "ldr   r0, [sp, #0]\n\t"
         "add   r2, r0, #4096\n\t"
         "ldr   r3, [r2, #1308]\n\t"
         "ldr   ip, [r2, #1316]\n\t"
         "ldr   r2, [r1, #0]\n\t"
         "mla   r2, r3, r2, ip\n\t"
-        "ldmfd sp!, {r4-r11, lr}\n\t"
+        "ldmfd sp!, {r0, r4-r11, lr}\n\t"
         "b     grTransformVertexFloat3Fallback_asm\n\t"
     );
 }
@@ -2538,14 +2737,14 @@ static inline HGint64 grVp_mulacc3ShRowGeneral(HGint64 w, const int *u, unsigned
     int t0, t1, t2, t3;
     __asm__(
         "and   %2, %7, #255\n\t"
-        "subs  %2, %2, #16\n\t"
+        "rsbs  %2, %2, #16\n\t"
         "ldr   %3, [%6, #0]\n\t"
-        "bgt   10f\n\t"
-        "rsb   %2, %2, #0\n\t"
+        "blt   10f\n\t"
         "mov   %2, %8, lsl %2\n\t"
         "smlal %0, %1, %3, %2\n\t"
         "b     11f\n\t"
     "10:\n\t"
+        "rsb   %2, %2, #0\n\t"
         "smull %4, %5, %3, %8\n\t"
         "rsb   %3, %2, #32\n\t"
         "mov   %4, %4, lsr %2\n\t"
@@ -2555,14 +2754,14 @@ static inline HGint64 grVp_mulacc3ShRowGeneral(HGint64 w, const int *u, unsigned
     "11:\n\t"
         "mov   %2, %7, lsr #8\n\t"
         "and   %2, %2, #255\n\t"
-        "subs  %2, %2, #16\n\t"
+        "rsbs  %2, %2, #16\n\t"
         "ldr   %3, [%6, #4]\n\t"
-        "bgt   12f\n\t"
-        "rsb   %2, %2, #0\n\t"
+        "blt   12f\n\t"
         "mov   %2, %9, lsl %2\n\t"
         "smlal %0, %1, %3, %2\n\t"
         "b     13f\n\t"
     "12:\n\t"
+        "rsb   %2, %2, #0\n\t"
         "smull %4, %5, %3, %9\n\t"
         "rsb   %3, %2, #32\n\t"
         "mov   %4, %4, lsr %2\n\t"
@@ -2572,14 +2771,14 @@ static inline HGint64 grVp_mulacc3ShRowGeneral(HGint64 w, const int *u, unsigned
     "13:\n\t"
         "mov   %2, %7, lsr #16\n\t"
         "and   %2, %2, #255\n\t"
-        "subs  %2, %2, #16\n\t"
+        "rsbs  %2, %2, #16\n\t"
         "ldr   %3, [%6, #8]\n\t"
-        "bgt   14f\n\t"
-        "rsb   %2, %2, #0\n\t"
+        "blt   14f\n\t"
         "mov   %2, %10, lsl %2\n\t"
         "smlal %0, %1, %3, %2\n\t"
         "b     15f\n\t"
     "14:\n\t"
+        "rsb   %2, %2, #0\n\t"
         "smull %4, %5, %3, %10\n\t"
         "rsb   %3, %2, #32\n\t"
         "mov   %4, %4, lsr %2\n\t"
@@ -2684,19 +2883,42 @@ static __attribute__((noinline, used)) void grTransformVertexShort3Identity(Gerb
     "orr   r4, r4, #0x4000\n\t" \
     "orr   r4, r4, #4\n\t" \
     "strh  r4, [r1, #4]\n\t" \
-    "ldrsh r4, [r2, #0]\n\t" \
-    "ldrsh r5, [r2, #2]\n\t" \
-    "ldrsh r6, [r2, #4]\n\t" \
     "add   lr, r0, #1408\n\t" \
-    "mov   r7, r4, lsl #16\n\t" \
-    "mov   r8, r5, lsl #16\n\t" \
+    "add   r11, r1, #72\n\t" \
+    "ldrsh r0, [r2, #0]\n\t" \
+    "ldrsh r1, [r2, #2]\n\t" \
+    "ldrsh r2, [r2, #4]\n\t" \
+    "mov   r7, r0, lsl #16\n\t" \
+    "mov   r8, r1, lsl #16\n\t" \
+    "mov   r9, r2, lsl #16\n\t" \
+    "mov   r10, #0x10000\n\t" \
+    "stmia r11, {r7, r8, r9, r10}\n\t" \
+    "add   ip, lr, #88\n\t" \
+    "ldmia ip, {r4-r11}\n\t"
+
+#define GR_ARM_S3_COL_PREAMBLE \
+    "stmfd sp!, {r0, r1, r2, r4-r11, lr}\n\t" \
+    "add   r3, r0, #4096\n\t" \
+    "ldr   r4, [r3, #1308]\n\t" \
+    "ldr   ip, [r1, #0]\n\t" \
+    "ldr   r3, [r3, #1316]\n\t" \
+    "mla   r2, r4, ip, r3\n\t" \
+    "ldrh  r4, [r1, #4]\n\t" \
+    "bic   r4, r4, #0xC000\n\t" \
+    "orr   r4, r4, #0x4000\n\t" \
+    "orr   r4, r4, #4\n\t" \
+    "strh  r4, [r1, #4]\n\t" \
+    "add   lr, r0, #1408\n\t" \
+    "add   r11, r1, #72\n\t" \
+    "ldrsh r0, [r2, #0]\n\t" \
+    "ldrsh r1, [r2, #2]\n\t" \
+    "ldrsh r6, [r2, #4]\n\t" \
+    "mov   r7, r0, lsl #16\n\t" \
+    "mov   r8, r1, lsl #16\n\t" \
     "mov   r9, r6, lsl #16\n\t" \
     "mov   r10, #0x10000\n\t" \
-    "add   r11, r1, #72\n\t" \
     "stmia r11, {r7, r8, r9, r10}\n\t" \
-    "mov   r0, r4\n\t" \
-    "mov   r1, r5\n\t" \
-    "mov   r2, r6\n\t" \
+    "str   r6, [sp, #8]\n\t" \
     "add   ip, lr, #88\n\t" \
     "ldmia ip, {r4-r11}\n\t"
 
@@ -2707,28 +2929,59 @@ static __attribute__((noinline, used)) void grTransformVertexShort3Identity(Gerb
     "mov   ip, " #rS ", lsl ip\n\t" \
     "smlal " #rLo ", " #rHi ", r3, ip\n\t"
 
+#define GR_ARM_S3_SLOW16_ELEM(rowOff, colOff, rS, rTmp, rLo, rHi) \
+    "ldrb  ip, [lr, #" #rowOff "]\n\t" \
+    "ldr   r3, [lr, #" #colOff "]\n\t" \
+    "sub   ip, ip, #16\n\t" \
+    "smull r3, " #rTmp ", " #rS ", r3\n\t" \
+    "mov   r3, r3, lsr ip\n\t" \
+    "rsb   ip, ip, #32\n\t" \
+    "orr   r3, r3, " #rTmp ", lsl ip\n\t" \
+    "rsb   ip, ip, #32\n\t" \
+    "adds  " #rLo ", " #rLo ", r3\n\t" \
+    "adc   " #rHi ", " #rHi ", " #rTmp ", asr ip\n\t"
+
+#define GR_ARM_S3_SLOW16_ELEM2(rowOff, colOff, rS, rTmp, rInv, rLo, rHi) \
+    "ldrb  ip, [lr, #" #rowOff "]\n\t" \
+    "ldr   r3, [lr, #" #colOff "]\n\t" \
+    "sub   ip, ip, #16\n\t" \
+    "smull r3, " #rTmp ", " #rS ", r3\n\t" \
+    "mov   r3, r3, lsr ip\n\t" \
+    "rsb   " #rInv ", ip, #32\n\t" \
+    "orr   r3, r3, " #rTmp ", lsl " #rInv "\n\t" \
+    "adds  " #rLo ", " #rLo ", r3\n\t" \
+    "adc   " #rHi ", " #rHi ", " #rTmp ", asr ip\n\t"
+
 #define GR_ARM_S3_GEN_ELEM(rowOff, colOff, rS, rLo, rHi, lblSlow, lblCont) \
     "ldrb  ip, [lr, #" #rowOff "]\n\t" \
     "ldr   r3, [lr, #" #colOff "]\n\t" \
-    "subs  ip, ip, #16\n\t" \
-    "bgt   " #lblSlow "f\n\t" \
-    "rsb   ip, ip, #0\n\t" \
+    "rsbs  ip, ip, #16\n\t" \
+    "blt   " #lblSlow "f\n\t" \
     "mov   ip, " #rS ", lsl ip\n\t" \
     "smlal " #rLo ", " #rHi ", r3, ip\n\t" \
     #lblCont ":\n\t"
 
-#define GR_ARM_S3_GEN_SLOW(rS, rSave, rLo, rHi, lblSlow, lblCont) \
+#define GR_ARM_S3_GEN_SLOW(rS, rTmp, rLo, rHi, lblSlow, lblCont) \
     #lblSlow ":\n\t" \
-    "str   " #rSave ", [sp, #8]\n\t" \
-    "mov   " #rSave ", ip\n\t" \
-    "smull r3, ip, " #rS ", r3\n\t" \
-    "mov   r3, r3, lsr " #rSave "\n\t" \
-    "rsb   " #rSave ", " #rSave ", #32\n\t" \
-    "orr   r3, r3, ip, lsl " #rSave "\n\t" \
-    "rsb   " #rSave ", " #rSave ", #32\n\t" \
+    "rsb   ip, ip, #0\n\t" \
+    "smull r3, " #rTmp ", " #rS ", r3\n\t" \
+    "mov   r3, r3, lsr ip\n\t" \
+    "rsb   ip, ip, #32\n\t" \
+    "orr   r3, r3, " #rTmp ", lsl ip\n\t" \
+    "rsb   ip, ip, #32\n\t" \
     "adds  " #rLo ", " #rLo ", r3\n\t" \
-    "adc   " #rHi ", " #rHi ", ip, asr " #rSave "\n\t" \
-    "ldr   " #rSave ", [sp, #8]\n\t" \
+    "adc   " #rHi ", " #rHi ", " #rTmp ", asr ip\n\t" \
+    "b     " #lblCont "b\n\t"
+
+#define GR_ARM_S3_GEN_SLOW2(rS, rTmp, rInv, rLo, rHi, lblSlow, lblCont) \
+    #lblSlow ":\n\t" \
+    "rsb   ip, ip, #0\n\t" \
+    "smull r3, " #rTmp ", " #rS ", r3\n\t" \
+    "mov   r3, r3, lsr ip\n\t" \
+    "rsb   " #rInv ", ip, #32\n\t" \
+    "orr   r3, r3, " #rTmp ", lsl " #rInv "\n\t" \
+    "adds  " #rLo ", " #rLo ", r3\n\t" \
+    "adc   " #rHi ", " #rHi ", " #rTmp ", asr ip\n\t" \
     "b     " #lblCont "b\n\t"
 
 #define GR_ARM_S3_COMMON_TAIL \
@@ -2766,25 +3019,21 @@ static __attribute__((noinline, used)) void grTransformVertexShort3Identity(Gerb
     "moveq r2, r0\n\t" \
     "clz   r2, r2\n\t" \
     "add   r2, r2, r3\n\t" \
-    "sub   r2, r2, #1\n\t" \
     "ldr   r3, [lr, #200]\n\t" \
+    "subs  r2, r2, #2\n\t" \
+    "bmi   10f\n\t" \
     "sub   r3, r3, r2\n\t" \
-    "add   r3, r3, #1\n\t" \
     "cmp   r2, #32\n\t" \
     "bge   3f\n\t" \
     "rsb   ip, r2, #32\n\t" \
     "mov   r5, r5, lsl r2\n\t" \
-    "orr   r5, r5, r4, lsr ip\n\t" \
-    "mov   r4, r5, asr #1\n\t" \
+    "orr   r4, r5, r4, lsr ip\n\t" \
     "mov   r7, r7, lsl r2\n\t" \
-    "orr   r7, r7, r6, lsr ip\n\t" \
-    "mov   r6, r7, asr #1\n\t" \
+    "orr   r6, r7, r6, lsr ip\n\t" \
     "mov   r9, r9, lsl r2\n\t" \
-    "orr   r9, r9, r8, lsr ip\n\t" \
-    "mov   r8, r9, asr #1\n\t" \
+    "orr   r8, r9, r8, lsr ip\n\t" \
     "mov   r11, r11, lsl r2\n\t" \
-    "orr   r11, r11, r10, lsr ip\n\t" \
-    "mov   r10, r11, asr #1\n\t" \
+    "orr   r10, r11, r10, lsr ip\n\t" \
     "4:\n\t" \
     "cmp   r4, #-1073741824\n\t" \
     "cmpne r6, #-1073741824\n\t" \
@@ -2836,16 +3085,19 @@ static __attribute__((noinline, used)) void grTransformVertexShort3Identity(Gerb
     "bne   9f\n\t" \
     "strh  r2, [r1, #6]\n\t" \
     "ldmfd sp!, {r0, r1, r2, r4-r11, pc}\n\t" \
+    "10:\n\t" \
+    "sub   r3, r3, r2\n\t" \
+    "mov   r4, r5, asr #1\n\t" \
+    "mov   r6, r7, asr #1\n\t" \
+    "mov   r8, r9, asr #1\n\t" \
+    "mov   r10, r11, asr #1\n\t" \
+    "b     4b\n\t" \
     "3:\n\t" \
     "sub   r2, r2, #32\n\t" \
     "mov   r4, r4, lsl r2\n\t" \
-    "mov   r4, r4, asr #1\n\t" \
     "mov   r6, r6, lsl r2\n\t" \
-    "mov   r6, r6, asr #1\n\t" \
     "mov   r8, r8, lsl r2\n\t" \
-    "mov   r8, r8, asr #1\n\t" \
     "mov   r10, r10, lsl r2\n\t" \
-    "mov   r10, r10, asr #1\n\t" \
     "b     4b\n\t" \
     "2:\n\t" \
     "ldr   r1, [sp, #4]\n\t" \
@@ -2907,6 +3159,30 @@ static void grTransformVertexShort3Fast16(Gerbera_s *state, _grVertex *vertex)
 }
 
 __attribute__((naked))
+static void grTransformVertexShort3Slow16(Gerbera_s *state, _grVertex *vertex)
+{
+    (void)state;
+    (void)vertex;
+    __asm__ __volatile__(
+        GR_ARM_S3_COL_PREAMBLE
+        GR_ARM_S3_SLOW16_ELEM(184, 120, r0, r2, r4, r5)
+        GR_ARM_S3_SLOW16_ELEM(188, 136, r0, r2, r6, r7)
+        GR_ARM_S3_SLOW16_ELEM(192, 152, r0, r2, r8, r9)
+        GR_ARM_S3_SLOW16_ELEM(196, 168, r0, r2, r10, r11)
+        GR_ARM_S3_SLOW16_ELEM2(185, 124, r1, r2, r0, r4, r5)
+        GR_ARM_S3_SLOW16_ELEM2(189, 140, r1, r2, r0, r6, r7)
+        GR_ARM_S3_SLOW16_ELEM2(193, 156, r1, r2, r0, r8, r9)
+        GR_ARM_S3_SLOW16_ELEM2(197, 172, r1, r2, r0, r10, r11)
+        "ldr   r2, [sp, #8]\n\t"
+        GR_ARM_S3_SLOW16_ELEM2(186, 128, r2, r0, r1, r4, r5)
+        GR_ARM_S3_SLOW16_ELEM2(190, 144, r2, r0, r1, r6, r7)
+        GR_ARM_S3_SLOW16_ELEM2(194, 160, r2, r0, r1, r8, r9)
+        GR_ARM_S3_SLOW16_ELEM2(198, 176, r2, r0, r1, r10, r11)
+        GR_ARM_S3_COMMON_TAIL
+    );
+}
+
+__attribute__((naked))
 static void grTransformVertexShort3(Gerbera_s *state, _grVertex *vertex)
 {
     (void)state;
@@ -2919,36 +3195,33 @@ static void grTransformVertexShort3(Gerbera_s *state, _grVertex *vertex)
         "orr   r3, r3, #2\n\t"
         "cmp   r2, r3\n\t"
         "beq   grTransformVertexShort3Identity_asm\n\t"
-        GR_ARM_S3_COMMON_PREAMBLE
+        GR_ARM_S3_COL_PREAMBLE
         GR_ARM_S3_GEN_ELEM(184, 120, r0, r4, r5, 20, 40)
-        GR_ARM_S3_GEN_ELEM(185, 124, r1, r4, r5, 21, 41)
-        GR_ARM_S3_GEN_ELEM(186, 128, r2, r4, r5, 22, 42)
-        GR_ARM_S3_GEN_ELEM(188, 136, r0, r6, r7, 23, 43)
-        GR_ARM_S3_GEN_ELEM(189, 140, r1, r6, r7, 24, 44)
-        GR_ARM_S3_GEN_ELEM(190, 144, r2, r6, r7, 25, 45)
-        GR_ARM_S3_GEN_ELEM(192, 152, r0, r8, r9, 26, 46)
-        GR_ARM_S3_GEN_ELEM(193, 156, r1, r8, r9, 27, 47)
-        GR_ARM_S3_GEN_ELEM(194, 160, r2, r8, r9, 28, 48)
-        "ldr   r3, [lr, #204]\n\t"
-        "tst   r3, #0x3F000000\n\t"
-        "beq   1f\n\t"
-        GR_ARM_S3_GEN_ELEM(196, 168, r0, r10, r11, 29, 49)
-        GR_ARM_S3_GEN_ELEM(197, 172, r1, r10, r11, 30, 50)
+        GR_ARM_S3_GEN_ELEM(188, 136, r0, r6, r7, 21, 41)
+        GR_ARM_S3_GEN_ELEM(192, 152, r0, r8, r9, 22, 42)
+        GR_ARM_S3_GEN_ELEM(196, 168, r0, r10, r11, 23, 43)
+        GR_ARM_S3_GEN_ELEM(185, 124, r1, r4, r5, 24, 44)
+        GR_ARM_S3_GEN_ELEM(189, 140, r1, r6, r7, 25, 45)
+        GR_ARM_S3_GEN_ELEM(193, 156, r1, r8, r9, 26, 46)
+        GR_ARM_S3_GEN_ELEM(197, 172, r1, r10, r11, 27, 47)
+        "ldr   r2, [sp, #8]\n\t"
+        GR_ARM_S3_GEN_ELEM(186, 128, r2, r4, r5, 28, 48)
+        GR_ARM_S3_GEN_ELEM(190, 144, r2, r6, r7, 29, 49)
+        GR_ARM_S3_GEN_ELEM(194, 160, r2, r8, r9, 30, 50)
         GR_ARM_S3_GEN_ELEM(198, 176, r2, r10, r11, 31, 51)
-    "1:\n\t"
         GR_ARM_S3_COMMON_TAIL
         GR_ARM_S3_GEN_SLOW(r0, r2, r4, r5, 20, 40)
-        GR_ARM_S3_GEN_SLOW(r1, r2, r4, r5, 21, 41)
-        GR_ARM_S3_GEN_SLOW(r2, r0, r4, r5, 22, 42)
-        GR_ARM_S3_GEN_SLOW(r0, r2, r6, r7, 23, 43)
-        GR_ARM_S3_GEN_SLOW(r1, r2, r6, r7, 24, 44)
-        GR_ARM_S3_GEN_SLOW(r2, r0, r6, r7, 25, 45)
-        GR_ARM_S3_GEN_SLOW(r0, r2, r8, r9, 26, 46)
-        GR_ARM_S3_GEN_SLOW(r1, r2, r8, r9, 27, 47)
-        GR_ARM_S3_GEN_SLOW(r2, r0, r8, r9, 28, 48)
-        GR_ARM_S3_GEN_SLOW(r0, r2, r10, r11, 29, 49)
-        GR_ARM_S3_GEN_SLOW(r1, r2, r10, r11, 30, 50)
-        GR_ARM_S3_GEN_SLOW(r2, r0, r10, r11, 31, 51)
+        GR_ARM_S3_GEN_SLOW(r0, r2, r6, r7, 21, 41)
+        GR_ARM_S3_GEN_SLOW(r0, r2, r8, r9, 22, 42)
+        GR_ARM_S3_GEN_SLOW(r0, r2, r10, r11, 23, 43)
+        GR_ARM_S3_GEN_SLOW2(r1, r2, r0, r4, r5, 24, 44)
+        GR_ARM_S3_GEN_SLOW2(r1, r2, r0, r6, r7, 25, 45)
+        GR_ARM_S3_GEN_SLOW2(r1, r2, r0, r8, r9, 26, 46)
+        GR_ARM_S3_GEN_SLOW2(r1, r2, r0, r10, r11, 27, 47)
+        GR_ARM_S3_GEN_SLOW2(r2, r0, r1, r4, r5, 28, 48)
+        GR_ARM_S3_GEN_SLOW2(r2, r0, r1, r6, r7, 29, 49)
+        GR_ARM_S3_GEN_SLOW2(r2, r0, r1, r8, r9, 30, 50)
+        GR_ARM_S3_GEN_SLOW2(r2, r0, r1, r10, r11, 31, 51)
     );
 }
 #else
@@ -3176,6 +3449,13 @@ void (*grSelectFastVertexTransform(Gerbera_s *state))(Gerbera_s *state, _grVerte
             rowBad |= ((pT->sh[3] & 0xFFFFFFu) - 0x010101u);
         if ((rowBad & 0xF0F0F0u) == 0)
             return grTransformVertexShort3Fast16;
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+        if ((pT->cl & 0x3F000000u) != 0 &&
+            (pT->sh[0] & pT->sh[1] & pT->sh[2] & pT->sh[3] & 0x101010u) == 0x101010u)
+            return grTransformVertexShort3Slow16;
+#endif
         return grTransformVertexShort3;
     }
     return NULL;
