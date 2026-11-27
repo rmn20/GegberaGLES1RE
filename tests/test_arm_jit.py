@@ -794,6 +794,183 @@ def check_spans(lib, machine, code, data, stack, stop):
             untex_blend_checks += 1
     print(f"ARM JIT: {untex_blend_checks} untextured multi-blend pixel pipeline comparisons passed")
 
+    # Phase 2: GR_WRAPMODE_CLAMP_TO_EDGE (nearest/bilinear, mixed REPEAT, PALETTE8, gates)
+    # and depthClampMin / depthClampMax (LESS/LEQUAL, depthMask 0/1, alphaTest, dither, untextured & textured).
+    clamp_checks = 0
+    clamp_uv_cases = (
+        ("clamp_under_over", -0x0C000000, -0x04000000, 0x05000000, 0x03800000, 0x01000000, 0x02000000),
+        ("clamp_border_rev", 0x16000000, 0x12000000, -0x06000000, -0x05000000, 0x02000000, -0x01000000),
+        ("clamp_interior_edge", 0x08000000, 0x04000000, 0x02800000, 0x03000000, -0x01000000, 0x01800000),
+    )
+    for (ws, wt), out_idx, bilinear, tex_fmt, modulate, fog, alpha_test in product(
+            ((1, 0), (0, 1), (1, 1)), range(4), (0, 1), (2, 11), (0, 1), (0, 1), (0, 1)):
+        if ((out_idx + bilinear + tex_fmt + modulate + fog + alpha_test + ws + wt) & 3) != 0:
+            continue
+        signature = bytearray(144)
+        signature[:16] = destinations[out_idx]
+        signature[10] = 2
+        depth = int((out_idx ^ fog) & 1)
+        dither = int(out_idx == 0 and (fog ^ alpha_test))
+        mono_fog = int(fog and (out_idx ^ tex_fmt ^ ws) & 1)
+        blend = int(not alpha_test and (out_idx == 1) and ((tex_fmt ^ bilinear) & 1))
+        for offset, value in ((16, 1), (17, signature[8]), (18, depth),
+                              (19, alpha_test), (20, 4),
+                              (21, depth), (22, 3),
+                              (27, blend), (28, 4 if blend else 0), (29, 5 if blend else 0), (30, 0),
+                              (40, fog), (41, mono_fog), (42, 1), (45, dither), (47, 1)):
+            signature[offset] = value
+        tex_rec = bytearray(pixel_texture_record(descriptors, fmt=tex_fmt, mode=0 if modulate else 3))
+        tex_rec[17], tex_rec[19], tex_rec[20], tex_rec[21], tex_rec[22] = 0, bilinear, bilinear, ws, wt
+        alpha_mode = ((out_idx + fog + ws + wt) % 3) + 1
+        if signature[7] or alpha_test or blend:
+            if alpha_mode == 1:
+                tex_rec[25], tex_rec[37] = 0, 1
+            elif alpha_mode == 2:
+                tex_rec[25], tex_rec[37] = 3, 1
+            else:
+                tex_rec[25], tex_rec[29], tex_rec[37] = 3, 0, 0
+        signature[56:100] = tex_rec
+        direct = buffer(bytes(4096))
+        mask = C.c_uint32()
+        assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 0) == 0
+        assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 1 + 11 * 2 + 2, C.byref(mask), 1) == 0
+        length = lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 1)
+        assert length > 0, (ws, wt, out_idx, bilinear, tex_fmt, modulate, fog, alpha_test)
+        ext_code = bytes(direct)[:length]
+        program, output = buffer(bytes(32768)), buffer(bytes(65536))
+        assert lib.grExecuteProgram(program, buffer(bytes(signature)), 4096) > 0
+        size = lib.differential_raster_compile(program, 0x3FF, output, 65536, buffer(bytes(16)))
+        assert size > 0
+        hc_code = bytes(output)[:size]
+        s_shift = 26 if ws else 30
+        t_shift = 26 if wt else 30
+        for cname, cref, cxadd, cyadd in (color_variants[0], color_variants[2], color_variants[4]):
+            for uvname, sref, tref, sx, tx, sy, ty in clamp_uv_cases:
+                if cname != "gouraud" and uvname != "clamp_under_over":
+                    continue
+                oracle.cursor = data
+                initial = [bytes(rng.getrandbits(8) for _ in range(128)) + b"\xA5" * 16,
+                           struct.pack("<32H", *([0, 0xFFFF, 0x4000, 0x8000] * 8)) + b"\xA5" * 16]
+                targets = [allocate(len(value), value) for value in initial]
+                scratch = allocate(16384)
+                pipe = scratch + 64
+                spans = allocate(8, words([(13 << 16) | 1, (7 << 16) | 3]))
+                palette = allocate(1024, words([rng.getrandbits(32) for _ in range(256)]))
+                texels = allocate(4 << 4, words([
+                    ((a & 0xFF) << 24) | (rng.getrandbits(24))
+                    for a in (0, 64, 140, 141, 200, 254, 255, 128, 32, 220, 10, 250, 180, 90, 255, 0)
+                ]))
+                oracle.write(pipe, words([0, texels, palette, bilinear, 3, 3, s_shift, t_shift, 2]))
+                oracle.write(pipe + 128, words([allocate(16, bytes(kernel))]))
+                fog_color = 0xB0 if mono_fog else 0xFF7090B0
+                oracle.write(pipe + 132, words([16 * signature[9], 32, 16, fog_color, 140 if alpha_test else 0, 3, 3, 255, 255]))
+                oracle.write(pipe + 168, words([*targets, 0, 2, spans, 1]))
+                gradients = [
+                    0x10000000, 127 << 16, *cref, sref & 0xFFFFFFFF, tref & 0xFFFFFFFF, 0, 0,
+                    0x01000000, -0x5234, *cxadd, sx & 0xFFFFFFFF, tx & 0xFFFFFFFF, 0, 0,
+                    0x02000000, 0x2134, *cyadd, sy & 0xFFFFFFFF, ty & 0xFFFFFFFF, 0, 0,
+                ]
+                oracle.write(pipe + 192, words(gradients))
+                original_stack = oracle.readback(scratch, 16384)
+                results = []
+                for emitted in (hc_code, ext_code):
+                    for address, value in zip(targets, initial):
+                        oracle.write(address, value)
+                    oracle.write(scratch, original_stack)
+                    entry = install_code(emitted)
+                    call(entry, [scratch], saved)
+                    results.append(tuple(oracle.readback(address, len(value)) for address, value in zip(targets, initial)))
+                    assert all(machine.reg_read(reg) == value for reg, value in saved.items())
+                    assert machine.reg_read(ARM.UC_ARM_REG_SP) == stack + 65536 - 4096
+                assert results[0] == results[1], (
+                    "clamp_to_edge pixel pipeline", ws, wt, out_idx, bilinear, tex_fmt,
+                    modulate, fog, alpha_test, depth, blend, cname, uvname)
+                clamp_checks += 1
+    bad_wrap = bytearray(signature)
+    bad_wrap[56 + 21] = 2  # GR_WRAPMODE_MIRRORED_REPEAT
+    assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(bad_wrap)), 0, C.byref(mask), 1) == 0
+    print(f"ARM JIT: {clamp_checks} CLAMP_TO_EDGE pixel pipeline comparisons passed")
+
+    depth_clamp_checks = 0
+    z_variants = (
+        ("z_underflow", -0x06000000, 0x02000000, 0x01000000),
+        ("z_overflow", 0x45000000, -0x02000000, -0x01000000),
+        ("z_mixed_reject", 0x20000000, 0x10000000, -0x24000000),
+    )
+    for (cmin, cmax), textured, bilinear, depth_func, depth_mask, alpha_test, dither, fog in product(
+            ((1, 0), (0, 1), (1, 1)), (0, 1), (0, 1), (1, 3), (0, 1), (0, 1), (0, 1), (0, 1)):
+        if not textured and bilinear:
+            continue
+        if ((cmin + cmax + textured + bilinear + depth_func + depth_mask + alpha_test + dither + fog) & 3) != 0:
+            continue
+        signature = bytearray(144)
+        signature[:16] = destinations[0 if dither else 1]
+        signature[10] = 2
+        keep_st_alpha = int(textured and not bilinear and alpha_test and not fog)
+        for offset, value in ((16, 1), (17, signature[8]), (18, 1),
+                              (19, alpha_test), (20, 4),
+                              (21, depth_mask), (22, depth_func),
+                              (23, cmin), (24, cmax),
+                              (30, 0),
+                              (40, fog), (41, fog & 1), (42, 1), (45, dither), (47, 1)):
+            signature[offset] = value
+        if textured:
+            tex_rec = bytearray(pixel_texture_record(descriptors, fmt=2, mode=3 if keep_st_alpha else 0))
+            tex_rec[17], tex_rec[19], tex_rec[20] = 0, bilinear, bilinear
+            if signature[7] or alpha_test:
+                tex_rec[25], tex_rec[37] = (0, 1) if keep_st_alpha else (3, 1)
+            signature[56:100] = tex_rec
+        direct = buffer(bytes(4096))
+        mask = C.c_uint32()
+        assert lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 0) == 0
+        length = lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 1)
+        assert length > 0, (cmin, cmax, textured, bilinear, depth_func, depth_mask, alpha_test, dither, fog)
+        ext_code = bytes(direct)[:length]
+        program, output = buffer(bytes(32768)), buffer(bytes(65536))
+        assert lib.grExecuteProgram(program, buffer(bytes(signature)), 4096) > 0
+        size = lib.differential_raster_compile(program, 0x3FF, output, 65536, buffer(bytes(16)))
+        assert size > 0
+        hc_code = bytes(output)[:size]
+        for zname, zref, zx, zy in z_variants:
+            oracle.cursor = data
+            initial = [bytes(rng.getrandbits(8) for _ in range(128)) + b"\xA5" * 16,
+                       struct.pack("<32H", *([0, 0xFFFF, 0x4000, 0x8000] * 8)) + b"\xA5" * 16]
+            targets = [allocate(len(value), value) for value in initial]
+            scratch = allocate(16384)
+            pipe = scratch + 64
+            spans = allocate(8, words([(13 << 16) | 1, (7 << 16) | 3]))
+            texels = allocate(4 << 4, words([
+                ((a & 0xFF) << 24) | (rng.getrandbits(24))
+                for a in (0, 64, 140, 141, 200, 254, 255, 128, 32, 220, 10, 250, 180, 90, 255, 0)
+            ]))
+            oracle.write(pipe, words([0, texels, 0, bilinear, 3, 3, 30, 30, 2]))
+            oracle.write(pipe + 128, words([allocate(16, bytes(kernel))]))
+            fog_color = 0xB0 if (fog & 1) else 0xFF7090B0
+            oracle.write(pipe + 132, words([16 * signature[9], 32, 16, fog_color, 140 if alpha_test else 0, 3, 3, 255, 255]))
+            oracle.write(pipe + 168, words([*targets, 0, 2, spans, 1]))
+            gradients = [
+                zref & 0xFFFFFFFF, 127 << 16, 180 << 16, 80 << 16, 200 << 16, 160 << 16, 0x91234567, 0xFEDCBA98, 0, 0,
+                zx & 0xFFFFFFFF, -0x5234, -0x5234, 0x12345, -0x45678, 0x10000, 0x13456789, 0xABCDEF01, 0, 0,
+                zy & 0xFFFFFFFF, 0x2134, 0x2134, -0x10000, 0x20000, -0x10000, 0x17234567, 0xDBECA987, 0, 0,
+            ]
+            oracle.write(pipe + 192, words(gradients))
+            original_stack = oracle.readback(scratch, 16384)
+            results = []
+            for emitted in (hc_code, ext_code):
+                for address, value in zip(targets, initial):
+                    oracle.write(address, value)
+                oracle.write(scratch, original_stack)
+                entry = install_code(emitted)
+                call(entry, [scratch], saved)
+                results.append(tuple(oracle.readback(address, len(value)) for address, value in zip(targets, initial)))
+                assert all(machine.reg_read(reg) == value for reg, value in saved.items())
+                assert machine.reg_read(ARM.UC_ARM_REG_SP) == stack + 65536 - 4096
+            assert results[0] == results[1], (
+                "depthClamp pixel pipeline", cmin, cmax, textured, bilinear,
+                depth_func, depth_mask, alpha_test, dither, fog, zname)
+            depth_clamp_checks += 1
+    print(f"ARM JIT: {depth_clamp_checks} depthClampMin/Max pixel pipeline comparisons passed")
+
 
 def check_scheduler(lib, machine, code, data, stack, stop):
     """Check load/store aliases and live values across scheduled register spills."""
