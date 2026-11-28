@@ -253,6 +253,18 @@ static int pixelArmAlphaRejectCond(int alphaFunc)
     }
 }
 
+static int pixelArmSwapAlphaCond(int cond)
+{
+    switch (cond)
+    {
+        case PA_HS: return PA_LS;
+        case PA_LO: return PA_HI;
+        case PA_HI: return PA_LO;
+        case PA_LS: return PA_HS;
+        default: return cond;
+    }
+}
+
 static void pixelArmGradientEx(ARMPixelCode_s *c, int gradient, int dst, int origin,
                                int scratchOffset, int tmpReg)
 {
@@ -2160,63 +2172,82 @@ static void pixelArmEmitVariant(ARMPixelCode_s *c, const _grSignature *sig,
     }
     else
     {
-        /* Compute alpha into r1, keep texReg and r2 (colPacked if const). */
-        if (alphaMode == 1 || (isConstWhite && alphaMode == 3))
-        {
-            pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[3]);
-        }
-        else if (alphaMode == 2)
-        {
-            if (isConstWhite)
-            {
-                pixelArmOp(c, PA_MOV, 1, 0, pixelArmImmediate(255u), 0);
-            }
-            else if (isConstRgb)
-            {
-                pixelArmLoad(c, 2, 0, -4);
-                pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(2, PA_LSR, 24), 0);
-            }
-            else
-            {
-                pixelArmLoad(c, 2, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_A);
-                pixelArmLoad(c, 3, 0, -16);
-                pixelArmMLA(c, 2, 2, 4, 3);
-                pixelArmUSAT8(c, 1, 2, 16);
-            }
-        }
-        else /* alphaMode == 3 */
-        {
-            pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[3]);
-            if (isConstRgb)
-            {
-                pixelArmLoad(c, 2, 0, -4);
-                pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(2, PA_LSR, 24), 0);
-                pixelArmMLA(c, 1, 1, 3, 3);
-                pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
-            }
-            else
-            {
-                pixelArmLoad(c, 2, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_A);
-                pixelArmLoad(c, 3, 0, -16);
-                pixelArmMLA(c, 2, 2, 4, 3);
-                pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 16), 0);
-                pixelArmMLA(c, 1, 1, 2, 2);
-                pixelArmUSAT8(c, 1, 1, 8);
-            }
-        }
         int preserveR2 = !keepSTAdders && haveR2Const && isConstRgb;
         int refReg = preserveR2 ? 3 : 2;
-        if (!depth && !dither)
+        int directAlphaCmp = (alphaMode == 1 || (isConstWhite && alphaMode == 3)) &&
+            tex->rgbaOffsets[3] == 24;
+
+        if (directAlphaCmp)
         {
-            pixelArmOp(c, PA_CMP, 0, 1, 10, 1);
+            int cmpReg = (!depth && !dither) ? 10 : refReg;
+            if (depth || dither)
+                pixelArmLoad(c, refReg, 0, PA_ALPHA_REF);
+            pixelArmOp(c, PA_CMP, 0, cmpReg, pixelArmShift(texReg, PA_LSR, 24), 1);
+            pixelArmBranch(c, pixelArmSwapAlphaCond(alphaRejectCond), lblAlphaReject);
+            if (needAlphaScratch)
+            {
+                pixelArmUXTB(c, 1, texReg, 24);
+                pixelArmStore(c, 1, 0, -24);
+            }
         }
         else
         {
-            pixelArmLoad(c, refReg, 0, PA_ALPHA_REF);
-            pixelArmOp(c, PA_CMP, 0, 1, refReg, 1);
+            /* Compute alpha into r1, keep texReg and r2 (colPacked if const). */
+            if (alphaMode == 1 || (isConstWhite && alphaMode == 3))
+            {
+                pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[3]);
+            }
+            else if (alphaMode == 2)
+            {
+                if (isConstWhite)
+                {
+                    pixelArmOp(c, PA_MOV, 1, 0, pixelArmImmediate(255u), 0);
+                }
+                else if (isConstRgb)
+                {
+                    pixelArmLoad(c, 2, 0, -4);
+                    pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(2, PA_LSR, 24), 0);
+                }
+                else
+                {
+                    pixelArmLoad(c, 2, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_A);
+                    pixelArmLoad(c, 3, 0, -16);
+                    pixelArmMLA(c, 2, 2, 4, 3);
+                    pixelArmUSAT8(c, 1, 2, 16);
+                }
+            }
+            else /* alphaMode == 3 */
+            {
+                pixelArmUXTB(c, 1, texReg, tex->rgbaOffsets[3]);
+                if (isConstRgb)
+                {
+                    pixelArmLoad(c, 2, 0, -4);
+                    pixelArmOp(c, PA_MOV, 3, 0, pixelArmShift(2, PA_LSR, 24), 0);
+                    pixelArmMLA(c, 1, 1, 3, 3);
+                    pixelArmOp(c, PA_MOV, 1, 0, pixelArmShift(1, PA_LSR, 8), 0);
+                }
+                else
+                {
+                    pixelArmLoad(c, 2, 0, PA_X_ADDER + 4 * GR_GRADIENT_COLOR_A);
+                    pixelArmLoad(c, 3, 0, -16);
+                    pixelArmMLA(c, 2, 2, 4, 3);
+                    pixelArmOp(c, PA_MOV, 2, 0, pixelArmShift(2, PA_LSR, 16), 0);
+                    pixelArmMLA(c, 1, 1, 2, 2);
+                    pixelArmUSAT8(c, 1, 1, 8);
+                }
+            }
+            if (!depth && !dither)
+            {
+                pixelArmOp(c, PA_CMP, 0, 1, 10, 1);
+            }
+            else
+            {
+                pixelArmLoad(c, refReg, 0, PA_ALPHA_REF);
+                pixelArmOp(c, PA_CMP, 0, 1, refReg, 1);
+            }
+            pixelArmBranch(c, alphaRejectCond, lblAlphaReject);
+            if (needAlphaScratch) pixelArmStore(c, 1, 0, -24);
         }
-        pixelArmBranch(c, alphaRejectCond, lblAlphaReject);
-        if (needAlphaScratch) pixelArmStore(c, 1, 0, -24);
         if (depth && sig->depthMask)
         {
             if (!isBilinear && textureLayout != 0 && texReg != 3 &&

@@ -163,21 +163,13 @@ int grClassifyTriangle(Gerbera_s *state, _grVertex *vertexCache,
  * otherwise computes the perspective-biased split position, lerps the clip
  * factors and the w, and snaps the screen position to the midpoint. */
 
-static GR_TESS_ALWAYS_INLINE int grSplitEdgeImpl(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
+static GR_TESS_ALWAYS_INLINE int grSplitEdgeTail(_grVertex *dst, _grVertex *v0, _grVertex *v1,
+                                                 int extent, int forceSplit, int willSplit)
 {
-    int willSplit = 1;
-    int extent = hgMax32(hgDiff32(v1->screenPosition[0], v0->screenPosition[0]),
-                         hgDiff32(v1->screenPosition[1], v0->screenPosition[1]));
     int w0, w1, t17, fdw2, factor1, t;
     _grVertex *swap;
     HGint64 sq, r;
 
-    if (extent < 0x4000)
-    {
-        if (forceSplit == 0)
-            return 0;
-        willSplit = 0;
-    }
     w0 = v0->normal[2];
     w1 = v1->normal[2];
     if (w0 == w1)
@@ -202,7 +194,7 @@ static GR_TESS_ALWAYS_INLINE int grSplitEdgeImpl(_grVertex *dst, _grVertex *v0, 
         int wBoost = w1 + (w1 >> 4);
         if (w0 <= wBoost)
         {
-            if (forceSplit == 0 && __builtin_expect(w1 > 0 && extent < 0x40000, 1))
+            if (forceSplit == 0 && extent < 0x40000)
                 return 0;
             w0 = wBoost;
         }
@@ -270,6 +262,21 @@ static GR_TESS_ALWAYS_INLINE int grSplitEdgeImpl(_grVertex *dst, _grVertex *v0, 
     return willSplit;
 }
 
+static GR_TESS_ALWAYS_INLINE int grSplitEdgeImpl(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
+{
+    int willSplit = 1;
+    int extent = hgMax32(hgDiff32(v1->screenPosition[0], v0->screenPosition[0]),
+                         hgDiff32(v1->screenPosition[1], v0->screenPosition[1]));
+
+    if (extent < 0x4000)
+    {
+        if (forceSplit == 0)
+            return 0;
+        willSplit = 0;
+    }
+    return grSplitEdgeTail(dst, v0, v1, extent, forceSplit, willSplit);
+}
+
 int grSplitEdge(_grVertex *dst, _grVertex *v0, _grVertex *v1, int forceSplit)
 {
     return grSplitEdgeImpl(dst, v0, v1, forceSplit);
@@ -291,11 +298,17 @@ static int grSplitEdgeFast(_grVertex *dst, _grVertex *v0, _grVertex *v1)
 static void grTessellateTriangle(Gerbera_s *state, unsigned int indices,
                                  unsigned int origIndices, unsigned int sideLevel);
 
-static GR_TESS_ALWAYS_INLINE void grTessellateTriangleDrawLeaf(
-    Gerbera_s *state, _grVertex *vertexBuffer,
-    unsigned int indices, unsigned int origIndices, int side)
+static GR_TESS_ALWAYS_INLINE HGint64 grComputeTriangleAreaXY(
+    int x0, int y0, int x1, int y1, int x2, int y2)
 {
-    HGint64 area64 = grComputeTriangleArea(vertexBuffer, indices);
+    return hgMadd64(hgMul64(x1 - x0, y2 - y0), y1 - y0, x0 - x2);
+}
+
+static GR_TESS_ALWAYS_INLINE void grTessellateTriangleDrawLeafXY(
+    Gerbera_s *state, unsigned int indices, unsigned int origIndices, int side,
+    int x0, int y0, int x1, int y1, int x2, int y2)
+{
+    HGint64 area64 = grComputeTriangleAreaXY(x0, y0, x1, y1, x2, y2);
 
     if (hgIsZero64(area64) != 0)
         return;
@@ -437,7 +450,10 @@ static void grTessellateTriangleSubdivide(Gerbera_s *state, unsigned int indices
     }
     else
     {
-        grTessellateTriangleDrawLeaf(state, vertexBuffer, indices, origIndices, side);
+        grTessellateTriangleDrawLeafXY(state, indices, origIndices, side,
+                                       v0->screenPosition[0], v0->screenPosition[1],
+                                       v1->screenPosition[0], v1->screenPosition[1],
+                                       v2->screenPosition[0], v2->screenPosition[1]);
     }
 }
 
@@ -467,22 +483,14 @@ static void grTessellateTriangle(Gerbera_s *state, unsigned int indices,
     int w0, w1, w2, wMin, wMax;
 
     if (__builtin_expect(extent < 0x4000, 0))
-    {
-        grTessellateTriangleDrawLeaf(state, vertexBuffer, indices, origIndices,
-                                     (int)(signed char)(sideLevel & 0xFFu));
-        return;
-    }
+        goto draw_leaf;
     if (grSubpixelTrunc(xMax) <= scissor->x0 ||
         grSubpixelTrunc(xMin) >= scissor->x1 ||
         grSubpixelTrunc(yMax) <= scissor->y0 ||
         grSubpixelTrunc(yMin) >= scissor->y1)
         return;
     if (__builtin_expect(level == 7, 0))
-    {
-        grTessellateTriangleDrawLeaf(state, vertexBuffer, indices, origIndices,
-                                     (int)(signed char)(sideLevel & 0xFFu));
-        return;
-    }
+        goto draw_leaf;
     w0 = v0->normal[2];
     w1 = v1->normal[2];
     w2 = v2->normal[2];
@@ -491,26 +499,33 @@ static void grTessellateTriangle(Gerbera_s *state, unsigned int indices,
     if (wMin == wMax)
     {
         if (wMin > 0)
-        {
-            grTessellateTriangleDrawLeaf(state, vertexBuffer, indices, origIndices,
-                                         (int)(signed char)(sideLevel & 0xFFu));
-            return;
-        }
+            goto draw_leaf;
     }
     else
     {
-        int wMaxBoosted = hgMax32(wMax, wMin + (wMin >> 4));
-        HGint64 smallSq = hgLsl64h(hgMul64(4096 - extent, 4096 - extent), 10);
-        HGint64 bigSq = hgLsl64h(hgMul64(extent + 4096, extent + 4096), 10);
+        int wBoost = wMin + (wMin >> 4);
 
-        if (hgLessThan64(hgMul64(wMaxBoosted, smallSq), hgMul64(wMin, bigSq)) != 0)
+        if (wMax <= wBoost)
         {
-            grTessellateTriangleDrawLeaf(state, vertexBuffer, indices, origIndices,
-                                         (int)(signed char)(sideLevel & 0xFFu));
-            return;
+            if (extent < 0x40000)
+                goto draw_leaf;
+            wMax = wBoost;
+        }
+        {
+            HGint64 smallSq = hgLsl64h(hgMul64(4096 - extent, 4096 - extent), 10);
+            HGint64 bigSq = hgLsl64h(hgMul64(extent + 4096, extent + 4096), 10);
+
+            if (hgLessThan64(hgMul64(wMax, smallSq), hgMul64(wMin, bigSq)) != 0)
+                goto draw_leaf;
         }
     }
     grTessellateTriangleSubdivide(state, indices, origIndices, sideLevel);
+    return;
+
+draw_leaf:
+    grTessellateTriangleDrawLeafXY(state, indices, origIndices,
+                                   (int)(signed char)(sideLevel & 0xFFu),
+                                   x0, y0, x1, y1, x2, y2);
 }
 
 /* --- grTriangleTessellator (grTessellator.inl 512; DLL 27249-27359) ----------
@@ -593,22 +608,21 @@ void grTriangleTessellator(Gerbera_s *state, _grClipTriangle *tri,
     else
     {
         int wBoost = wMin + (wMin >> 4);
-        int wMaxBoosted = wMax;
 
         if (wMax <= wBoost)
         {
-            if (__builtin_expect(wMin > 0 && extent < 0x40000, 1))
+            if (extent < 0x40000)
             {
                 grDrawClippedTriangle(state, tri, origIndices, 8);
                 return;
             }
-            wMaxBoosted = wBoost;
+            wMax = wBoost;
         }
         {
             HGint64 smallSq = hgLsl64h(hgMul64(4096 - extent, 4096 - extent), 10);
             HGint64 bigSq = hgLsl64h(hgMul64(extent + 4096, extent + 4096), 10);
 
-            if (hgLessThan64(hgMul64(wMaxBoosted, smallSq), hgMul64(wMin, bigSq)) != 0)
+            if (hgLessThan64(hgMul64(wMax, smallSq), hgMul64(wMin, bigSq)) != 0)
             {
                 grDrawClippedTriangle(state, tri, origIndices, 8);
                 return;

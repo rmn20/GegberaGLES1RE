@@ -276,40 +276,38 @@ static inline void grComputeDeltasSeq(const _grGradientInfo *info, int gradient,
     {
         int xAdder;
         int yAdder;
+        HGint64 syDelta = hgMul64(info->v01syPerArea, g02);
+        HGint64 sxDelta;
+
+        syDelta = hgMadd64(syDelta, info->v02syPerArea,
+                           (int)(0u - (unsigned int)g01));
+        if (__builtin_expect(info->shift < 18, 1))
         {
-            HGint64 syDelta = hgMul64(info->v01syPerArea, g02);
-            syDelta = hgMadd64(syDelta, info->v02syPerArea,
-                               (int)(0u - (unsigned int)g01));
-            if (__builtin_expect(info->shift < 18, 1))
-            {
-                int sh = 18 - info->shift;
-                int rsh = 32 - sh;
-                xAdder = (int)(((unsigned int)hgGet64h(syDelta) << sh) |
-                               ((unsigned int)hgGet64l(syDelta) >> rsh));
-            }
-            else
-            {
-                xAdder = hgGet64h(syDelta) >> (info->shift - 18);
-            }
-            info->pPP->xAdder[gradient] = xAdder;
+            int sh = 18 - info->shift;
+            int rsh = 32 - sh;
+            xAdder = (int)(((unsigned int)hgGet64h(syDelta) << sh) |
+                           ((unsigned int)hgGet64l(syDelta) >> rsh));
         }
+        else
         {
-            HGint64 sxDelta = hgMul64(info->v02sxPerArea, g01);
-            sxDelta = hgMadd64(sxDelta, info->v01sxPerArea,
-                               (int)(0u - (unsigned int)g02));
-            if (__builtin_expect(info->shift < 18, 1))
-            {
-                int sh = 18 - info->shift;
-                int rsh = 32 - sh;
-                yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
-                               ((unsigned int)hgGet64l(sxDelta) >> rsh));
-            }
-            else
-            {
-                yAdder = hgGet64h(sxDelta) >> (info->shift - 18);
-            }
-            info->pPP->yAdder[gradient] = yAdder;
+            xAdder = hgGet64h(syDelta) >> (info->shift - 18);
         }
+        sxDelta = hgMul64(info->v02sxPerArea, g01);
+        sxDelta = hgMadd64(sxDelta, info->v01sxPerArea,
+                           (int)(0u - (unsigned int)g02));
+        if (__builtin_expect(info->shift < 18, 1))
+        {
+            int sh = 18 - info->shift;
+            int rsh = 32 - sh;
+            yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
+                           ((unsigned int)hgGet64l(sxDelta) >> rsh));
+        }
+        else
+        {
+            yAdder = hgGet64h(sxDelta) >> (info->shift - 18);
+        }
+        info->pPP->xAdder[gradient] = xAdder;
+        info->pPP->yAdder[gradient] = yAdder;
     }
     else
     {
@@ -326,8 +324,20 @@ static inline void grComputeDeltasSeq(const _grGradientInfo *info, int gradient,
  * unit, coord 1..0 (T then S) - gradient index = coord + 2*texIndex + 6.
  */
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+static void grSetupTextureUnitCoord(Gerbera_s * restrict state, int texIndex, int (* restrict g0)[2],
+                                    int v0sx, int v0sy)
+    __asm__("grSetupTextureUnitCoord_asm");
+static void grSetupTextureUnit0AndDeltas(Gerbera_s * restrict state, const _grGradientInfo * restrict info,
+                                         const _grVertex * restrict v0, const _grVertex * restrict v1,
+                                         const _grVertex * restrict v2)
+    __asm__("grSetupTextureUnit0AndDeltas_asm");
+#else
 static void grSetupTextureUnitCoord(Gerbera_s * restrict state, int texIndex, int (* restrict g0)[2],
                                     int v0sx, int v0sy);
+#endif
 
 static int grSetupTriangleGradientsVisibleVertsAtY_slow(Gerbera_s *state, _grClipTriangle *tri,
                                                       _grVertex *v0, _grVertex *v1, _grVertex *v2,
@@ -515,6 +525,28 @@ static int grSetupTriangleGradientsVisibleVertsAtY_slow(Gerbera_s *state, _grCli
     return 1;
 }
 
+static inline unsigned int grLoadU32Aligned4(const unsigned short *p)
+{
+    unsigned int v;
+#if !defined(__ARM_FEATURE_UNALIGNED) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_memcpy(&v, __builtin_assume_aligned(p, 4), 4);
+#else
+    __builtin_memcpy(&v, p, 4);
+#endif
+    return v;
+}
+
+static inline void grStoreU32Aligned4(unsigned short *p, unsigned int v)
+{
+#if !defined(__ARM_FEATURE_UNALIGNED) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_memcpy(__builtin_assume_aligned(p, 4), &v, 4);
+#else
+    __builtin_memcpy(p, &v, 4);
+#endif
+}
+
+typedef char gr_check_vcolor_align_[(offsetof(_grVertex, color) & 3) == 0 ? 1 : -1];
+
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3")))
 #endif
@@ -548,7 +580,6 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s * restrict state, _grClipT
         int v0sx;
         int v0sy;
         _grGradientInfo info;
-        int texIndex;
         int coord;
 
         ok = 1;
@@ -617,16 +648,46 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s * restrict state, _grClipT
         }
 
         /* texcoord gradients (texIndex 1..0) */
-#if defined(__GNUC__) && !defined(__clang__)
-        #pragma GCC unroll 2
-#endif
-        for (texIndex = GR_GRADIENT_FOG; texIndex >= GR_GRADIENT_DEPTH; --texIndex)
+        if (__builtin_expect((gradientMask & 0x300u) != 0, 0))
         {
-            if (((192 << (2 * texIndex)) & gradientMask) != 0)
+            int *tc0 = &v0->texCoord[1].x;
+            int *tc1 = &v1->texCoord[1].x;
+            int *tc2 = &v2->texCoord[1].x;
+            int pairs[2][2];
+
+            for (coord = GR_GRADIENT_FOG; coord >= GR_GRADIENT_DEPTH; --coord)
             {
-                int *tc0 = &v0->texCoord[texIndex].x;
-                int *tc1 = &v1->texCoord[texIndex].x;
-                int *tc2 = &v2->texCoord[texIndex].x;
+                int d0 = tc0[coord];
+                int d1 = tc1[coord];
+                int d2 = tc2[coord];
+                int shift = hgClz32(hgAbs32(d2) | (hgAbs32(d0) | hgAbs32(d1))) - 1;
+                int clamped = hgClamp32_0_x(shift, 11);
+
+                d0 = (int)((unsigned int)d0 << clamped) >> 1;
+                d1 = (int)((unsigned int)d1 << clamped) >> 1;
+                d2 = (int)((unsigned int)d2 << clamped) >> 1;
+                pairs[coord][1] = clamped - 1;
+                grComputeDeltasSeq(&info, coord + 8, d1 - d0, d2 - d0);
+                pairs[coord][0] = d0;
+            }
+            grSetupTextureUnitCoord(state, 1, pairs, v0sx, v0sy);
+        }
+        if ((gradientMask & 0xC0u) != 0)
+        {
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+            if (__builtin_expect((gradientMask & 0xC0u) == 0xC0u &&
+                                 ((unsigned int)state->activeGradientMask & 0xC0u) == 0xC0u, 1))
+            {
+                grSetupTextureUnit0AndDeltas(state, &info, v0, v1, v2);
+            }
+            else
+#endif
+            {
+                int *tc0 = &v0->texCoord[0].x;
+                int *tc1 = &v1->texCoord[0].x;
+                int *tc2 = &v2->texCoord[0].x;
                 int pairs[2][2];
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -637,23 +698,17 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s * restrict state, _grClipT
                     int d0 = tc0[coord];
                     int d1 = tc1[coord];
                     int d2 = tc2[coord];
-                    int shift;
+                    int shift = hgClz32(hgAbs32(d2) | (hgAbs32(d0) | hgAbs32(d1))) - 1;
+                    int clamped = hgClamp32_0_x(shift, 11);
 
-                    shift = hgClz32(hgAbs32(d2) | (hgAbs32(d0) | hgAbs32(d1))) - 1;
-                    {
-                        int clamped = hgClamp32_0_x(shift, 11);
-                        d0 = (int)((unsigned int)d0 << clamped);
-                        d1 = (int)((unsigned int)d1 << clamped);
-                        d2 = (int)((unsigned int)d2 << clamped);
-                        d0 >>= 1;
-                        d1 >>= 1;
-                        d2 >>= 1;
-                        pairs[coord][1] = clamped - 1;
-                    }
-                    grComputeDeltasSeq(&info, coord + 2 * texIndex + 6, d1 - d0, d2 - d0);
+                    d0 = (int)((unsigned int)d0 << clamped) >> 1;
+                    d1 = (int)((unsigned int)d1 << clamped) >> 1;
+                    d2 = (int)((unsigned int)d2 << clamped) >> 1;
+                    pairs[coord][1] = clamped - 1;
+                    grComputeDeltasSeq(&info, coord + 6, d1 - d0, d2 - d0);
                     pairs[coord][0] = d0;
                 }
-                grSetupTextureUnitCoord(state, texIndex, pairs, v0sx, v0sy);
+                grSetupTextureUnitCoord(state, 0, pairs, v0sx, v0sy);
             }
         }
 
@@ -693,22 +748,20 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s * restrict state, _grClipT
             {
                 if (side == GR_SIDE_FRONT && (gradientMask & 0x1Cu) == 0x1Cu)
                 {
-                    unsigned int rg0, rg1, rg2;
-                    __builtin_memcpy(&rg0, &v0->color.final[0][0], sizeof(rg0));
-                    __builtin_memcpy(&rg1, &v1->color.final[0][0], sizeof(rg1));
-                    __builtin_memcpy(&rg2, &v2->color.final[0][0], sizeof(rg2));
-                    if (rg0 == rg1 && rg0 == rg2)
+                    unsigned int rg0 = grLoadU32Aligned4(&v0->color.final[0][0]);
+                    unsigned int rg1 = grLoadU32Aligned4(&v1->color.final[0][0]);
+                    unsigned int rg2 = grLoadU32Aligned4(&v2->color.final[0][0]);
+                    if (__builtin_expect(rg0 == rg1 && rg0 == rg2, 1))
                     {
                         const unsigned short *c = &v0->color.final[0][0];
                         int sameAll;
                         if (gradientMask & 0x20u)
                         {
-                            unsigned int ba0, ba1, ba2;
-                            __builtin_memcpy(&ba0, &v0->color.final[0][2], sizeof(ba0));
-                            __builtin_memcpy(&ba1, &v1->color.final[0][2], sizeof(ba1));
-                            __builtin_memcpy(&ba2, &v2->color.final[0][2], sizeof(ba2));
+                            unsigned int ba0 = grLoadU32Aligned4(&v0->color.final[0][2]);
+                            unsigned int ba1 = grLoadU32Aligned4(&v1->color.final[0][2]);
+                            unsigned int ba2 = grLoadU32Aligned4(&v2->color.final[0][2]);
                             sameAll = (ba0 == ba1 && ba0 == ba2);
-                            if (sameAll)
+                            if (__builtin_expect(sameAll, 1))
                             {
                                 pixelPipe->reference[GR_GRADIENT_COLOR_A] = ((int)c[3] << 8) + 0x8000;
                                 pixelPipe->xAdder[GR_GRADIENT_COLOR_A] = 0;
@@ -719,7 +772,7 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s * restrict state, _grClipT
                         {
                             sameAll = (c[2] == v1->color.final[0][2] && c[2] == v2->color.final[0][2]);
                         }
-                        if (sameAll)
+                        if (__builtin_expect(sameAll, 1))
                         {
                             pixelPipe->reference[GR_GRADIENT_COLOR_R] = ((int)c[0] << 8) + 0x8000;
                             pixelPipe->reference[GR_GRADIENT_COLOR_G] = ((int)c[1] << 8) + 0x8000;
@@ -1711,15 +1764,135 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
  * from the corresponding source vertex.
  * Depth (mask bit 0) is NOT handled here - it is a per-scanline gradient. */
 
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void grInterp2Verts(_grVertex * restrict vertex,
+                           const _grVertex * restrict u0,
+                           const _grVertex * restrict u1,
+                           int w0, unsigned int maskAndSide)
+{
+    int w1 = IUNITSCALAR_ONE - w0;
+    unsigned int gradientMask = maskAndSide & 0x3FFu;
+    int side = (int)(maskAndSide >> 31);
+#define GR_INTERP2_TEXCOORD(u_)                                                 \
+    do {                                                                        \
+        int t0y = u0->texCoord[u_].y;                                           \
+        int t1y = u1->texCoord[u_].y;                                           \
+        int gy = (t0y == t1y) ? t0y :                                           \
+            (int)imLsl64h_0_31OF(hgMadd64(hgMul64(w0, t0y), w1, t1y), 3);       \
+        int t0x = u0->texCoord[u_].x;                                           \
+        int t1x = u1->texCoord[u_].x;                                           \
+        int gx = (t0x == t1x) ? t0x :                                           \
+            (int)imLsl64h_0_31OF(hgMadd64(hgMul64(w0, t0x), w1, t1x), 3);       \
+        if (hgInRange32(gy, hgMin32(t0y, t1y), hgMax32(t0y, t1y)) == 0 &&       \
+            grAssert("hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1))",        \
+                     "grRasterizer.inl", 332) != 0)                             \
+            grDie(0);                                                           \
+        if (hgInRange32(gx, hgMin32(t0x, t1x), hgMax32(t0x, t1x)) == 0 &&       \
+            grAssert("hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1))",        \
+                     "grRasterizer.inl", 332) != 0)                             \
+            grDie(0);                                                           \
+        vertex->texCoord[u_].y = gy;                                            \
+        vertex->texCoord[u_].x = gx;                                            \
+    } while (0)
+
+    if ((gradientMask & 0xC0u) != 0)
+        GR_INTERP2_TEXCOORD(0);
+    if (__builtin_expect((gradientMask & 0x300u) != 0, 0))
+        GR_INTERP2_TEXCOORD(1);
+#undef GR_INTERP2_TEXCOORD
+    if ((gradientMask & 2u) != 0)
+    {
+        int t0 = u0->color.final[1][3];
+        int t1 = u1->color.final[1][3];
+        int g = (t0 == t1) ? t0 :
+            (int)imLsl64h_0_31OF(hgMadd64(hgMul64(w0, t0), w1, t1), 3);
+        if (hgInRange32(g, 0, 0xFFFF) == 0 &&
+            grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 341) != 0)
+            grDie(0);
+        if (hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1)) == 0 &&
+            grAssert("hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1))",
+                     "grRasterizer.inl", 343) != 0)
+            grDie(0);
+        vertex->color.final[1][3] = (unsigned short)g;
+    }
+    if ((gradientMask & 0x1Cu) != 0)
+    {
+        const unsigned short *c0 = u0->color.final[side];
+        const unsigned short *c1 = u1->color.final[side];
+        unsigned short *cd = vertex->color.final[side];
+        if (__builtin_expect((gradientMask & 0x1Cu) == 0x1Cu, 1))
+        {
+            unsigned int rg0 = grLoadU32Aligned4(c0);
+            unsigned int rg1 = grLoadU32Aligned4(c1);
+            if (__builtin_expect(rg0 == rg1, 1))
+            {
+                if (side == 0 && (gradientMask & 0x20u) != 0)
+                {
+                    unsigned int ba0 = grLoadU32Aligned4(c0 + 2);
+                    unsigned int ba1 = grLoadU32Aligned4(c1 + 2);
+                    if (__builtin_expect(ba0 == ba1, 1))
+                    {
+                        grStoreU32Aligned4(cd, rg0);
+                        grStoreU32Aligned4(cd + 2, ba0);
+                        return;
+                    }
+                }
+                else if (c0[2] == c1[2])
+                {
+                    grStoreU32Aligned4(cd, rg0);
+                    cd[2] = c0[2];
+                    goto after_rgb2;
+                }
+            }
+        }
+#define GR_INTERP2_COMP(comp_)                                                  \
+        if ((gradientMask & (4u << (comp_))) != 0)                              \
+        {                                                                       \
+            int t0 = c0[comp_];                                                 \
+            int t1 = c1[comp_];                                                 \
+            int g = (t0 == t1) ? t0 :                                           \
+                (int)imLsl64h_0_31OF(hgMadd64(hgMul64(w0, t0), w1, t1), 3);     \
+            if (hgInRange32(g, 0, 0xFFFF) == 0 &&                               \
+                grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 371) != 0) \
+                grDie(0);                                                       \
+            if (hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1)) == 0 &&        \
+                grAssert("hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1))",    \
+                         "grRasterizer.inl", 373) != 0)                         \
+                grDie(0);                                                       \
+            cd[comp_] = (unsigned short)g;                                      \
+        }
+        GR_INTERP2_COMP(2);
+        GR_INTERP2_COMP(1);
+        GR_INTERP2_COMP(0);
+#undef GR_INTERP2_COMP
+    }
+after_rgb2:
+    if ((gradientMask & 0x20u) != 0)
+    {
+        int t0 = u0->color.final[0][3];
+        int t1 = u1->color.final[0][3];
+        int g = (t0 == t1) ? t0 :
+            (int)imLsl64h_0_31OF(hgMadd64(hgMul64(w0, t0), w1, t1), 3);
+        if (hgInRange32(g, 0, 0xFFFF) == 0 &&
+            grAssert("hgInRange32(g, 0, 65535)", "grRasterizer.inl", 384) != 0)
+            grDie(0);
+        if (hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1)) == 0 &&
+            grAssert("hgInRange32(g, hgMin32(t0, t1), hgMax32(t0, t1))",
+                     "grRasterizer.inl", 386) != 0)
+            grDie(0);
+        vertex->color.final[0][3] = (unsigned short)g;
+    }
+}
+
 void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
                                   unsigned int origIndices, int side)
 {
-    _grVertex *v0 = GR_VERTEX_BUFFER(state) + grUnpackIndex(origIndices, 0);
-    _grVertex *v1 = GR_VERTEX_BUFFER(state) + grUnpackIndex(origIndices, 1);
-    _grVertex *v2 = GR_VERTEX_BUFFER(state) + grUnpackIndex(origIndices, 2);
-    unsigned int gradientMask = (unsigned int)state->activeGradientMask;
-    int a = vertex->normal[0];
-    int b = vertex->normal[1];
+    _grVertex * restrict vb;
+    unsigned int gradientMask;
+    int a;
+    int b;
 
     if ((state == NULL || vertex == NULL) &&
         grAssert("state && vertex", "grRasterizer.inl", 251) != 0)
@@ -1736,6 +1909,10 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
         grAssert("vertex->stateMask & (GR_VERTEXMASK_SURVIVED_2D_REJECTION | GR_VERTEXMASK_SURVIVED_3D_REJECTION)",
                  "grRasterizer.inl", 255) != 0)
         grDie(0);
+    vb = GR_VERTEX_BUFFER(state);
+    gradientMask = (unsigned int)state->activeGradientMask;
+    a = vertex->normal[0];
+    b = vertex->normal[1];
     vertex->stateMask = (unsigned short)((vertex->stateMask & ~0x40u) | 0x20u);
     if (hgInRange32(a, 0, IUNITSCALAR_ONE) == 0 &&
         grAssert("hgInRange32(a, 0, IUNITSCALAR_ONE)", "grRasterizer.inl", 259) != 0)
@@ -1746,7 +1923,7 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
     if (hgInRange32(a + b, 0, IUNITSCALAR_ONE) == 0 &&
         grAssert("hgInRange32(a+b, 0, IUNITSCALAR_ONE)", "grRasterizer.inl", 261) != 0)
         grDie(0);
-    if (((b | a) & 0x1FFFFFFF) != 0)
+    if (__builtin_expect(((b | a) & 0x1FFFFFFF) != 0, 1))
     {
         int c = IUNITSCALAR_ONE - a - b;
 
@@ -1754,6 +1931,31 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
             grAssert("a!=IUNITSCALAR_ONE && b!=IUNITSCALAR_ONE && (a!=0 || b!=0)",
                      "grRasterizer.inl", 303) != 0)
             grDie(0);
+        if (c == 0)
+        {
+            _grVertex *u0 = vb + grUnpackIndex(origIndices, 0);
+            _grVertex *u1 = vb + grUnpackIndex(origIndices, 1);
+            grInterp2Verts(vertex, u0, u1, a, gradientMask | ((unsigned int)side << 31));
+            return;
+        }
+        if (a == 0)
+        {
+            _grVertex *u0 = vb + grUnpackIndex(origIndices, 1);
+            _grVertex *u1 = vb + grUnpackIndex(origIndices, 2);
+            grInterp2Verts(vertex, u0, u1, b, gradientMask | ((unsigned int)side << 31));
+            return;
+        }
+        if (b == 0)
+        {
+            _grVertex *u0 = vb + grUnpackIndex(origIndices, 0);
+            _grVertex *u1 = vb + grUnpackIndex(origIndices, 2);
+            grInterp2Verts(vertex, u0, u1, a, gradientMask | ((unsigned int)side << 31));
+            return;
+        }
+        {
+            _grVertex *v0 = vb + grUnpackIndex(origIndices, 0);
+            _grVertex *v1 = vb + grUnpackIndex(origIndices, 1);
+            _grVertex *v2 = vb + grUnpackIndex(origIndices, 2);
 #define GR_INTERP_TEXCOORD(u_)                                                  \
         do {                                                                    \
             int t0y = v0->texCoord[u_].y;                                       \
@@ -1812,6 +2014,33 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
             const unsigned short *c1 = v1->color.final[side];
             const unsigned short *c2 = v2->color.final[side];
             unsigned short *cd = vertex->color.final[side];
+            if (__builtin_expect((gradientMask & 0x1Cu) == 0x1Cu, 1))
+            {
+                unsigned int rg0 = grLoadU32Aligned4(c0);
+                unsigned int rg1 = grLoadU32Aligned4(c1);
+                unsigned int rg2 = grLoadU32Aligned4(c2);
+                if (__builtin_expect(rg0 == rg1 && rg0 == rg2, 1))
+                {
+                    if (side == 0 && (gradientMask & 0x20u) != 0)
+                    {
+                        unsigned int ba0 = grLoadU32Aligned4(c0 + 2);
+                        unsigned int ba1 = grLoadU32Aligned4(c1 + 2);
+                        unsigned int ba2 = grLoadU32Aligned4(c2 + 2);
+                        if (__builtin_expect(ba0 == ba1 && ba0 == ba2, 1))
+                        {
+                            grStoreU32Aligned4(cd, rg0);
+                            grStoreU32Aligned4(cd + 2, ba0);
+                            return;
+                        }
+                    }
+                    else if (c0[2] == c1[2] && c0[2] == c2[2])
+                    {
+                        grStoreU32Aligned4(cd, rg0);
+                        cd[2] = c0[2];
+                        goto after_rgb3;
+                    }
+                }
+            }
 #define GR_INTERP_COMP(comp_)                                                   \
             if ((gradientMask & (4u << (comp_))) != 0)                          \
             {                                                                   \
@@ -1837,6 +2066,7 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
             GR_INTERP_COMP(0);
 #undef GR_INTERP_COMP
         }
+after_rgb3:
         if ((gradientMask & 0x20) != 0)
         {
             int t0 = v0->color.final[0][3];
@@ -1856,17 +2086,18 @@ void grInterpolateVertexGradients(Gerbera_s *state, _grVertex *vertex,
                 grDie(0);
             vertex->color.final[0][3] = (unsigned short)g;
         }
+        }
     }
     else
     {
         _grVertex *rec;
 
         if (a == IUNITSCALAR_ONE)
-            rec = v0;
+            rec = vb + grUnpackIndex(origIndices, 0);
         else if (b == IUNITSCALAR_ONE)
-            rec = v1;
+            rec = vb + grUnpackIndex(origIndices, 1);
         else
-            rec = v2;
+            rec = vb + grUnpackIndex(origIndices, 2);
         if ((a != IUNITSCALAR_ONE && b != IUNITSCALAR_ONE && (a != 0 || b != 0)) &&
             grAssert("a==IUNITSCALAR_ONE || b==IUNITSCALAR_ONE || (a==0 && b==0)",
                      "grRasterizer.inl", 277) != 0)
@@ -2124,9 +2355,9 @@ typedef char gr_check_tu_ppu_[offsetof(_grPixelPipe, textureUnit) == 0 && sizeof
                               offsetof(_grPixelPipeTextureUnit, log2DimS) == 32 ? 1 : -1];
 
 #if defined(__GNUC__) && !defined(__clang__)
-__attribute__((noinline, noclone, naked))
+__attribute__((noinline, noclone, naked, used))
 #else
-__attribute__((noinline, naked))
+__attribute__((noinline, naked, used))
 #endif
 static void grSetupTextureUnitCoord(Gerbera_s * restrict state, int texIndex, int (* restrict g0)[2],
                                     int v0sx, int v0sy)
@@ -2392,6 +2623,551 @@ static void grSetupTextureUnitCoord(Gerbera_s * restrict state, int texIndex, in
         "str     r2, [r0, #272]\n\t"
         "str     r2, [r0, #192]\n\t"
         "str     r2, [r11, #24]\n\t"
+        "pop     {r4-r11, pc}\n\t");
+}
+
+typedef char gr_check_tud_vtc_[offsetof(_grVertex, texCoord) == 56 ? 1 : -1];
+typedef char gr_check_tud_ppref_[offsetof(_grPixelPipe, reference) == 192 ? 1 : -1];
+typedef char gr_check_tud_ppxa_[offsetof(_grPixelPipe, xAdder) == 232 ? 1 : -1];
+typedef char gr_check_tud_ppya_[offsetof(_grPixelPipe, yAdder) == 272 ? 1 : -1];
+typedef char gr_check_tud_gr_[GR_GRADIENT_TEX0_S == 6 && GR_GRADIENT_TEX0_T == 7 ? 1 : -1];
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, noclone, naked))
+#else
+__attribute__((noinline, naked))
+#endif
+static void grSetupTextureUnit0AndDeltas(Gerbera_s * restrict state, const _grGradientInfo * restrict info,
+                                         const _grVertex * restrict v0, const _grVertex * restrict v1,
+                                         const _grVertex * restrict v2)
+{
+    (void)state; (void)info; (void)v0; (void)v1; (void)v2;
+    __asm__ volatile(
+        "push    {r4-r11, lr}\n\t"
+        "add     lr, r0, #4096\n\t"
+        "ldr     r5, [lr, #1012]\n\t"      /* textureUnit[0].texture */
+        "ldr     r4, [r1]\n\t"             /* pipe = info->pPP */
+        "ldrb    r12, [r5, #183]\n\t"      /* parmMask */
+        "tst     r12, #32\n\t"
+        "beq     0f\n\t"
+        "ldrh    r12, [r5, #206]\n\t"      /* filterMask[0..1] */
+        "tst     r12, #2\n\t"
+        "bne     20f\n\t"
+        "eor     lr, r12, r12, lsr #8\n\t"
+        "tst     lr, #255\n\t"
+        "bne     20f\n\t"
+    "0:\n\t"
+        "ldr     r0, [sp, #36]\n\t"        /* v2 */
+        "ldrb    r6, [r5, #207]\n\t"       /* filterMask[1] */
+        "ldrsh   r7, [r5, #4]\n\t"         /* log2S */
+        "ldrsh   r8, [r5, #6]\n\t"         /* log2T */
+        "ldr     r9, [r5, #0]\n\t"         /* pixels */
+        "ldr     r10, [r5, #176]\n\t"      /* palette */
+        "and     r6, r6, #1\n\t"           /* linear */
+        "mov     r12, #1\n\t"
+        "lsl     r11, r12, r7\n\t"
+        "sub     r11, r11, #1\n\t"         /* sMask */
+        "lsl     r12, r12, r8\n\t"
+        "sub     r12, r12, #1\n\t"         /* tMask */
+        "str     r9, [r4, #4]\n\t"
+        "str     r10, [r4, #8]\n\t"
+        "str     r6, [r4, #12]\n\t"
+        "str     r11, [r4, #16]\n\t"
+        "str     r12, [r4, #20]\n\t"
+        "str     r7, [r4, #32]\n\t"
+        "ldrh    r12, [r5, #204]\n\t"      /* wrapMode[0] | (wrapMode[1] << 8) */
+        "orr     r5, r12, r6, lsl #16\n\t" /* wrapS | (wrapT << 8) | (linear << 16) */
+        "orr     r7, r7, r8, lsl #8\n\t"   /* log2S | (log2T << 8) */
+        /* coord = 1 (T, +60, grad 7) */
+        "cmp     r8, #0\n\t"
+        "beq     10f\n\t"
+        "ldr     r9, [r2, #60]\n\t"        /* d0 */
+        "ldr     r10, [r3, #60]\n\t"       /* d1 */
+        "ldr     r11, [r0, #60]\n\t"       /* d2 */
+        "eor     r6, r9, r9, asr #31\n\t"
+        "sub     r6, r6, r9, asr #31\n\t"
+        "eor     r12, r10, r10, asr #31\n\t"
+        "sub     r12, r12, r10, asr #31\n\t"
+        "orr     r6, r6, r12\n\t"
+        "eor     r12, r11, r11, asr #31\n\t"
+        "sub     r12, r12, r11, asr #31\n\t"
+        "orr     r6, r6, r12\n\t"
+        "clz     r6, r6\n\t"
+        "sub     r6, r6, #1\n\t"
+        "asr     r12, r6, #31\n\t"
+        "bic     r6, r6, r12\n\t"
+        "cmp     r6, #11\n\t"
+        "movgt   r6, #11\n\t"              /* clamped */
+        "lsl     r9, r9, r6\n\t"
+        "asr     r9, r9, #1\n\t"           /* d0 */
+        "lsl     r10, r10, r6\n\t"
+        "asr     r10, r10, #1\n\t"         /* d1 */
+        "lsl     r11, r11, r6\n\t"
+        "asr     r11, r11, #1\n\t"         /* d2 */
+        "sub     r10, r10, r9\n\t"         /* g01 */
+        "sub     r11, r11, r9\n\t"         /* g02 */
+        "sub     r6, r6, #1\n\t"           /* g0sh */
+        "tst     r5, #0x10000\n\t"
+        "beq     1f\n\t"
+        "subs    r12, r8, r6\n\t"
+        "mov     lr, #0x100000\n\t"
+        "lsrge   r12, lr, r12\n\t"
+        "rsblt   r12, r12, #0\n\t"
+        "lsllt   r12, lr, r12\n\t"
+        "sub     r9, r9, r12\n\t"          /* d0 - bias */
+    "1:\n\t"
+        "orrs    r12, r10, r11\n\t"
+        "moveq   r10, #0\n\t"
+        "moveq   r11, #0\n\t"
+        "beq     4f\n\t"
+        "ldr     r0, [r1, #16]\n\t"        /* v01sy */
+        "rsb     lr, r10, #0\n\t"          /* -g01 */
+        "smull   r8, r12, r0, r11\n\t"
+        "ldr     r0, [r1, #24]\n\t"        /* v02sy */
+        "smlal   r8, r12, r0, lr\n\t"
+        "ldr     r0, [r1, #28]\n\t"        /* shift */
+        "cmp     r0, #18\n\t"
+        "bge     2f\n\t"
+        "rsb     r0, r0, #18\n\t"
+        "lsl     r12, r12, r0\n\t"
+        "rsb     lr, r0, #32\n\t"
+        "orr     lr, r12, r8, lsr lr\n\t"
+        "b       3f\n\t"
+    "2:\n\t"
+        "sub     r0, r0, #18\n\t"
+        "asr     lr, r12, r0\n\t"
+    "3:\n\t"
+        "ldr     r0, [r1, #20]\n\t"        /* v02sx */
+        "rsb     r11, r11, #0\n\t"         /* -g02 */
+        "smull   r8, r12, r0, r10\n\t"
+        "ldr     r0, [r1, #12]\n\t"        /* v01sx */
+        "smlal   r8, r12, r0, r11\n\t"
+        "ldr     r0, [r1, #28]\n\t"
+        "cmp     r0, #18\n\t"
+        "bge     5f\n\t"
+        "rsb     r0, r0, #18\n\t"
+        "lsl     r12, r12, r0\n\t"
+        "rsb     r10, r0, #32\n\t"
+        "orr     r11, r12, r8, lsr r10\n\t"
+        "b       6f\n\t"
+    "5:\n\t"
+        "sub     r0, r0, #18\n\t"
+        "asr     r11, r12, r0\n\t"
+    "6:\n\t"
+        "mov     r10, lr\n\t"              /* xAdd */
+        "ldr     r0, [r1, #4]\n\t"         /* v0sx */
+        "ldr     r8, [r1, #8]\n\t"         /* v0sy */
+        "smull   r12, lr, r0, r10\n\t"
+        "smlal   r12, lr, r8, r11\n\t"
+        "lsr     r12, r12, #12\n\t"
+        "orr     r12, r12, lr, lsl #20\n\t"
+        "sub     r9, r9, r12\n\t"
+    "4:\n\t"
+        "lsr     r8, r5, #8\n\t"
+        "and     r8, r8, #255\n\t"
+        "cmp     r8, #1\n\t"
+        "addeq   r8, r6, #21\n\t"
+        "moveq   r6, #0\n\t"
+        "lsrne   r8, r8, #1\n\t"
+        "addne   r6, r6, r8\n\t"
+        "rsbne   r8, r8, #32\n\t"
+        "rsbne   r6, r6, #11\n\t"
+        "lsl     r9, r9, r6\n\t"
+        "lsl     r10, r10, r6\n\t"
+        "lsl     r11, r11, r6\n\t"
+        "str     r9, [r4, #220]\n\t"
+        "str     r10, [r4, #260]\n\t"
+        "str     r11, [r4, #300]\n\t"
+        "sub     r8, r8, r7, lsr #8\n\t"
+        "str     r8, [r4, #28]\n\t"
+        "ldr     r0, [sp, #36]\n\t"        /* reload v2 */
+        "b       11f\n\t"
+    "10:\n\t"
+        "mov     r8, #0\n\t"
+        "str     r8, [r4, #220]\n\t"
+        "str     r8, [r4, #260]\n\t"
+        "str     r8, [r4, #300]\n\t"
+        "str     r8, [r4, #28]\n\t"
+    "11:\n\t"
+        /* coord = 0 (S, +56, grad 6) */
+        "ands    r8, r7, #255\n\t"         /* log2S */
+        "beq     19f\n\t"
+        "ldr     r9, [r2, #56]\n\t"        /* d0 */
+        "ldr     r10, [r3, #56]\n\t"       /* d1 */
+        "ldr     r11, [r0, #56]\n\t"       /* d2 */
+        "eor     r6, r9, r9, asr #31\n\t"
+        "sub     r6, r6, r9, asr #31\n\t"
+        "eor     r12, r10, r10, asr #31\n\t"
+        "sub     r12, r12, r10, asr #31\n\t"
+        "orr     r6, r6, r12\n\t"
+        "eor     r12, r11, r11, asr #31\n\t"
+        "sub     r12, r12, r11, asr #31\n\t"
+        "orr     r6, r6, r12\n\t"
+        "clz     r6, r6\n\t"
+        "sub     r6, r6, #1\n\t"
+        "asr     r12, r6, #31\n\t"
+        "bic     r6, r6, r12\n\t"
+        "cmp     r6, #11\n\t"
+        "movgt   r6, #11\n\t"
+        "lsl     r9, r9, r6\n\t"
+        "asr     r9, r9, #1\n\t"
+        "lsl     r10, r10, r6\n\t"
+        "asr     r10, r10, #1\n\t"
+        "lsl     r11, r11, r6\n\t"
+        "asr     r11, r11, #1\n\t"
+        "sub     r10, r10, r9\n\t"
+        "sub     r11, r11, r9\n\t"
+        "sub     r6, r6, #1\n\t"
+        "tst     r5, #0x10000\n\t"
+        "beq     12f\n\t"
+        "subs    r12, r8, r6\n\t"
+        "mov     lr, #0x100000\n\t"
+        "lsrge   r12, lr, r12\n\t"
+        "rsblt   r12, r12, #0\n\t"
+        "lsllt   r12, lr, r12\n\t"
+        "sub     r9, r9, r12\n\t"
+    "12:\n\t"
+        "orrs    r12, r10, r11\n\t"
+        "moveq   r10, #0\n\t"
+        "moveq   r11, #0\n\t"
+        "beq     17f\n\t"
+        "ldr     r0, [r1, #16]\n\t"
+        "rsb     lr, r10, #0\n\t"
+        "smull   r8, r12, r0, r11\n\t"
+        "ldr     r0, [r1, #24]\n\t"
+        "smlal   r8, r12, r0, lr\n\t"
+        "ldr     r0, [r1, #28]\n\t"
+        "cmp     r0, #18\n\t"
+        "bge     13f\n\t"
+        "rsb     r0, r0, #18\n\t"
+        "lsl     r12, r12, r0\n\t"
+        "rsb     lr, r0, #32\n\t"
+        "orr     lr, r12, r8, lsr lr\n\t"
+        "b       14f\n\t"
+    "13:\n\t"
+        "sub     r0, r0, #18\n\t"
+        "asr     lr, r12, r0\n\t"
+    "14:\n\t"
+        "ldr     r0, [r1, #20]\n\t"
+        "rsb     r11, r11, #0\n\t"
+        "smull   r8, r12, r0, r10\n\t"
+        "ldr     r0, [r1, #12]\n\t"
+        "smlal   r8, r12, r0, r11\n\t"
+        "ldr     r0, [r1, #28]\n\t"
+        "cmp     r0, #18\n\t"
+        "bge     15f\n\t"
+        "rsb     r0, r0, #18\n\t"
+        "lsl     r12, r12, r0\n\t"
+        "rsb     r10, r0, #32\n\t"
+        "orr     r11, r12, r8, lsr r10\n\t"
+        "b       16f\n\t"
+    "15:\n\t"
+        "sub     r0, r0, #18\n\t"
+        "asr     r11, r12, r0\n\t"
+    "16:\n\t"
+        "mov     r10, lr\n\t"
+        "ldr     r0, [r1, #4]\n\t"
+        "ldr     r8, [r1, #8]\n\t"
+        "smull   r12, lr, r0, r10\n\t"
+        "smlal   r12, lr, r8, r11\n\t"
+        "lsr     r12, r12, #12\n\t"
+        "orr     r12, r12, lr, lsl #20\n\t"
+        "sub     r9, r9, r12\n\t"
+    "17:\n\t"
+        "and     r8, r5, #255\n\t"
+        "cmp     r8, #1\n\t"
+        "addeq   r8, r6, #21\n\t"
+        "moveq   r6, #0\n\t"
+        "lsrne   r8, r8, #1\n\t"
+        "addne   r6, r6, r8\n\t"
+        "rsbne   r8, r8, #32\n\t"
+        "rsbne   r6, r6, #11\n\t"
+        "lsl     r9, r9, r6\n\t"
+        "lsl     r10, r10, r6\n\t"
+        "lsl     r11, r11, r6\n\t"
+        "str     r9, [r4, #216]\n\t"
+        "str     r10, [r4, #256]\n\t"
+        "str     r11, [r4, #296]\n\t"
+        "and     r7, r7, #255\n\t"
+        "sub     r8, r8, r7\n\t"
+        "str     r8, [r4, #24]\n\t"
+        "pop     {r4-r11, pc}\n\t"
+    "19:\n\t"
+        "mov     r8, #0\n\t"
+        "str     r8, [r4, #216]\n\t"
+        "str     r8, [r4, #256]\n\t"
+        "str     r8, [r4, #296]\n\t"
+        "str     r8, [r4, #24]\n\t"
+        "pop     {r4-r11, pc}\n\t"
+    "20:\n\t"
+        /* Mipmapped path: compute g0, xAdd/yAdd, maxRho2, mipLevel, then finish T & S */
+        "sub     sp, sp, #32\n\t"
+        "mov     r12, #0\n\t"
+        "str     r5, [sp, #16]\n\t"        /* texture */
+        "str     r12, [sp, #20]\n\t"       /* maxRho2_lo */
+        "str     r12, [sp, #24]\n\t"       /* maxRho2_hi */
+        "str     r1, [sp, #28]\n\t"        /* info */
+        "mov     r5, r1\n\t"               /* r5 = info */
+        "ldr     r6, [sp, #68]\n\t"        /* v2 */
+        "mov     r7, #1\n\t"
+    "21:\n\t"
+        "cmp     r7, #0\n\t"
+        "ldrne   r9, [r2, #60]\n\t"
+        "ldrne   r10, [r3, #60]\n\t"
+        "ldrne   r11, [r6, #60]\n\t"
+        "ldreq   r9, [r2, #56]\n\t"
+        "ldreq   r10, [r3, #56]\n\t"
+        "ldreq   r11, [r6, #56]\n\t"
+        "eor     r0, r9, r9, asr #31\n\t"
+        "sub     r0, r0, r9, asr #31\n\t"
+        "eor     r12, r10, r10, asr #31\n\t"
+        "sub     r12, r12, r10, asr #31\n\t"
+        "orr     r0, r0, r12\n\t"
+        "eor     r12, r11, r11, asr #31\n\t"
+        "sub     r12, r12, r11, asr #31\n\t"
+        "orr     r0, r0, r12\n\t"
+        "clz     r0, r0\n\t"
+        "sub     r0, r0, #1\n\t"
+        "asr     r12, r0, #31\n\t"
+        "bic     r0, r0, r12\n\t"
+        "cmp     r0, #11\n\t"
+        "movgt   r0, #11\n\t"
+        "lsl     r9, r9, r0\n\t"
+        "asr     r9, r9, #1\n\t"
+        "lsl     r10, r10, r0\n\t"
+        "asr     r10, r10, #1\n\t"
+        "lsl     r11, r11, r0\n\t"
+        "asr     r11, r11, #1\n\t"
+        "sub     r10, r10, r9\n\t"
+        "sub     r11, r11, r9\n\t"
+        "sub     r0, r0, #1\n\t"
+        "add     r1, sp, r7, lsl #3\n\t"
+        "str     r9, [r1]\n\t"             /* d0 */
+        "str     r0, [r1, #4]\n\t"         /* g0sh */
+        "mov     r9, r0\n\t"               /* keep g0sh in r9 */
+        "orrs    r12, r10, r11\n\t"
+        "moveq   r10, #0\n\t"
+        "moveq   r11, #0\n\t"
+        "beq     26f\n\t"
+        "ldr     r0, [r5, #16]\n\t"
+        "rsb     lr, r10, #0\n\t"
+        "smull   r8, r12, r0, r11\n\t"
+        "ldr     r0, [r5, #24]\n\t"
+        "smlal   r8, r12, r0, lr\n\t"
+        "ldr     r0, [r5, #28]\n\t"
+        "cmp     r0, #18\n\t"
+        "bge     22f\n\t"
+        "rsb     r0, r0, #18\n\t"
+        "lsl     r12, r12, r0\n\t"
+        "rsb     lr, r0, #32\n\t"
+        "orr     lr, r12, r8, lsr lr\n\t"
+        "b       23f\n\t"
+    "22:\n\t"
+        "sub     r0, r0, #18\n\t"
+        "asr     lr, r12, r0\n\t"
+    "23:\n\t"
+        "ldr     r0, [r5, #20]\n\t"
+        "rsb     r11, r11, #0\n\t"
+        "smull   r8, r12, r0, r10\n\t"
+        "ldr     r0, [r5, #12]\n\t"
+        "smlal   r8, r12, r0, r11\n\t"
+        "ldr     r0, [r5, #28]\n\t"
+        "cmp     r0, #18\n\t"
+        "bge     24f\n\t"
+        "rsb     r0, r0, #18\n\t"
+        "lsl     r12, r12, r0\n\t"
+        "rsb     r10, r0, #32\n\t"
+        "orr     r11, r12, r8, lsr r10\n\t"
+        "b       25f\n\t"
+    "24:\n\t"
+        "sub     r0, r0, #18\n\t"
+        "asr     r11, r12, r0\n\t"
+    "25:\n\t"
+        "mov     r10, lr\n\t"
+    "26:\n\t"
+        "add     r0, r7, #6\n\t"
+        "add     r0, r4, r0, lsl #2\n\t"
+        "str     r10, [r0, #232]\n\t"
+        "str     r11, [r0, #272]\n\t"
+        "smull   r8, r12, r10, r10\n\t"
+        "smlal   r8, r12, r11, r11\n\t"
+        "ldr     lr, [sp, #16]\n\t"        /* texture */
+        "add     lr, lr, r7, lsl #1\n\t"
+        "ldrsh   r10, [lr, #4]\n\t"        /* mipmap[0].log2Dim[coord] */
+        "rsb     r10, r10, #7\n\t"
+        "add     r10, r10, r9\n\t"         /* 7 - shift + g0sh */
+        "lsl     r10, r10, #1\n\t"
+        "asr     r11, r10, #31\n\t"
+        "bic     r10, r10, r11\n\t"
+        "cmp     r10, #63\n\t"
+        "movgt   r10, #63\n\t"
+        "cmp     r10, #31\n\t"
+        "bgt     27f\n\t"
+        "rsb     r11, r10, #32\n\t"
+        "lsr     r8, r8, r10\n\t"
+        "orr     r8, r8, r12, lsl r11\n\t"
+        "lsr     r12, r12, r10\n\t"
+        "b       28f\n\t"
+    "27:\n\t"
+        "sub     r11, r10, #32\n\t"
+        "lsr     r8, r12, r11\n\t"
+        "mov     r12, #0\n\t"
+    "28:\n\t"
+        "ldr     r10, [sp, #20]\n\t"
+        "ldr     r11, [sp, #24]\n\t"
+        "cmp     r10, r8\n\t"
+        "sbcs    r9, r11, r12\n\t"
+        "strlo   r8, [sp, #20]\n\t"
+        "strlo   r12, [sp, #24]\n\t"
+        "subs    r7, r7, #1\n\t"
+        "bge     21b\n\t"
+        "ldr     r5, [sp, #16]\n\t"        /* texture */
+        "ldr     r10, [sp, #20]\n\t"
+        "ldr     r11, [sp, #24]\n\t"
+        "cmp     r11, #0x8000\n\t"
+        "bhs     29f\n\t"
+        "lsl     r0, r11, #16\n\t"
+        "orr     r0, r0, r10, lsr #16\n\t"
+        "add     r0, r0, r0, lsr #3\n\t"
+        "clz     r0, r0\n\t"
+        "rsbs    r0, r0, #20\n\t"
+        "movle   r0, #0\n\t"
+        "asrgt   r0, r0, #1\n\t"
+        "cmp     r0, #0\n\t"
+        "moveq   r1, #1\n\t"
+        "beq     30f\n\t"
+        "mov     r1, #0\n\t"
+        "ldrsh   r2, [r5, #180]\n\t"
+        "sub     r2, r2, #1\n\t"
+        "cmp     r0, r2\n\t"
+        "movgt   r0, r2\n\t"
+        "b       30f\n\t"
+    "29:\n\t"
+        "mov     r1, #0\n\t"
+        "ldrsh   r0, [r5, #180]\n\t"
+        "sub     r0, r0, #1\n\t"
+    "30:\n\t"
+        "ldrb    r2, [r5, #206]\n\t"
+        "tst     r2, #2\n\t"
+        "moveq   r0, #0\n\t"
+        "add     r2, r5, #206\n\t"
+        "ldrb    r6, [r2, r1]\n\t"
+        "and     r6, r6, #1\n\t"           /* linear */
+        "add     r0, r5, r0, lsl #4\n\t"   /* mipmap[mipLevel] */
+        "ldrsh   r7, [r0, #4]\n\t"         /* log2S */
+        "ldrsh   r8, [r0, #6]\n\t"         /* log2T */
+        "ldr     r9, [r0, #0]\n\t"
+        "ldr     r10, [r5, #176]\n\t"
+        "mov     r12, #1\n\t"
+        "lsl     r11, r12, r7\n\t"
+        "sub     r11, r11, #1\n\t"
+        "lsl     r12, r12, r8\n\t"
+        "sub     r12, r12, #1\n\t"
+        "str     r9, [r4, #4]\n\t"
+        "str     r10, [r4, #8]\n\t"
+        "str     r6, [r4, #12]\n\t"
+        "str     r11, [r4, #16]\n\t"
+        "str     r12, [r4, #20]\n\t"
+        "str     r7, [r4, #32]\n\t"
+        "ldrh    r12, [r5, #204]\n\t"
+        "orr     r5, r12, r6, lsl #16\n\t"
+        "orr     r7, r7, r8, lsl #8\n\t"
+        "ldr     r1, [sp, #28]\n\t"        /* info */
+        "ldr     r2, [r1, #4]\n\t"         /* v0sx */
+        "ldr     r3, [r1, #8]\n\t"         /* v0sy */
+        /* T finish */
+        "cmp     r8, #0\n\t"
+        "beq     32f\n\t"
+        "ldr     r9, [sp, #8]\n\t"         /* d0_T */
+        "ldr     r6, [sp, #12]\n\t"        /* g0sh_T */
+        "ldr     r10, [r4, #260]\n\t"
+        "ldr     r11, [r4, #300]\n\t"
+        "tst     r5, #0x10000\n\t"
+        "beq     31f\n\t"
+        "subs    r12, r8, r6\n\t"
+        "mov     lr, #0x100000\n\t"
+        "lsrge   r12, lr, r12\n\t"
+        "rsblt   r12, r12, #0\n\t"
+        "lsllt   r12, lr, r12\n\t"
+        "sub     r9, r9, r12\n\t"
+    "31:\n\t"
+        "smull   r12, lr, r2, r10\n\t"
+        "smlal   r12, lr, r3, r11\n\t"
+        "lsr     r12, r12, #12\n\t"
+        "orr     r12, r12, lr, lsl #20\n\t"
+        "sub     r9, r9, r12\n\t"
+        "lsr     r8, r5, #8\n\t"
+        "and     r8, r8, #255\n\t"
+        "cmp     r8, #1\n\t"
+        "addeq   r8, r6, #21\n\t"
+        "moveq   r6, #0\n\t"
+        "lsrne   r8, r8, #1\n\t"
+        "addne   r6, r6, r8\n\t"
+        "rsbne   r8, r8, #32\n\t"
+        "rsbne   r6, r6, #11\n\t"
+        "lsl     r9, r9, r6\n\t"
+        "lsl     r10, r10, r6\n\t"
+        "lsl     r11, r11, r6\n\t"
+        "str     r9, [r4, #220]\n\t"
+        "str     r10, [r4, #260]\n\t"
+        "str     r11, [r4, #300]\n\t"
+        "sub     r8, r8, r7, lsr #8\n\t"
+        "str     r8, [r4, #28]\n\t"
+        "b       33f\n\t"
+    "32:\n\t"
+        "mov     r8, #0\n\t"
+        "str     r8, [r4, #220]\n\t"
+        "str     r8, [r4, #260]\n\t"
+        "str     r8, [r4, #300]\n\t"
+        "str     r8, [r4, #28]\n\t"
+    "33:\n\t"
+        /* S finish */
+        "ands    r8, r7, #255\n\t"
+        "beq     35f\n\t"
+        "ldr     r9, [sp, #0]\n\t"         /* d0_S */
+        "ldr     r6, [sp, #4]\n\t"         /* g0sh_S */
+        "ldr     r10, [r4, #256]\n\t"
+        "ldr     r11, [r4, #296]\n\t"
+        "tst     r5, #0x10000\n\t"
+        "beq     34f\n\t"
+        "subs    r12, r8, r6\n\t"
+        "mov     lr, #0x100000\n\t"
+        "lsrge   r12, lr, r12\n\t"
+        "rsblt   r12, r12, #0\n\t"
+        "lsllt   r12, lr, r12\n\t"
+        "sub     r9, r9, r12\n\t"
+    "34:\n\t"
+        "smull   r12, lr, r2, r10\n\t"
+        "smlal   r12, lr, r3, r11\n\t"
+        "lsr     r12, r12, #12\n\t"
+        "orr     r12, r12, lr, lsl #20\n\t"
+        "sub     r9, r9, r12\n\t"
+        "and     r8, r5, #255\n\t"
+        "cmp     r8, #1\n\t"
+        "addeq   r8, r6, #21\n\t"
+        "moveq   r6, #0\n\t"
+        "lsrne   r8, r8, #1\n\t"
+        "addne   r6, r6, r8\n\t"
+        "rsbne   r8, r8, #32\n\t"
+        "rsbne   r6, r6, #11\n\t"
+        "lsl     r9, r9, r6\n\t"
+        "lsl     r10, r10, r6\n\t"
+        "lsl     r11, r11, r6\n\t"
+        "str     r9, [r4, #216]\n\t"
+        "str     r10, [r4, #256]\n\t"
+        "str     r11, [r4, #296]\n\t"
+        "and     r7, r7, #255\n\t"
+        "sub     r8, r8, r7\n\t"
+        "str     r8, [r4, #24]\n\t"
+        "add     sp, sp, #32\n\t"
+        "pop     {r4-r11, pc}\n\t"
+    "35:\n\t"
+        "mov     r8, #0\n\t"
+        "str     r8, [r4, #216]\n\t"
+        "str     r8, [r4, #256]\n\t"
+        "str     r8, [r4, #296]\n\t"
+        "str     r8, [r4, #24]\n\t"
+        "add     sp, sp, #32\n\t"
         "pop     {r4-r11, pc}\n\t");
 }
 #else
