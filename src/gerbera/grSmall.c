@@ -125,6 +125,96 @@ int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsign
                             return 0;
                     }
                 }
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && !defined(__thumb__) && \
+    !defined(__BIG_ENDIAN__) && (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+                if (rem < 4u)
+                {
+                    do
+                    {
+                        if (*depth++ >= fBound)
+                            return 0;
+                    } while (--rem);
+                }
+                else
+                {
+                    unsigned int tmpBound = fBound;
+                    unsigned int tmp1, tmp2;
+#if defined(__ARM_ARCH) && __ARM_ARCH >= 6
+                    __asm__ volatile(
+                        "cmp   %[fbound], #65536\n\t"
+                        "movhs %[rem], #0\n\t"
+                        "bhs   3f\n\t"
+                        "sub   %[fbound], %[fbound], #1\n\t"
+                        "tst   %[depth], #2\n\t"
+                        "beq   0f\n\t"
+                        "ldrh  %[tmp1], [%[depth]], #2\n\t"
+                        "cmp   %[tmp1], %[fbound]\n\t"
+                        "bhi   3f\n\t"
+                        "sub   %[rem], %[rem], #1\n\t"
+                        "cmp   %[rem], #3\n\t"
+                        "bls   4f\n\t"
+                    "0:\n\t"
+                        "orr   %[fbound], %[fbound], %[fbound], lsl #16\n\t"
+                    "1:\n\t"
+                        "ldmia %[depth]!, {%[tmp1], %[tmp2]}\n\t"
+                        "uqsub16 %[tmp1], %[tmp1], %[fbound]\n\t"
+                        "uqsub16 %[tmp2], %[tmp2], %[fbound]\n\t"
+                        "orrs  %[tmp1], %[tmp1], %[tmp2]\n\t"
+                        "bne   3f\n\t"
+                        "sub   %[rem], %[rem], #4\n\t"
+                        "cmp   %[rem], #3\n\t"
+                        "bhi   1b\n\t"
+                        "cmp   %[rem], #0\n\t"
+                        "beq   3f\n\t"
+                        "uxth  %[fbound], %[fbound]\n\t"
+                    "4:\n\t"
+                        "ldrh  %[tmp1], [%[depth]], #2\n\t"
+                        "cmp   %[tmp1], %[fbound]\n\t"
+                        "bhi   3f\n\t"
+                        "subs  %[rem], %[rem], #1\n\t"
+                        "bne   4b\n\t"
+                    "3:\n\t"
+                        : [depth] "+r"(depth), [rem] "+r"(rem), [fbound] "+r"(tmpBound),
+                          [tmp1] "=&r"(tmp1), [tmp2] "=&r"(tmp2)
+                        :
+                        : "cc", "memory");
+#else
+                    __asm__ volatile(
+                        "cmp   %[fbound], #65536\n\t"
+                        "movhs %[rem], #0\n\t"
+                        "bhs   3f\n\t"
+                        "sub   %[fbound], %[fbound], #1\n\t"
+                        "tst   %[depth], #2\n\t"
+                        "beq   1f\n\t"
+                        "ldrh  %[tmp1], [%[depth]], #2\n\t"
+                        "cmp   %[tmp1], %[fbound]\n\t"
+                        "bhi   3f\n\t"
+                        "sub   %[rem], %[rem], #1\n\t"
+                    "1:\n\t"
+                        "ldr   %[tmp1], [%[depth]], #4\n\t"
+                        "mov   %[tmp2], %[tmp1], lsl #16\n\t"
+                        "cmp   %[fbound], %[tmp2], lsr #16\n\t"
+                        "cmphs %[fbound], %[tmp1], lsr #16\n\t"
+                        "blo   3f\n\t"
+                        "sub   %[rem], %[rem], #2\n\t"
+                        "cmp   %[rem], #1\n\t"
+                        "bhi   1b\n\t"
+                        "cmp   %[rem], #0\n\t"
+                        "beq   3f\n\t"
+                        "ldrh  %[tmp1], [%[depth]], #2\n\t"
+                        "cmp   %[tmp1], %[fbound]\n\t"
+                        "bhi   3f\n\t"
+                        "mov   %[rem], #0\n\t"
+                    "3:\n\t"
+                        : [depth] "+r"(depth), [rem] "+r"(rem), [fbound] "+r"(tmpBound),
+                          [tmp1] "=&r"(tmp1), [tmp2] "=&r"(tmp2)
+                        :
+                        : "cc", "memory");
+#endif
+                    if (rem != 0u)
+                        return 0;
+                }
+#else
                 {
                     const unsigned short *end = depth + rem;
                     do
@@ -133,6 +223,7 @@ int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsign
                             return 0;
                     } while (depth != end);
                 }
+#endif
             }
         }
         if (--n == 0)
@@ -241,32 +332,16 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                                        state->drawSurface.buffers[1].stride * yStart);
 #if GERBERA_ARMV6_JIT
         int rejectDepth = state->fastDepthReject;
-        if (!grSetupTriangleGradientsVisibleVerts(state, tri, v0, v1, v2, flatShadeIndex, activeGradientMask, rejectDepth))
+        if (!grSetupTriangleGradientsVisibleVertsAtY(state, tri, v0, v1, v2, flatShadeIndex, activeGradientMask, rejectDepth, yStart))
             goto done;
 #else
-        grSetupTriangleGradients(state, tri, flatShadeIndex, activeGradientMask);
+        (void)grSetupTriangleGradientsVisibleVertsAtY(state, tri, v0, v1, v2, flatShadeIndex, activeGradientMask, 0, yStart);
 #endif
 
         pixelPipe->colorRow = (void *)((char *)state->drawSurface.buffers[0].data +
                                        state->drawSurface.buffers[0].stride * yStart);
         pixelPipe->stencilRow = (void *)((char *)state->drawSurface.buffers[2].data +
                                          state->drawSurface.buffers[2].stride * yStart);
-        if (yStart != 0)
-        {
-            int n = state->numActiveGradients;
-#if defined(__GNUC__) && !defined(__clang__)
-            #pragma GCC unroll 1
-#endif
-            for (i = n - 1; i >= 0; --i)
-            {
-                int g = state->activeGradientIndex[i];
-                int ya = pixelPipe->yAdder[g];
-
-                if (ya != 0)
-                    pixelPipe->reference[g] = (int)((unsigned int)pixelPipe->reference[g] +
-                                                  (unsigned int)ya * (unsigned int)yStart);
-            }
-        }
         grExecutePixelPipeline(state);
 #if GERBERA_ARMV6_JIT
 done:

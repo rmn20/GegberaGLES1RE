@@ -104,65 +104,56 @@ typedef char gr_check_arm_vc_sz_[sizeof(_grVertex) == 128 ? 1 : -1];
 typedef char gr_check_arm_vc_vi_[__builtin_offsetof(_grVertex, index) == 0 ? 1 : -1];
 typedef char gr_check_arm_vc_vm_[__builtin_offsetof(_grVertex, stateMask) == 4 ? 1 : -1];
 
-__attribute__((naked)) static int grVertexCacheAllocBypass(Gerbera_s *state, int vtxIndex)
+__attribute__((always_inline)) static inline int queueAllocSlotOnly(
+    _grVertexCache *cache, _grVertex *vertexBuffer, int vtxIndex, _grVertex **outV)
 {
-    (void)state;
-    (void)vtxIndex;
-    __asm__ volatile(
-        "stmfd sp!, {r4, r5, r6, lr}\n\t"
-        "add   ip, r0, #4096\n\t"
-        "ldr   r4, [ip, #1152]\n\t"
-        "ldr   r5, [ip, #1144]\n\t"
-        "ldr   lr, [r4, #4]\n\t"
-        "add   r5, r5, #1328\n\t"
-        "mvns  r2, lr\n\t"
-        "add   r5, r5, #4\n\t"
-        "moveq r6, #0\n\t"
-        "ldreq lr, [r4, #0]\n\t"
-        "mvneq r2, lr\n\t"
-        "movne r6, #4\n\t"
-        "mov   r3, #0x80000000\n\t"
-        "clz   r2, r2\n\t"
-        "orr   lr, lr, r3, lsr r2\n\t"
-        "str   lr, [r4, r6]\n\t"
-        "rsb   r2, r2, #31\n\t"
-        "ldr   r3, [r4, #8]\n\t"
-        "orr   r6, r2, r6, lsl #3\n\t"
-        "sub   r3, r3, #1\n\t"
-        "str   r3, [r4, #8]\n\t"
-        "add   r5, r5, r6, lsl #7\n\t"
-        "mov   r2, #0\n\t"
-        "str   r1, [r5, #0]\n\t"
-        "mov   r1, r5\n\t"
-        "strh  r2, [r5, #4]\n\t"
-        "ldr   r3, [ip, #3920]\n\t"
-        "cmp   r3, #0\n\t"
-        "beq   1f\n\t"
-        "blx   r3\n\t"
-        "mov   r0, r6\n\t"
-        "ldmfd sp!, {r4, r5, r6, pc}\n\t"
-        "1:\n\t"
-        "ldr   r2, [r1, #0]\n\t"
-        "bl    grVertexCacheTransformSlow_asm\n\t"
-        "mov   r0, r6\n\t"
-        "ldmfd sp!, {r4, r5, r6, pc}\n\t");
+    unsigned int high, slot;
+    _grVertex *v;
+
+    __builtin_memcpy(&high, (const unsigned char *)cache + 4, 4);
+    if (__builtin_expect(~high != 0u, 1))
+    {
+        unsigned int lz = (unsigned int)__builtin_clz(~high);
+        unsigned int word = high | (0x80000000u >> lz);
+        __builtin_memcpy((unsigned char *)cache + 4, &word, 4);
+        slot = 63u - lz;
+    }
+    else
+    {
+        unsigned int low, lz, word;
+        __builtin_memcpy(&low, (const unsigned char *)cache, 4);
+        lz = (unsigned int)__builtin_clz(~low);
+        word = low | (0x80000000u >> lz);
+        __builtin_memcpy((unsigned char *)cache, &word, 4);
+        slot = 31u - lz;
+    }
+    v = &vertexBuffer[slot];
+    v->index = vtxIndex;
+    v->stateMask = 0;
+    *outV = v;
+    return (int)slot;
 }
 
-__attribute__((naked)) int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
+static int grVertexCacheGetPreloaded(Gerbera_s *state, int vtxIndex,
+                                     _grVertexCache *cache, _grVertex *vertexBuffer)
+    __asm__("grVertexCacheGetPreloaded_asm");
+
+__attribute__((naked, used))
+static int grVertexCacheGetPreloaded(Gerbera_s *state, int vtxIndex,
+                                     _grVertexCache *cache, _grVertex *vertexBuffer)
 {
     (void)state;
     (void)vtxIndex;
+    (void)cache;
+    (void)vertexBuffer;
     __asm__ volatile(
         "stmfd sp!, {r4, r5, r6, r7, lr}\n\t"
-        "add   ip, r0, #4096\n\t"
+        "mov   r4, r2\n\t"
         "eor   r7, r1, r1, asr #3\n\t"
-        "ldr   r4, [ip, #1152]\n\t"
-        "ldr   r6, [ip, #1144]\n\t"
+        "mov   r6, r3\n\t"
         "eor   r7, r7, r1, asr #5\n\t"
         "and   ip, r7, #31\n\t"
-        "add   r6, r6, #1328\n\t"
         "add   r5, r4, ip, lsl #2\n\t"
-        "add   r6, r6, #4\n\t"
         "ldr   r3, [r5, #40]\n\t"
         "and   ip, r3, #255\n\t"
         "ldr   ip, [r6, ip, lsl #7]\n\t"
@@ -260,11 +251,23 @@ __attribute__((naked)) int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
         "orr   r7, r2, r7, lsl #3\n\t"
         "b     12b\n\t");
 }
-#else
-static int grVertexCacheAllocBypass(Gerbera_s *state, int vtxIndex)
+
+__attribute__((naked)) int grVertexCacheGet(Gerbera_s *state, int vtxIndex)
 {
-    _grVertexCache *cache = GR_VERTEX_CACHE(state);
-    _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
+    (void)state;
+    (void)vtxIndex;
+    __asm__ volatile(
+        "add   ip, r0, #4096\n\t"
+        "ldr   r2, [ip, #1152]\n\t"
+        "ldr   r3, [ip, #1144]\n\t"
+        "add   r3, r3, #1328\n\t"
+        "add   r3, r3, #4\n\t"
+        "b     grVertexCacheGetPreloaded_asm\n\t");
+}
+#else
+static inline int queueAllocCacheIndexBypass(
+    Gerbera_s *state, _grVertexCache *cache, _grVertex *vertexBuffer, int vtxIndex)
+{
     HGint64 notMask = hgNot64(cache->batchLockMask);
     int slot = 63 - hgClz64(notMask);
     unsigned int bit;
@@ -475,18 +478,6 @@ static inline int queueLookupCacheIndex(Gerbera_s *state, _grVertexCache *cache,
     return grVertexCacheGet(state, v);
 }
 
-static inline int queueLookupCacheIndexBypass(Gerbera_s *state, _grVertexCache *cache,
-                                              int v, int prev0, int prev1, int prev2)
-{
-    if (v == prev0)
-        return cache->prevCacheIndices[0];
-    if (v == prev1)
-        return cache->prevCacheIndices[1];
-    if (v == prev2)
-        return cache->prevCacheIndices[2];
-    return grVertexCacheAllocBypass(state, v);
-}
-
 void grQueuePrimitive(Gerbera_s *state, int i0, int i1, int i2, int numVertices)
 {
     _grVertexCache *cache = GR_VERTEX_CACHE(state);
@@ -660,6 +651,48 @@ static inline int grApi_stp(const _IVector4 *pA, const _IVector4 *pB, const _IVe
     return r;
 }
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+static inline int grApi_stp_raw_v(const _grVertex *A, const _grVertex *B, const _grVertex *C)
+{
+    int t0, t1, t2, t3, t4, lo, nbc, nca;
+
+    __asm__(
+        "ldr   %[t0], [%[B], #12]\n\t"
+        "ldr   %[t1], [%[B], #16]\n\t"
+        "ldr   %[t2], [%[C], #12]\n\t"
+        "ldr   %[t3], [%[C], #16]\n\t"
+        "mov   %[t1], %[t1], lsl #1\n\t"
+        "mov   %[t3], %[t3], lsl #1\n\t"
+        "rsb   %[t4], %[t2], #0\n\t"
+        "smull %[lo], %[nbc], %[t0], %[t3]\n\t"
+        "smlal %[lo], %[nbc], %[t4], %[t1]\n\t"
+        "ldr   %[t0], [%[A], #12]\n\t"
+        "ldr   %[t1], [%[A], #16]\n\t"
+        "mov   %[t1], %[t1], lsl #1\n\t"
+        "rsb   %[t4], %[t0], #0\n\t"
+        "smull %[lo], %[nca], %[t2], %[t1]\n\t"
+        "smlal %[lo], %[nca], %[t4], %[t3]\n\t"
+        "ldr   %[t2], [%[B], #12]\n\t"
+        "ldr   %[t3], [%[B], #16]\n\t"
+        "mov   %[t3], %[t3], lsl #1\n\t"
+        "rsb   %[t4], %[t2], #0\n\t"
+        "smull %[lo], %[t2], %[t0], %[t3]\n\t"
+        "smlal %[lo], %[t2], %[t4], %[t1]\n\t"
+        "ldr   %[t0], [%[A], #24]\n\t"
+        "smull %[lo], %[t4], %[nbc], %[t0]\n\t"
+        "ldr   %[t0], [%[B], #24]\n\t"
+        "smlal %[lo], %[t4], %[nca], %[t0]\n\t"
+        "ldr   %[t0], [%[C], #24]\n\t"
+        "smlal %[lo], %[t4], %[t2], %[t0]"
+        : [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3),
+          [t4] "=&r"(t4), [lo] "=&r"(lo), [nbc] "=&r"(nbc), [nca] "=&r"(nca)
+        : [A] "r"(A), [B] "r"(B), [C] "r"(C));
+    return t4;
+}
+#endif
+
 #define grApi_stp_v(v0, v1, v2) grApi_stp(&(v0)->clipPosition, &(v1)->clipPosition, &(v2)->clipPosition)
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -669,7 +702,7 @@ static inline int grApi_stp(const _IVector4 *pA, const _IVector4 *pB, const _IVe
 #endif
 
 static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0, int i1, int i2,
-                                                       int bypass)
+                                                       int bypass, int checkDegenerate)
 {
     _grVertexCache *cache;
     _grVertex *vertexBuffer;
@@ -681,7 +714,7 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
     int x0, x1, x2, y0, y1, y2;
     HGint64 area;
 
-    if (i0 == i2 || i1 == i2 || i0 == i1)
+    if (checkDegenerate && (i0 == i2 || i1 == i2 || i0 == i1))
         return;
 
     cache = GR_VERTEX_CACHE(state);
@@ -693,24 +726,95 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
     prev1 = cache->prevVertexIndices[1];
     prev2 = cache->prevVertexIndices[2];
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    if (bypass)
+    {
+        unsigned int misses = 0u;
+        unsigned int missBits = 0u;
+
+        cache->prevVertexIndices[2] = i2;
+        if (i2 == prev0) { ci2 = cache->prevCacheIndices[0]; v2 = &vertexBuffer[ci2]; }
+        else if (i2 == prev1) { ci2 = cache->prevCacheIndices[1]; v2 = &vertexBuffer[ci2]; }
+        else if (i2 == prev2) { ci2 = cache->prevCacheIndices[2]; v2 = &vertexBuffer[ci2]; }
+        else { ci2 = queueAllocSlotOnly(cache, vertexBuffer, i2, &v2); misses = 1u; missBits = 1u; }
+
+        cache->prevVertexIndices[1] = i1;
+        if (i1 == prev0) { ci1 = cache->prevCacheIndices[0]; v1 = &vertexBuffer[ci1]; }
+        else if (i1 == prev1) { ci1 = cache->prevCacheIndices[1]; v1 = &vertexBuffer[ci1]; }
+        else if (i1 == prev2) { ci1 = cache->prevCacheIndices[2]; v1 = &vertexBuffer[ci1]; }
+        else { ci1 = queueAllocSlotOnly(cache, vertexBuffer, i1, &v1); misses += 1u; missBits |= 2u; }
+
+        cache->prevVertexIndices[0] = i0;
+        if (i0 == prev0) { ci0 = cache->prevCacheIndices[0]; v0 = &vertexBuffer[ci0]; }
+        else if (i0 == prev1) { ci0 = cache->prevCacheIndices[1]; v0 = &vertexBuffer[ci0]; }
+        else if (i0 == prev2) { ci0 = cache->prevCacheIndices[2]; v0 = &vertexBuffer[ci0]; }
+        else { ci0 = queueAllocSlotOnly(cache, vertexBuffer, i0, &v0); misses += 1u; missBits |= 4u; }
+
+        cache->prevCacheIndices[0] = ci0;
+        cache->prevCacheIndices[1] = ci1;
+        cache->prevCacheIndices[2] = ci2;
+        if (missBits != 0u)
+        {
+            void (* const xform)(Gerbera_s *, _grVertex *) = state->transformVertexFast;
+            cache->totalFreeSlots -= (int)misses;
+            if (__builtin_expect(xform != NULL, 1))
+            {
+                if (missBits & 1u) xform(state, v2);
+                if (missBits & 2u) xform(state, v1);
+                if (missBits & 4u) xform(state, v0);
+            }
+            else
+            {
+                if (missBits & 1u) grVertexCacheTransformSlow(state, v2, v2->index);
+                if (missBits & 2u) grVertexCacheTransformSlow(state, v1, v1->index);
+                if (missBits & 4u) grVertexCacheTransformSlow(state, v0, v0->index);
+            }
+        }
+    }
+    else
+    {
+        cache->prevVertexIndices[2] = i2;
+        if (i2 == prev0) ci2 = cache->prevCacheIndices[0];
+        else if (i2 == prev1) ci2 = cache->prevCacheIndices[1];
+        else if (i2 == prev2) ci2 = cache->prevCacheIndices[2];
+        else ci2 = grVertexCacheGetPreloaded(state, i2, cache, vertexBuffer);
+
+        cache->prevVertexIndices[1] = i1;
+        if (i1 == prev0) ci1 = cache->prevCacheIndices[0];
+        else if (i1 == prev1) ci1 = cache->prevCacheIndices[1];
+        else if (i1 == prev2) ci1 = cache->prevCacheIndices[2];
+        else ci1 = grVertexCacheGetPreloaded(state, i1, cache, vertexBuffer);
+
+        cache->prevVertexIndices[0] = i0;
+        if (i0 == prev0) ci0 = cache->prevCacheIndices[0];
+        else if (i0 == prev1) ci0 = cache->prevCacheIndices[1];
+        else if (i0 == prev2) ci0 = cache->prevCacheIndices[2];
+        else ci0 = grVertexCacheGetPreloaded(state, i0, cache, vertexBuffer);
+
+        cache->prevCacheIndices[0] = ci0;
+        cache->prevCacheIndices[1] = ci1;
+        cache->prevCacheIndices[2] = ci2;
+        v0 = &vertexBuffer[ci0];
+        v1 = &vertexBuffer[ci1];
+        v2 = &vertexBuffer[ci2];
+    }
+#else
+    (void)bypass;
     cache->prevVertexIndices[2] = i2;
-    ci2 = bypass
-        ? queueLookupCacheIndexBypass(state, cache, i2, prev0, prev1, prev2)
-        : queueLookupCacheIndex(state, cache, i2, prev0, prev1, prev2);
+    ci2 = queueLookupCacheIndex(state, cache, i2, prev0, prev1, prev2);
     cache->prevVertexIndices[1] = i1;
-    ci1 = bypass
-        ? queueLookupCacheIndexBypass(state, cache, i1, prev0, prev1, prev2)
-        : queueLookupCacheIndex(state, cache, i1, prev0, prev1, prev2);
+    ci1 = queueLookupCacheIndex(state, cache, i1, prev0, prev1, prev2);
     cache->prevVertexIndices[0] = i0;
-    ci0 = bypass
-        ? queueLookupCacheIndexBypass(state, cache, i0, prev0, prev1, prev2)
-        : queueLookupCacheIndex(state, cache, i0, prev0, prev1, prev2);
+    ci0 = queueLookupCacheIndex(state, cache, i0, prev0, prev1, prev2);
     cache->prevCacheIndices[0] = ci0;
     cache->prevCacheIndices[1] = ci1;
     cache->prevCacheIndices[2] = ci2;
     v0 = &vertexBuffer[ci0];
     v1 = &vertexBuffer[ci1];
     v2 = &vertexBuffer[ci2];
+#endif
 
     if ((ci0 != ci1 && ci0 != ci2 && ci1 != ci2) == 0 &&
         grAssert("(ci0 != ci1) && (ci0 != ci2) && (ci1 != ci2)",
@@ -725,22 +829,40 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
     if ((cm0 & cm1 & cm2 & 0xFFC3u) != 0)
         return;
     maskAll = cm0 | cm1 | cm2;
+    packed = grSetIndices(ci0, ci1, ci2);
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5)
+    {
+        unsigned int mtmp = maskAll;
+        __asm__("bics %1, %1, #0x3c0\n\torrne %0, %0, #0x10000000"
+                : "+r"(packed), "+r"(mtmp) : : "cc");
+    }
+#else
+    if ((maskAll & 0xFC3Fu) != 0)
+        packed |= 0x10000000;
+#endif
     if (grTestCapability(state, GR_CAPABILITY_CULL_FACE) != 0)
     {
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+        int stp = grApi_stp_raw_v(v0, v1, v2);
+#else
         int stp = grApi_stp_v(v0, v1, v2);
-
+#endif
         if ((unsigned int)(stp + 94) > 187u && (unsigned int)stp >> 31 == state->cullNegative)
             return;
     }
-    packed = grSetIndices(ci0, ci1, ci2);
-    if ((maskAll & 0xFC3Fu) != 0)
+    if ((packed & 0x10000000) != 0)
     {
-        int idx = *queueIndexPtr;
-        unsigned int *cmd = rs + idx + 42;
+        unsigned int *rs2 = (unsigned int *)state->renderStack;
+        int *qiPtr2 = (int *)((unsigned char *)rs2 + GR_RENDER_STACK_COMMAND_QUEUE_INDEX);
+        int idx = *qiPtr2;
+        unsigned int *cmd = rs2 + idx + 42;
 
-        cmd[0] = (unsigned int)packed | 0x10000000u;
+        cmd[0] = (unsigned int)packed;
         cmd[1] = 0;
-        *queueIndexPtr = idx + 2;
+        *qiPtr2 = idx + 2;
         return;
     }
 
@@ -788,8 +910,10 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
         if (((areaSign ^ state->cullNegative) &
              grTestCapability(state, GR_CAPABILITY_CULL_FACE)) == 0)
         {
-            int idx = *queueIndexPtr;
-            unsigned int *cmd = rs + idx + 42;
+            unsigned int *rs2 = (unsigned int *)state->renderStack;
+            int *qiPtr2 = (int *)((unsigned char *)rs2 + GR_RENDER_STACK_COMMAND_QUEUE_INDEX);
+            int idx = *qiPtr2;
+            unsigned int *cmd = rs2 + idx + 42;
             int triSide = areaSign ^ grGetFrontFace(state);
             unsigned int rArea;
 
@@ -806,19 +930,51 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
             }
             cmd[0] = (unsigned int)packed | ((unsigned int)triSide << 24);
             cmd[1] = rArea;
-            *queueIndexPtr = idx + 2;
+            *qiPtr2 = idx + 2;
         }
     }
 }
 
 void grQueuePrimitive3(Gerbera_s *state, int i0, int i1, int i2)
 {
-    grQueuePrimitive3Impl(state, i0, i1, i2, 0);
+    grQueuePrimitive3Impl(state, i0, i1, i2, 0, 1);
+}
+
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void grQueuePrimitive3NoDeg(Gerbera_s *state, int i0, int i1, int i2)
+{
+    grQueuePrimitive3Impl(state, i0, i1, i2, 0, 0);
+}
+
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void grQueuePrimitive3BypassNoDeg(Gerbera_s *state, int i0, int i1, int i2)
+{
+    grQueuePrimitive3Impl(state, i0, i1, i2, 1, 0);
 }
 
 static void grQueuePrimitive3Bypass(Gerbera_s *state, int i0, int i1, int i2)
 {
-    grQueuePrimitive3Impl(state, i0, i1, i2, 1);
+    grQueuePrimitive3Impl(state, i0, i1, i2, 1, 1);
+}
+
+static inline void grQueuePrimitive3Checked(Gerbera_s *state, int i0, int i1, int i2)
+{
+    if (i0 != i2)
+        if (i1 != i2)
+            if (i0 != i1)
+                grQueuePrimitive3NoDeg(state, i0, i1, i2);
+}
+
+static inline void grQueuePrimitive3BypassChecked(Gerbera_s *state, int i0, int i1, int i2)
+{
+    if (i0 != i2)
+        if (i1 != i2)
+            if (i0 != i1)
+                grQueuePrimitive3BypassNoDeg(state, i0, i1, i2);
 }
 
 static inline int probeCacheHit(_grVertexCache *cache, _grVertex *vertexBuffer, int v)
@@ -1294,7 +1450,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
                     {
                         do
                         {
-                            grQueuePrimitive3Bypass(state, bytes[2], bytes[0], bytes[1]);
+                            grQueuePrimitive3BypassChecked(state, bytes[2], bytes[0], bytes[1]);
                             bytes += 3;
                             vertexCount -= 3;
                         } while (vertexCount >= numVertices);
@@ -1303,7 +1459,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
                     {
                         do
                         {
-                            grQueuePrimitive3(state, bytes[2], bytes[0], bytes[1]);
+                            grQueuePrimitive3Checked(state, bytes[2], bytes[0], bytes[1]);
                             bytes += 3;
                             vertexCount -= 3;
                         } while (vertexCount >= numVertices);
@@ -1314,7 +1470,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
             {
                 do
                 {
-                    grQueuePrimitive3(state, bytes[2], bytes[0], bytes[1]);
+                    grQueuePrimitive3Checked(state, bytes[2], bytes[0], bytes[1]);
                     bytes += 3;
                     vertexCount -= 3;
                 } while (vertexCount >= numVertices);
@@ -1332,23 +1488,24 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
                 } while (vertexCount >= numVertices && lookups < 24);
                 if (vertexCount >= numVertices)
                 {
+                    const unsigned short *endShorts = shorts + (vertexCount - (numVertices - 1));
                     if ((unsigned int)hits * 8u < (unsigned int)lookups)
                     {
                         do
                         {
-                            grQueuePrimitive3Bypass(state, shorts[2], shorts[0], shorts[1]);
+                            int s0 = shorts[0], s1 = shorts[1], s2 = shorts[2];
                             shorts += 3;
-                            vertexCount -= 3;
-                        } while (vertexCount >= numVertices);
+                            grQueuePrimitive3BypassChecked(state, s2, s0, s1);
+                        } while (shorts < endShorts);
                     }
                     else
                     {
                         do
                         {
-                            grQueuePrimitive3(state, shorts[2], shorts[0], shorts[1]);
+                            int s0 = shorts[0], s1 = shorts[1], s2 = shorts[2];
                             shorts += 3;
-                            vertexCount -= 3;
-                        } while (vertexCount >= numVertices);
+                            grQueuePrimitive3Checked(state, s2, s0, s1);
+                        } while (shorts < endShorts);
                     }
                 }
             }
@@ -1356,7 +1513,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
             {
                 do
                 {
-                    grQueuePrimitive3(state, shorts[2], shorts[0], shorts[1]);
+                    grQueuePrimitive3Checked(state, shorts[2], shorts[0], shorts[1]);
                     shorts += 3;
                     vertexCount -= 3;
                 } while (vertexCount >= numVertices);
@@ -1373,7 +1530,7 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
 
                     vtxIndex += 3;
                     vertexCount -= 3;
-                    grQueuePrimitive3Bypass(state, i2, i0, i1);
+                    grQueuePrimitive3BypassNoDeg(state, i2, i0, i1);
                 } while (vertexCount >= numVertices);
             }
             else
@@ -1386,36 +1543,38 @@ void grFetchPrimitives(Gerbera_s *state, int fetchType, int numVertices,
 
                     vtxIndex += 3;
                     vertexCount -= 3;
-                    grQueuePrimitive3(state, i2, i0, i1);
+                    grQueuePrimitive3NoDeg(state, i2, i0, i1);
                 } while (vertexCount >= numVertices);
             }
             break;
         case GR_FETCHTYPE_TRISTRIPchar:
-            do
+        {
+            const unsigned char *endPairs = bytes + (vertexCount - 3);
+            while (bytes < endPairs)
             {
-                int i1 = bytes[stripSwap];
-                int i2 = bytes[1 - stripSwap];
-                int i0 = bytes[2];
-
-                bytes += 1;
-                stripSwap = 1 - stripSwap;
-                --vertexCount;
-                grQueuePrimitive3(state, i0, i1, i2);
-            } while (vertexCount >= numVertices);
+                unsigned int b0 = bytes[0], b1 = bytes[1], b2 = bytes[2];
+                bytes += 2;
+                grQueuePrimitive3Checked(state, (int)b2, (int)b0, (int)b1);
+                grQueuePrimitive3Checked(state, (int)bytes[1], (int)b2, (int)b1);
+            }
+            if (bytes == endPairs)
+                grQueuePrimitive3Checked(state, (int)bytes[2], (int)bytes[0], (int)bytes[1]);
             break;
+        }
         case GR_FETCHTYPE_TRISTRIP_SHORT:
-            do
+        {
+            const unsigned short *endPairs = shorts + (vertexCount - 3);
+            while (shorts < endPairs)
             {
-                int i1 = shorts[stripSwap];
-                int i2 = shorts[1 - stripSwap];
-                int i0 = shorts[2];
-
-                ++shorts;
-                stripSwap = 1 - stripSwap;
-                --vertexCount;
-                grQueuePrimitive3(state, i0, i1, i2);
-            } while (vertexCount >= numVertices);
+                unsigned int s0 = shorts[0], s1 = shorts[1], s2 = shorts[2];
+                shorts += 2;
+                grQueuePrimitive3Checked(state, (int)s2, (int)s0, (int)s1);
+                grQueuePrimitive3Checked(state, (int)shorts[1], (int)s2, (int)s1);
+            }
+            if (shorts == endPairs)
+                grQueuePrimitive3Checked(state, (int)shorts[2], (int)shorts[0], (int)shorts[1]);
             break;
+        }
         case GR_FETCHTYPE_TRISTRIP_ARRAY:
             if (vertexCount > 64)
             {

@@ -1258,6 +1258,10 @@ int  grSetupTriangleGradientsVisibleVerts(Gerbera_s *state, _grClipTriangle *tri
                                          _grVertex *v0, _grVertex *v1, _grVertex *v2,
                                          int flatShadeIndex, unsigned int gradientMask,
                                          int rejectDepth);
+int  grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s *state, _grClipTriangle *tri,
+                                            _grVertex *v0, _grVertex *v1, _grVertex *v2,
+                                            int flatShadeIndex, unsigned int gradientMask,
+                                            int rejectDepth, int advanceY);
 void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
                               int flatShadeIndex, unsigned int gradientMask);
 void grSetupTextureUnit(Gerbera_s *state, int texIndex, int (*pairs)[2],
