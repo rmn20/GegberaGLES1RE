@@ -761,9 +761,18 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
             cache->totalFreeSlots -= (int)misses;
             if (__builtin_expect(xform != NULL, 1))
             {
-                if (missBits & 1u) xform(state, v2);
-                if (missBits & 2u) xform(state, v1);
-                if (missBits & 4u) xform(state, v0);
+                if (bypass && __builtin_expect(missBits == 7u, 1))
+                {
+                    xform(state, v2);
+                    xform(state, v1);
+                    xform(state, v0);
+                }
+                else
+                {
+                    if (missBits & 1u) xform(state, v2);
+                    if (missBits & 2u) xform(state, v1);
+                    if (missBits & 4u) xform(state, v0);
+                }
             }
             else
             {
@@ -866,12 +875,34 @@ static GR_API_ALWAYS_INLINE void grQueuePrimitive3Impl(Gerbera_s *state, int i0,
         return;
     }
 
-    if ((v0->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
-        grViewportTransformVertex(state, v0);
-    if ((v1->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
-        grViewportTransformVertex(state, v1);
-    if ((v2->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
-        grViewportTransformVertex(state, v2);
+    if (bypass)
+    {
+        if (__builtin_expect(((v0->stateMask | v1->stateMask | v2->stateMask) &
+                              GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0, 1))
+        {
+            grViewportTransformVertex(state, v0);
+            grViewportTransformVertex(state, v1);
+            grViewportTransformVertex(state, v2);
+        }
+        else
+        {
+            if ((v0->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+                grViewportTransformVertex(state, v0);
+            if ((v1->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+                grViewportTransformVertex(state, v1);
+            if ((v2->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+                grViewportTransformVertex(state, v2);
+        }
+    }
+    else
+    {
+        if ((v0->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+            grViewportTransformVertex(state, v0);
+        if ((v1->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+            grViewportTransformVertex(state, v1);
+        if ((v2->stateMask & GR_VERTEXMASK_VIEWPORT_TRANSFORMED) == 0)
+            grViewportTransformVertex(state, v2);
+    }
 
     sc = &state->renderScissor;
     x0 = v0->screenPosition[0];

@@ -74,20 +74,20 @@ static void grSetupGradientNZ(const _grGradientInfo * restrict info, int gradien
         "lsl   r2, r9, r2\n\t"
         "orr   r2, r2, ip, lsr r8\n\t"
         "3:\n\t"
-        "eor   r5, r5, r3, asr #31\n\t"
-        "eor   r7, r7, r2, asr #31\n\t"
-        "orrs  r5, r5, r7\n\t"
+        "ldmia r0, {r0, r4, r6}\n\t"
+        "ldr   r8, [sp, #24]\n\t"
+        "eor   ip, r5, r3, asr #31\n\t"
+        "eor   r9, r7, r2, asr #31\n\t"
+        "orrs  ip, ip, r9\n\t"
         "bne   4f\n\t"
-        "ldmia r0, {r0, r4, r5}\n\t"
-        "smull r7, r8, r3, r4\n\t"
-        "smlal r7, r8, r2, r5\n\t"
+        "smull r7, r9, r3, r4\n\t"
+        "smlal r7, r9, r2, r6\n\t"
         "5:\n\t"
-        "ldr   r6, [sp, #24]\n\t"
-        "lsr   r7, r7, #12\n\t"
-        "orr   r7, r7, r8, lsl #20\n\t"
-        "sub   r6, r6, r7\n\t"
         "add   r1, r0, r1, lsl #2\n\t"
-        "str   r6, [r1, #192]\n\t"
+        "lsr   r7, r7, #12\n\t"
+        "orr   r7, r7, r9, lsl #20\n\t"
+        "sub   r8, r8, r7\n\t"
+        "str   r8, [r1, #192]\n\t"
         "str   r3, [r1, #232]\n\t"
         "str   r2, [r1, #272]\n\t"
         "pop   {r4, r5, r6, r7, r8, r9}\n\t"
@@ -100,22 +100,16 @@ static void grSetupGradientNZ(const _grGradientInfo * restrict info, int gradien
         "asr   r2, r9, r2\n\t"
         "b     3b\n\t"
         "4:\n\t"
-        "cmp   r8, #32\n\t"
-        "movge r5, r4, asr #31\n\t"
-        "movlt r5, r4, asr r8\n\t"
-        "movge r7, r9, asr #31\n\t"
-        "movlt r7, r9, asr r8\n\t"
-        "ldmia r0, {r0, r4, r6}\n\t"
-        "umull r8, r9, r3, r4\n\t"
+        "umull ip, r9, r3, r4\n\t"
         "mla   r9, r5, r4, r9\n\t"
-        "and   ip, r3, r4, asr #31\n\t"
-        "sub   r9, r9, ip\n\t"
+        "and   r5, r3, r4, asr #31\n\t"
+        "sub   r9, r9, r5\n\t"
         "umull r4, r5, r2, r6\n\t"
         "mla   r5, r7, r6, r5\n\t"
-        "and   ip, r2, r6, asr #31\n\t"
-        "sub   r5, r5, ip\n\t"
-        "adds  r7, r8, r4\n\t"
-        "adc   r8, r9, r5\n\t"
+        "and   r7, r2, r6, asr #31\n\t"
+        "sub   r5, r5, r7\n\t"
+        "adds  r7, ip, r4\n\t"
+        "adc   r9, r9, r5\n\t"
         "b     5b\n\t"
     );
 }
@@ -1069,6 +1063,7 @@ typedef char gr_check_sc_y1_[offsetof(Gerbera_s, renderScissor.y1) == 116 ? 1 : 
 typedef char gr_check_sc_rs_[offsetof(Gerbera_s, renderStack) == 5240 ? 1 : -1];
 typedef char gr_check_sc_pp_[offsetof(Gerbera_s, pixelPipeline) == 5252 ? 1 : -1];
 typedef char gr_check_sc_esc_[offsetof(Gerbera_s, edgeSlopeCache) == 8020 ? 1 : -1];
+typedef char gr_check_sc_esc_rs_[offsetof(Gerbera_s, edgeSlopeCache) - offsetof(Gerbera_s, renderStack) == 2780 ? 1 : -1];
 typedef char gr_check_sc_ns_[offsetof(_grPixelPipe, numScanlines) == 180 ? 1 : -1];
 typedef char gr_check_sc_si_[offsetof(_grPixelPipe, scanlineInfo) == 184 ? 1 : -1];
 typedef char gr_check_sc_ys_[offsetof(_grPixelPipe, yStart) == 188 ? 1 : -1];
@@ -1161,13 +1156,13 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "asr   r6, r6, r7\n\t"               /* r6 = den12 */
         "sub   r3, r5, r4\n\t"
         "asr   r3, r3, r7\n\t"               /* r3 = den01 */
+        "ldr   r9, [sp, #0]\n\t"
         "mvn   r7, #0\n\t"
         "lsr   r7, r7, #20\n\t"              /* 0xFFF */
         "bic   r4, r7, r4\n\t"               /* fracV0y */
         "bic   r5, r7, r5\n\t"               /* fracV1y */
         "orr   r4, r4, r5, lsl #16\n\t"      /* r4 = fracV0y | (fracV1y << 16) */
         "mov   r7, r3\n\t"                   /* r7 = den01 */
-        "ldr   r9, [sp, #0]\n\t"
         "add   r9, r9, #7936\n\t"
         "add   r9, r9, #84\n\t"              /* r9 = cacheBase (+8020) */
 
@@ -1215,11 +1210,11 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "lsr   r3, r3, #12\n\t"
         "orr   r3, r3, r12, lsl #20\n\t"
         "sub   r11, r8, r3\n\t"              /* longMid */
+        "ldr   r12, [sp, #24]\n\t"           /* topHeight */
         "rsbs  r11, r11, r1, lsl #2\n\t"     /* 4*p1x - longMid */
         "orrmi r4, r4, #0x8000\n\t"          /* longOnRight in r4 bit 15 */
 
         /* Top half */
-        "ldr   r12, [sp, #24]\n\t"           /* topHeight */
         "cmp   r12, #0\n\t"
         "beq   .Lgrsc_skip_top\n\t"
         "ldr   r12, [sp, #64]\n\t"           /* emptyBits */
@@ -1268,19 +1263,16 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "moveq r7, r11\n\t"
 
         "ldr   r11, [sp, #8]\n\t"            /* topAdvance */
+        "ldr   r12, [sp, #16]\n\t"           /* needsXSciss */
         "cmp   r11, #0\n\t"
         "mlane r0, r3, r11, r0\n\t"
         "mlane r10, r7, r11, r10\n\t"
 
-        "ldr   r11, [sp, #0]\n\t"
-        "add   r11, r11, #4096\n\t"
-        "ldr   r11, [r11, #1144]\n\t"
+        "ldr   r11, [r9, #-2780]\n\t"        /* renderStack */
+        "cmp   r12, #0\n\t"
         "add   r11, r11, #15616\n\t"
         "add   r11, r11, #52\n\t"
         "str   r11, [sp, #8]\n\t"            /* save scanStart */
-
-        "ldr   r12, [sp, #16]\n\t"           /* needsXSciss */
-        "cmp   r12, #0\n\t"
         "blt   .Lgrsc_top_scissor\n\t"
         "ldr   r12, [sp, #24]\n\t"           /* topHeight */
         "str   r9, [sp, #24]\n\t"            /* preserve cacheBase */
@@ -1297,9 +1289,7 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "b     .Lgrsc_check_btm\n\t"
 
     ".Lgrsc_skip_top:\n\t"
-        "ldr   r11, [sp, #0]\n\t"
-        "add   r11, r11, #4096\n\t"
-        "ldr   r11, [r11, #1144]\n\t"
+        "ldr   r11, [r9, #-2780]\n\t"        /* renderStack */
         "add   r11, r11, #15616\n\t"
         "add   r11, r11, #52\n\t"
         "str   r11, [sp, #8]\n\t"
@@ -1350,11 +1340,11 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "moveq r5, r10\n\t"
 
         "ldr   r7, [sp, #12]\n\t"            /* btmAdvance */
+        "ldr   r12, [sp, #16]\n\t"           /* needsXSciss */
         "cmp   r7, #0\n\t"
         "mlane r0, r3, r7, r0\n\t"
         "mlane r8, r5, r7, r8\n\t"
 
-        "ldr   r12, [sp, #16]\n\t"           /* needsXSciss */
         "cmp   r12, #0\n\t"
         "ldr   r12, [sp, #20]\n\t"           /* btmHeight */
         "blt   .Lgrsc_btm_scissor\n\t"
@@ -1370,6 +1360,8 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
 
     ".Lgrsc_trim:\n\t"
         "ldr   r0, [sp, #8]\n\t"             /* scanStart */
+        "ldr   r4, [sp, #0]\n\t"             /* state */
+        "ldr   r5, [sp, #4]\n\t"             /* yStart */
     ".Lgrsc_trim_tail:\n\t"
         "ldr   r1, [r11, #-4]!\n\t"
         "movs  r1, r1, lsr #16\n\t"
@@ -1383,7 +1375,24 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "pop   {r4-r11, pc}\n\t"
 
     ".Lgrsc_tail_found:\n\t"
+        "ldr   r2, [r0]\n\t"
+        "add   r4, r4, #4096\n\t"
+        "ldr   r4, [r4, #1156]\n\t"          /* pixelPipe */
+        "movs  r2, r2, lsr #16\n\t"
+        "beq   .Lgrsc_trim_head_skip\n\t"
+        "sub   r3, r11, r0\n\t"
+        "add   r3, r3, #4\n\t"
+        "lsr   r3, r3, #2\n\t"
+        "str   r3, [r4, #180]\n\t"
+        "str   r0, [r4, #184]\n\t"
+        "str   r5, [r4, #188]\n\t"
+        "mov   r0, r3\n\t"
+        "add   sp, sp, #28\n\t"
+        "pop   {r4-r11, pc}\n\t"
+
+    ".Lgrsc_trim_head_skip:\n\t"
         "mov   r2, r0\n\t"
+        "add   r0, r0, #4\n\t"
     ".Lgrsc_trim_head:\n\t"
         "ldr   r1, [r0], #4\n\t"
         "movs  r1, r1, lsr #16\n\t"
@@ -1393,14 +1402,10 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
         "add   r3, r3, #4\n\t"
         "lsr   r3, r3, #2\n\t"
         "sub   r2, r0, r2\n\t"
-        "ldr   r1, [sp, #4]\n\t"             /* yStart */
-        "add   r1, r1, r2, asr #2\n\t"
-        "ldr   r4, [sp, #0]\n\t"             /* state */
-        "add   r4, r4, #4096\n\t"
-        "ldr   r4, [r4, #1156]\n\t"          /* pixelPipe */
+        "add   r5, r5, r2, asr #2\n\t"
         "str   r3, [r4, #180]\n\t"
         "str   r0, [r4, #184]\n\t"
-        "str   r1, [r4, #188]\n\t"
+        "str   r5, [r4, #188]\n\t"
         "mov   r0, r3\n\t"
         "add   sp, sp, #28\n\t"
         "pop   {r4-r11, pc}\n\t"

@@ -107,9 +107,9 @@ int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsign
         "uxth    r8, r8\n\t"              /* x = span & 0xffff */
         "mla     r10, r4, r8, r2\n\t"     /* first = reference + dx * x */
         "add     r8, r3, r8, lsl #1\n\t"  /* depth = row + 2 * x */
+        "ldrh    r12, [r8], #2\n\t"       /* d0 = *depth++ (overlaps cmp/add) */
         "cmp     r10, #0x40000000\n\t"    /* first > 0x3FFFFFFF ? */
         "bhs     9f\n\t"
-        "ldrh    r12, [r8], #2\n\t"       /* d0 = *depth++ */
         "add     r11, r1, r10, lsr #14\n\t" /* fBound = (first >> 14) + strictLess */
         "cmp     r12, r11\n\t"
         "bhs     9f\n\t"
@@ -124,8 +124,8 @@ int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsign
         "bne     9f\n\t"
         "cmp     r4, #0\n\t"              /* dx < 0? */
         "bge     3f\n\t"
-        "add     r11, r1, r12, lsr #14\n\t"
         "ldrh    lr, [r8, #-2]\n\t"       /* d0 */
+        "add     r11, r1, r12, lsr #14\n\t"
         "cmp     lr, r11\n\t"
         "bhs     9f\n\t"
     "3:\n\t"
@@ -160,11 +160,11 @@ int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsign
         "orr     r11, r11, r11, lsl #16\n\t"
     "61:\n\t"
         "ldmia   r8!, {r12, lr}\n\t"
+        "sub     r9, r9, #4\n\t"
         "uqsub16 r12, r12, r11\n\t"
         "uqsub16 lr, lr, r11\n\t"
         "orrs    r12, r12, lr\n\t"
         "bne     9f\n\t"
-        "sub     r9, r9, #4\n\t"
         "cmp     r9, #3\n\t"
         "bhi     61b\n\t"
         "cmp     r9, #0\n\t"
