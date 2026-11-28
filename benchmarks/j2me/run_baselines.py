@@ -55,6 +55,11 @@ def main() -> None:
                         default=ARM / "build/attempt-3-source")
     parser.add_argument("--output", type=Path, default=HERE / "baselines")
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
+    parser.add_argument("--bpp", type=int, choices=(16, 32), default=32)
+    parser.add_argument("--include-16bpp", action="store_true",
+                        help="Allow 16bpp RGB565 replay")
+    parser.add_argument("--include-armv5", action="store_true",
+                        help="Build current-worktree with armv5t instead of armv6j")
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=240)
     parser.add_argument("--times", default="0,5000,10000,15000,20000,25000",
@@ -69,6 +74,8 @@ def main() -> None:
     parser.add_argument("--profile", action="store_true",
                         help="Save native function profiles for each measured frame")
     args = parser.parse_args()
+    if args.bpp == 16 and not args.include_16bpp:
+        parser.error("--bpp 16 requires --include-16bpp")
     if args.jobs < 1 or args.jobs > 8:
         parser.error("--jobs must be between 1 and 8")
     if not 1 <= args.width <= 1024 or not 1 <= args.height <= 1024:
@@ -96,7 +103,10 @@ def main() -> None:
             parser.error("--attempt-source must point to a checkout of attempt-3")
         sources = {"current-worktree": ROOT, "attempt-3": attempt}
         revisions = {label: revision(source) for label, source in sources.items()}
-        architectures = {"current-worktree": "armv5t", "attempt-3": "armv6j"}
+        architectures = {
+            "current-worktree": "armv5t" if args.include_armv5 else "armv6j",
+            "attempt-3": "armv6j",
+        }
         builds = {label: ARM / "build" / ("j2me-current" if label == "current-worktree"
                                           else "j2me-attempt-3") for label in sources}
         renderers = {label: build / "gerbera.elf" for label, build in builds.items()}
@@ -106,9 +116,12 @@ def main() -> None:
     if not args.skip_build:
         tasks = []
         for label, source in sources.items():
-            tasks.append((label, [sys.executable, ARM / "build_gerbera.py",
-                                  "--source", source, "--build", builds[label],
-                                  "--march", architectures[label]], logs / (label + ".log")))
+            build_cmd = [sys.executable, ARM / "build_gerbera.py",
+                         "--source", source, "--build", builds[label],
+                         "--march", architectures[label]]
+            if architectures[label] in ("armv5t", "armv5te"):
+                build_cmd.append("--include-armv5")
+            tasks.append((label, build_cmd, logs / (label + ".log")))
         parallel(args.jobs, tasks)
         run([sys.executable, HERE / "build.py"], logs / "host-build.log")
     if not args.skip_capture and not args.captures:
@@ -136,8 +149,10 @@ def main() -> None:
             command = [sys.executable, ARM / "replay_gles.py", trace,
                        "--frame", str(frame), "--width", str(args.width),
                        "--height", str(args.height), "--cpu", "arm1136",
-                       "--counter", "block", "--warm-runs", "2", "--bpp", "32",
+                       "--counter", "block", "--warm-runs", "2", "--bpp", str(args.bpp),
                        "--output", directory]
+            if args.bpp == 16:
+                command.append("--include-16bpp")
             if args.profile:
                 command.append("--profile")
             for label, elf in renderers.items():
@@ -148,7 +163,7 @@ def main() -> None:
     parallel(args.jobs, tasks)
     rows = []
     for case, capture, directory in frames:
-        with (directory / "results_32.csv").open(newline="") as stream:
+        with (directory / f"results_{args.bpp}.csv").open(newline="") as stream:
             for row in csv.DictReader(stream):
                 label = row["renderer"]
                 row.update(workload=case, time_ms=capture.get("time_ms", ""),
@@ -159,9 +174,9 @@ def main() -> None:
         images = output / "images" / case / str(capture["frame"])
         images.mkdir(parents=True, exist_ok=True)
         for label in renderers:
-            shutil.copyfile(directory / (label + "_16.png"), images / (label + ".png"))
+            shutil.copyfile(directory / f"{label}_{args.bpp}.png", images / (label + ".png"))
             if args.profile:
-                shutil.copyfile(directory / (label + "_16_profile.csv"),
+                shutil.copyfile(directory / f"{label}_{args.bpp}_profile.csv",
                                 images / (label + "-profile.csv"))
     with (output / "results.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")

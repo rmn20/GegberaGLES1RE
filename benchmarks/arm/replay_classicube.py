@@ -13,7 +13,7 @@ import struct
 import numpy as np
 from PIL import Image
 
-from run import COUNT_FIELDS, Machine, counter_library, words
+from run import COUNT_FIELDS, CPU_MODELS, Machine, counter_library, words
 
 
 HERE = Path(__file__).resolve().parent
@@ -102,7 +102,7 @@ def category(name: str, stage: str | None = None) -> str:
 
 def render(renderer: str, bpp: int, events: list[dict], payload: bytes, capture_frame: int,
            directory: Path, rows: list[dict], width: int, height: int, *,
-           elf: Path | None = None, cpu: str = "arm926", counter: str = "instruction",
+           elf: Path | None = None, cpu: str = "arm1136", counter: str = "instruction",
            warm_runs: int = 1, max_warm_runs: int = 6, finish: bool = False,
            profile: bool = False, profile_jit: bool = False, window: bool = False,
            end_frame: int | None = None, frames: dict[int, bytes] | None = None) -> bytes:
@@ -269,11 +269,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", type=Path, default=HERE / "classicube")
     parser.add_argument("--bpp", type=int, choices=(16, 32), default=32)
+    parser.add_argument("--include-16bpp", action="store_true",
+                        help="Allow 16bpp RGB565 replay")
+    parser.add_argument("--cpu", choices=CPU_MODELS, default="arm1136")
+    parser.add_argument("--include-arm926", action="store_true",
+                        help="Allow arm926 CPU replay")
     parser.add_argument("--renderer", choices=("gerbera", "pixelflinger", "both"), default="both")
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=240)
     parser.add_argument("--window", action="store_true", help="Use native window-surface locking during replay")
     args = parser.parse_args()
+    if args.bpp == 16 and not args.include_16bpp:
+        parser.error("--bpp 16 requires --include-16bpp")
+    if args.cpu == "arm926" and not args.include_arm926:
+        parser.error("--cpu arm926 requires --include-arm926")
     events = [json.loads(line) for line in (args.trace / "landscape.jsonl").read_text().splitlines()]
     payload = (args.trace / "landscape.bin").read_bytes()
     capture_frame = next(e["frame"] for e in events if e["fn"] == "capture")
@@ -281,7 +290,8 @@ def main() -> None:
     rows, images = [], {}
     for renderer in renderers:
         images[renderer] = render(renderer, args.bpp, events, payload, capture_frame,
-                                  args.trace, rows, args.width, args.height, window=args.window)
+                                  args.trace, rows, args.width, args.height, cpu=args.cpu,
+                                  window=args.window)
         output = args.trace / f"results_{args.bpp}_{args.renderer}.csv"
         fields = ["renderer", "bpp", "surface", "phase", "category", "iteration", "settling_runs",
                   *COUNT_FIELDS, "calls"]

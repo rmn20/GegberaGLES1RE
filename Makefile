@@ -32,8 +32,10 @@ win32:
 symbian:
 	./symbian/build_symbian.sh
 
+SYMBIAN_ENTRY_FLAGS ?=
+
 symbian-entry-check: differential-build
-	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_symbian_entry.py
+	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_symbian_entry.py $(SYMBIAN_ENTRY_FLAGS)
 
 .PHONY: arm-division-check
 arm-division-check: differential-build
@@ -93,16 +95,21 @@ differential: differential-harness-check
 
 check: test differential
 
+NATIVE_DISPATCH_FLAGS ?=
+
 # Cross-target dispatch ABI checks; requires Clang, ld.lld and Unicorn.
 native-dispatch-check: differential-build
-	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_native_dispatch.py
+	GERBERA_DIFFERENTIAL_LIBRARY=$(DIFF_LIB) $(PYTHON) tests/test_native_dispatch.py $(NATIVE_DISPATCH_FLAGS)
+
+ARM_JIT_MODES ?= 1
+ARM_JIT_FLAGS ?=
 
 arm-jit-check:
-	@set -e; for mode in 0 1; do \
+	@set -e; for mode in $(ARM_JIT_MODES); do \
 	    dir=$(BUILD)/arm-jit-$$mode; armv5=; \
 	    if [ "$$mode" = 0 ]; then armv5=--armv5; fi; \
 	    $(MAKE) BUILD=$$dir CFLAGS='$(CFLAGS) -DGERBERA_ARMV6_JIT='$$mode differential-build; \
-	    $(PYTHON) tests/test_arm_jit.py --library $$dir/differential/libgerbera_diff.so $$armv5; \
+	    $(PYTHON) tests/test_arm_jit.py --library $$dir/differential/libgerbera_diff.so $$armv5 $(ARM_JIT_FLAGS); \
 	done
 
 # Optional recovered-C coverage, measured during the same binary comparisons.

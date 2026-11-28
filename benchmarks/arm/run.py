@@ -77,7 +77,7 @@ class Machine:
     RET = STUB + 0xf000
     STACK = 0x70000000
 
-    def __init__(self, path, library, width, height, bpp, *, cpu='arm926', counter='instruction',
+    def __init__(self, path, library, width, height, bpp, *, cpu='arm1136', counter='instruction',
                  profile=False, profile_jit=False):
         profile |= profile_jit
         if profile and counter != 'block':
@@ -905,9 +905,13 @@ def main():
                         help='Named ELF; gerbera, pixelflinger and both select their default builds')
     parser.add_argument('--scenes', nargs='+', choices=SCENES, default=list(SCENES))
     parser.add_argument('--bpp', type=int, nargs='+', default=[32], choices=[16,32])
+    parser.add_argument('--include-16bpp', action='store_true',
+                        help='Allow 16bpp RGB565 benchmarks')
     parser.add_argument('--width', type=int, default=128)
     parser.add_argument('--height', type=int, default=96)
     parser.add_argument('--cpu', choices=CPU_MODELS, default='arm1136')
+    parser.add_argument('--include-arm926', action='store_true',
+                        help='Allow arm926 CPU benchmarks')
     parser.add_argument('--counter', choices=('block', 'instruction'), default='block')
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--window', action='store_true')
@@ -917,6 +921,10 @@ def main():
     parser.add_argument('--profile-jit', action='store_true', help='Include hot generated-code block disassembly')
     parser.add_argument('--require-identical', action='store_true', help='Fail on cross-renderer RGB differences')
     args = parser.parse_args()
+    if 16 in args.bpp and not args.include_16bpp:
+        parser.error('16bpp benchmarks require --include-16bpp')
+    if args.cpu == 'arm926' and not args.include_arm926:
+        parser.error('--cpu arm926 requires --include-arm926')
     args.profile |= args.profile_jit
     if args.profile and args.counter != 'block':
         parser.error('profiling requires --counter block')

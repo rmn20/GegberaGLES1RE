@@ -3,6 +3,7 @@
 
 Run with make native-dispatch-check; requires Clang, ld.lld and Unicorn.
 """
+import argparse
 import os
 from pathlib import Path
 import struct
@@ -65,6 +66,8 @@ def run(target, work):
     high = (max(segment[2] + segment[5] for segment in segments) + 4095) & ~4095
     is_arm = target.startswith("arm")
     machine = Uc(UC_ARCH_ARM if is_arm else UC_ARCH_X86, UC_MODE_ARM if is_arm else UC_MODE_32)
+    if is_arm:
+        machine.ctl_set_cpu_model(ARM.UC_CPU_ARM_926 if target.startswith("armv5") else ARM.UC_CPU_ARM_1136_R2)
     machine.mem_map(low, high - low)
     for _, offset, address, _, size, _, _, _ in segments:
         machine.mem_write(address, data[offset:offset + size])
@@ -88,6 +91,12 @@ def run(target, work):
 
 if __name__ == "__main__":
     guard = install()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--include-armv5", action="store_true",
+                        help="Also check the armv5-none-eabi target")
+    args = parser.parse_args()
+    targets = ("armv6j-none-eabi", "armv5-none-eabi", "i386-unknown-none") if args.include_armv5 else (
+        "armv6j-none-eabi", "i386-unknown-none")
     with tempfile.TemporaryDirectory(prefix="gerbera-dispatch-") as directory:
-        for architecture in ("armv5-none-eabi", "i386-unknown-none"):
+        for architecture in targets:
             run(architecture, Path(directory))

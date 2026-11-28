@@ -4,6 +4,7 @@
 Run with make symbian-entry-check; requires arm-none-eabi tools and Unicorn.
 Select handlers from the linked EHABI descriptors using the OS return-address ranges.
 """
+import argparse
 import os
 from pathlib import Path
 import struct
@@ -11,7 +12,10 @@ import subprocess
 import tempfile
 
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM, UC_HOOK_CODE
-from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R4, UC_ARM_REG_LR, UC_ARM_REG_PC, UC_ARM_REG_SP
+from unicorn.arm_const import (
+    UC_ARM_REG_R0, UC_ARM_REG_R4, UC_ARM_REG_LR, UC_ARM_REG_PC, UC_ARM_REG_SP,
+    UC_CPU_ARM_926, UC_CPU_ARM_1136_R2,
+)
 from differential_fault_guard import install
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +29,7 @@ IMPORTS = (
 )
 
 
-def main():
+def check_march(march):
     with tempfile.TemporaryDirectory(prefix="gerbera-entry-") as directory:
         work = Path(directory)
         stub = work / "imports.S"
@@ -51,7 +55,7 @@ SECTIONS {
 }
 """)
         for source, output in ((ROOT / "symbian/symbian_entry.S", "entry.o"), (stub, "imports.o")):
-            subprocess.run([PREFIX + "gcc", "-march=armv5t", "-marm", "-c", str(source),
+            subprocess.run([PREFIX + "gcc", f"-march={march}", "-marm", "-c", str(source),
                             "-o", str(work / output)], check=True, timeout=10)
         elf, binary = work / "entry.elf", work / "entry.bin"
         subprocess.run([PREFIX + "ld", "-T", str(linker), str(work / "entry.o"),
@@ -98,6 +102,7 @@ SECTIONS {
 
     def run(mode, reason=None):
         machine = Uc(UC_ARCH_ARM, UC_MODE_ARM)
+        machine.ctl_set_cpu_model(UC_CPU_ARM_926 if march == "armv5t" else UC_CPU_ARM_1136_R2)
         machine.mem_map(0x8000, 0x10000)
         machine.mem_write(0x8000, code)
         machine.mem_map(0x20000, 0x10000)
@@ -157,7 +162,17 @@ SECTIONS {
     assert run("leave") == prefix + ["__cxa_begin_catch", "sym_XLeaveException_GetReason", "__cxa_end_catch"]
     assert run("foreign") == prefix + ["__cxa_begin_catch", "sym_User_Invariant"]
     assert run("cleanup") == prefix + ["__cxa_begin_catch", "sym_XLeaveException_GetReason", "__cxa_end_catch", "__cxa_end_cleanup"]
-    print("Symbian entry: 5 lifecycle reasons, success, leave, foreign catch and cleanup passed")
+    print(f"Symbian entry ({march}): 5 lifecycle reasons, success, leave, foreign catch and cleanup passed")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--include-armv5", action="store_true",
+                        help="Also check the armv5t / ARM926 target")
+    args = parser.parse_args()
+    arches = ("armv6j", "armv5t") if args.include_armv5 else ("armv6j",)
+    for march in arches:
+        check_march(march)
 
 
 if __name__ == "__main__":

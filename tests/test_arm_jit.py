@@ -76,7 +76,7 @@ def scalar_blend(op, lanes=4, wrong_bias=False):
     return body
 
 
-def check_spans(lib, machine, code, data, stack, stop):
+def check_spans(lib, machine, code, data, stack, stop, include_16bpp=False):
     oracle = SimpleNamespace(uc=machine, STACK=stack, STACK_SIZE=65536, cursor=data)
     oracle.write = lambda address, payload: machine.mem_write(address, bytes(payload))
     oracle.readback = lambda address, size: bytes(machine.mem_read(address, size))
@@ -122,56 +122,57 @@ def check_spans(lib, machine, code, data, stack, stop):
         desc = buffer(bytes(16))
         lib.grrGetTextureFormatDescriptor(desc, fmt)
         descriptors.append(bytes(desc))
-    signature = bytearray(144)
-    signature[:16] = descriptors[15]
-    signature[10] = 2
-    for offset, value in ((16, 1), (17, 7), (18, 1), (21, 1), (22, 3), (42, 1), (47, 1)):
-        signature[offset] = value
-    signature[56:100] = pixel_texture_record(descriptors)
-    inputs = [0xFF204060, 0xFFA08020, 0xFF10D0A0, 0xFFE03090] + [0] * 4 + [0, 0, 0, 2, 2, 0, 0]
-    patterns = ([0] * 8, [0xFFFF] * 8, [0, 0xFFFF] * 4)
-    color_steps = (0, 1 << 16, -(11 << 16), 0x80000000)
-    depth_steps = (0, 0x01000000, -0x01000000, 0x80000000)
-    checks = 0
-    for dither, less, depth_write, mode in product((0, 1), repeat=4):
-        signature[21], signature[22], signature[45] = depth_write, 1 if less else 3, dither
-        texture_mode = 3 if mode else 0
-        signature[56:100] = pixel_texture_record(descriptors, mode=texture_mode)
-        inputs[13] = texture_mode
-        program = buffer(bytes(32768))
-        assert lib.grExecuteProgram(program, buffer(bytes(signature)), 4096) > 0
-        emitted = []
-        for mask in (0x3FF, 0x7FF, 0xFFF):
-            output, parameters = buffer(bytes(65536)), buffer(bytes(16))
-            length = lib.differential_raster_compile(program, mask, output, 65536, parameters)
-            assert 0 < length <= 65536
-            emitted.append(bytes(output)[:length])
-        assert emitted[2] != emitted[1], "depth-reject optimization did not execute"
-        if not mode:
-            assert emitted[0] != emitted[1], "gradient rematerialization did not execute"
-        optimized_codes = [item for item in dict.fromkeys(emitted[1:]) if item != emitted[0]]
-        direct, mask = buffer(bytes(4096)), C.c_uint32()
-        length = lib.grCompileARMPixelPipeline(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask))
-        assert length > 0
-        direct_bytes = bytes(direct)[:length]
-        optimized_codes.append(direct_bytes)
-        for (pattern, depths), step, depth_step in product(enumerate(patterns), color_steps, depth_steps):
-            # Out-of-range interpolants use the ordinary JIT as reference.
-            bounded_reference = step in (0, 1 << 16, -(11 << 16)) and depth_step in (0, 0x01000000, -0x01000000)
-            gradients = [0x10000000, 127 << 16, 80 << 16, 40 << 16, 180 << 16,
-                         255 << 16, 0x10000000, 0x40000000, 0, 0]
-            gradients += [depth_step, 0, step, step, step, 0, 0x70000000, 0xA0000000, 0, 0]
-            gradients += [0x02000000, 0, 0, 0, 0, 0, 0xC0000000, 0x90000000, 0, 0]
-            initial = (words([0] * 8) + b"\xA5" * 8,
-                       struct.pack("<8H", *depths) + b"\xA5" * 8,
-                       bytes(8) + b"\xA5" * 8)
-            for optimized in optimized_codes:
-                oracle.cursor = data
-                compare_pixel_span(suite, bytes(signature), (emitted[0], optimized),
-                                   (dither, less, depth_write, mode, pattern, step, depth_step),
-                                   inputs=inputs, gradients=gradients, initial=initial)
-                checks += 1
-    print(f"ARM JIT: {checks} optimized spans match ordinary JIT; bounded interpolants also match C")
+    if include_16bpp:
+        signature = bytearray(144)
+        signature[:16] = descriptors[15]
+        signature[10] = 2
+        for offset, value in ((16, 1), (17, 7), (18, 1), (21, 1), (22, 3), (42, 1), (47, 1)):
+            signature[offset] = value
+        signature[56:100] = pixel_texture_record(descriptors)
+        inputs = [0xFF204060, 0xFFA08020, 0xFF10D0A0, 0xFFE03090] + [0] * 4 + [0, 0, 0, 2, 2, 0, 0]
+        patterns = ([0] * 8, [0xFFFF] * 8, [0, 0xFFFF] * 4)
+        color_steps = (0, 1 << 16, -(11 << 16), 0x80000000)
+        depth_steps = (0, 0x01000000, -0x01000000, 0x80000000)
+        checks = 0
+        for dither, less, depth_write, mode in product((0, 1), repeat=4):
+            signature[21], signature[22], signature[45] = depth_write, 1 if less else 3, dither
+            texture_mode = 3 if mode else 0
+            signature[56:100] = pixel_texture_record(descriptors, mode=texture_mode)
+            inputs[13] = texture_mode
+            program = buffer(bytes(32768))
+            assert lib.grExecuteProgram(program, buffer(bytes(signature)), 4096) > 0
+            emitted = []
+            for mask in (0x3FF, 0x7FF, 0xFFF):
+                output, parameters = buffer(bytes(65536)), buffer(bytes(16))
+                length = lib.differential_raster_compile(program, mask, output, 65536, parameters)
+                assert 0 < length <= 65536
+                emitted.append(bytes(output)[:length])
+            assert emitted[2] != emitted[1], "depth-reject optimization did not execute"
+            if not mode:
+                assert emitted[0] != emitted[1], "gradient rematerialization did not execute"
+            optimized_codes = [item for item in dict.fromkeys(emitted[1:]) if item != emitted[0]]
+            direct, mask = buffer(bytes(4096)), C.c_uint32()
+            length = lib.grCompileARMPixelPipeline(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask))
+            assert length > 0
+            direct_bytes = bytes(direct)[:length]
+            optimized_codes.append(direct_bytes)
+            for (pattern, depths), step, depth_step in product(enumerate(patterns), color_steps, depth_steps):
+                # Out-of-range interpolants use the ordinary JIT as reference.
+                bounded_reference = step in (0, 1 << 16, -(11 << 16)) and depth_step in (0, 0x01000000, -0x01000000)
+                gradients = [0x10000000, 127 << 16, 80 << 16, 40 << 16, 180 << 16,
+                             255 << 16, 0x10000000, 0x40000000, 0, 0]
+                gradients += [depth_step, 0, step, step, step, 0, 0x70000000, 0xA0000000, 0, 0]
+                gradients += [0x02000000, 0, 0, 0, 0, 0, 0xC0000000, 0x90000000, 0, 0]
+                initial = (words([0] * 8) + b"\xA5" * 8,
+                           struct.pack("<8H", *depths) + b"\xA5" * 8,
+                           bytes(8) + b"\xA5" * 8)
+                for optimized in optimized_codes:
+                    oracle.cursor = data
+                    compare_pixel_span(suite, bytes(signature), (emitted[0], optimized),
+                                       (dither, less, depth_write, mode, pattern, step, depth_step),
+                                       inputs=inputs, gradients=gradients, initial=initial)
+                    checks += 1
+        print(f"ARM JIT: {checks} optimized spans match ordinary JIT; bounded interpolants also match C")
     bounded_reference = True
     checks = 0
     for width, height in ((0, 0), (0, 2), (2, 0), (1, 1)):
@@ -215,7 +216,7 @@ def check_spans(lib, machine, code, data, stack, stop):
     checks = 0
     saved = {reg: 0x71360000 + reg for reg in range(ARM.UC_ARM_REG_R4, ARM.UC_ARM_REG_R11 + 1)}
     for output_format, texture_format, modulate, dither, fog in product(
-            range(4), (1, 2, 10, 11), (0, 1), (0, 1), (0, 1)):
+            range(0 if include_16bpp else 1, 4), (1, 2, 10, 11), (0, 1), (0, 1), (0, 1)):
         if dither and output_format != 0:
             continue
         signature = bytearray(144)
@@ -307,8 +308,10 @@ def check_spans(lib, machine, code, data, stack, stop):
         ("gouraud", [260 << 16, 80 << 16, 40 << 16, 180 << 16],
          [-0x5234, 0x12345, -0x45678, 0x10000], [0xABCDEF, -0x76543, 0x20000, -0x10000]),
     )
+    out_range_4 = range(0 if include_16bpp else 1, 4)
+    out_range_5 = range(0 if include_16bpp else 1, 5)
     for out_idx, tex_fmt, modulate, fog, alpha_test, depth in product(
-            range(4), (2, 11), (0, 1), (0, 1), (0, 1), (0, 1)):
+            out_range_4, (2, 11), (0, 1), (0, 1), (0, 1), (0, 1)):
         if alpha_test and modulate and out_idx not in (0, 2):
             continue
         signature = bytearray(144)
@@ -538,7 +541,7 @@ def check_spans(lib, machine, code, data, stack, stop):
     )
     untex_checks = 0
     for out_idx, blend, fog, alpha_test, depth, dither in product(
-            range(4), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1)):
+            out_range_4, (0, 1), (0, 1), (0, 1), (0, 1), (0, 1)):
         if dither and out_idx != 0:
             continue
         if blend and (out_idx not in (0, 1, 3) or alpha_test):
@@ -603,7 +606,7 @@ def check_spans(lib, machine, code, data, stack, stop):
                     "untextured pixel pipeline", out_idx, blend, fog, alpha_test, depth, dither, mono_fog, cname)
                 untex_checks += 1
     bad_blend = bytearray(144)
-    bad_blend[:16] = destinations[0]
+    bad_blend[:16] = destinations[0 if include_16bpp else 1]
     bad_blend[10] = 2
     for offset, value in ((16, 1), (17, bad_blend[8]), (27, 1), (28, 0), (29, 3), (42, 1), (47, 1)):
         bad_blend[offset] = value
@@ -618,7 +621,7 @@ def check_spans(lib, machine, code, data, stack, stop):
     # and all 5 blend modes across RGB565, XRGB8888, ARGB8888, RGBA8888, XBGR8888.
     bilinear_checks = 0
     for out_idx, tex_fmt, modulate, fog, alpha_test, depth in product(
-            range(4), (2, 11), (0, 1), (0, 1), (0, 1), (0, 1)):
+            out_range_4, (2, 11), (0, 1), (0, 1), (0, 1), (0, 1)):
         if (out_idx ^ tex_fmt ^ modulate ^ fog) & 1 and (depth or alpha_test):
             continue
         signature = bytearray(144)
@@ -713,7 +716,7 @@ def check_spans(lib, machine, code, data, stack, stop):
     blend_all_dests = (descriptors[15], descriptors[1], descriptors[2], descriptors[6], descriptors[5])
     blend_all_checks = 0
     for (src_f, dst_f), out_idx, bilinear, tex_fmt, modulate, fog, alpha_test, depth in product(
-            blend_modes, range(5), (0, 1), (2, 11), (0, 1), (0, 1), (0, 1), (0, 1)):
+            blend_modes, out_range_5, (0, 1), (2, 11), (0, 1), (0, 1), (0, 1), (0, 1)):
         if ((out_idx + bilinear + tex_fmt + modulate + fog + alpha_test + depth) & 3) != 0:
             continue
         signature = bytearray(144)
@@ -794,7 +797,7 @@ def check_spans(lib, machine, code, data, stack, stop):
 
     untex_blend_checks = 0
     for (src_f, dst_f), out_idx, fog, alpha_test, depth in product(
-            blend_modes, range(4), (0, 1), (0, 1), (0, 1)):
+            blend_modes, out_range_4, (0, 1), (0, 1), (0, 1)):
         if (src_f, dst_f) == (0, 2) and alpha_test:
             continue
         if ((out_idx + fog + alpha_test + depth + src_f) & 1) != 0:
@@ -866,7 +869,7 @@ def check_spans(lib, machine, code, data, stack, stop):
         ("clamp_interior_edge", 0x08000000, 0x04000000, 0x02800000, 0x03000000, -0x01000000, 0x01800000),
     )
     for (ws, wt), out_idx, bilinear, tex_fmt, modulate, fog, alpha_test in product(
-            ((1, 0), (0, 1), (1, 1)), range(4), (0, 1), (2, 11), (0, 1), (0, 1), (0, 1)):
+            ((1, 0), (0, 1), (1, 1)), out_range_4, (0, 1), (2, 11), (0, 1), (0, 1), (0, 1)):
         if ((out_idx + bilinear + tex_fmt + modulate + fog + alpha_test + ws + wt) & 3) != 0:
             continue
         signature = bytearray(144)
@@ -961,7 +964,8 @@ def check_spans(lib, machine, code, data, stack, stop):
         ("z_mixed_reject", 0x20000000, 0x10000000, -0x24000000),
     )
     for (cmin, cmax), textured, bilinear, depth_func, depth_mask, alpha_test, dither, fog in product(
-            ((1, 0), (0, 1), (1, 1)), (0, 1), (0, 1), (1, 3), (0, 1), (0, 1), (0, 1), (0, 1)):
+            ((1, 0), (0, 1), (1, 1)), (0, 1), (0, 1), (1, 3), (0, 1), (0, 1),
+            (0, 1) if include_16bpp else (0,), (0, 1)):
         if not textured and bilinear:
             continue
         if ((cmin + cmax + textured + bilinear + depth_func + depth_mask + alpha_test + dither + fog) & 3) != 0:
@@ -1119,6 +1123,8 @@ def main():
     parser.add_argument("--library", type=Path, required=True,
                         help="Differential library built with GERBERA_ARMV6_JIT=1")
     parser.add_argument("--armv5", action="store_true", help="Check the compatibility backend")
+    parser.add_argument("--include-16bpp", action="store_true",
+                        help="Include 16bpp (RGB565) framebuffer checks")
     args = parser.parse_args()
     lib = install(path=args.library)
     lib.differential_arm_codegen.argtypes = [C.c_void_p, C.c_void_p, C.c_int]
@@ -1327,7 +1333,7 @@ def main():
     print(f"ARM JIT: {comparisons} arithmetic and ABI comparisons passed")
     if not args.armv5:
         check_scheduler(lib, machine, code, data, stack, stop)
-        check_spans(lib, machine, code, data, stack, stop)
+        check_spans(lib, machine, code, data, stack, stop, include_16bpp=args.include_16bpp)
 
 
 if __name__ == "__main__":

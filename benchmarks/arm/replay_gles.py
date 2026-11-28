@@ -27,8 +27,12 @@ def main() -> None:
     parser.add_argument("--width", type=int, help="Defaults to capture metadata")
     parser.add_argument("--height", type=int, help="Defaults to capture metadata")
     parser.add_argument("--bpp", type=int, choices=(16, 32), default=32)
+    parser.add_argument("--include-16bpp", action="store_true",
+                        help="Allow 16bpp RGB565 replay")
     parser.add_argument("--window", action="store_true", help="Use native window-surface locking during replay")
     parser.add_argument("--cpu", choices=CPU_MODELS, default="arm1136")
+    parser.add_argument("--include-arm926", action="store_true",
+                        help="Allow arm926 CPU replay")
     parser.add_argument("--counter", choices=("block", "instruction"), default="block")
     parser.add_argument("--profile", action="store_true",
                         help="Save a warm scene function profile using the native block counter")
@@ -37,6 +41,10 @@ def main() -> None:
     parser.add_argument("--warm-runs", type=int, default=2)
     parser.add_argument("--max-warm-runs", type=int, default=6)
     args = parser.parse_args()
+    if args.bpp == 16 and not args.include_16bpp:
+        parser.error("--bpp 16 requires --include-16bpp")
+    if args.cpu == "arm926" and not args.include_arm926:
+        parser.error("--cpu arm926 requires --include-arm926")
     args.profile |= args.profile_jit
     if args.warm_runs < 1 or args.max_warm_runs < args.warm_runs:
         parser.error("warm run bounds must satisfy 1 <= warm-runs <= max-warm-runs")

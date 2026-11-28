@@ -30,11 +30,15 @@ def build() -> None:
     parser.add_argument("--compiler", default="arm-none-eabi-gcc")
     parser.add_argument("--runner", type=shlex.split, default=[], metavar="COMMAND",
                         help="Run compiler tools through a command prefix; paths must be visible unchanged")
-    parser.add_argument("--march", default="armv5t", choices=("armv5t", "armv5te", "armv6j"))
+    parser.add_argument("--march", default="armv6j", choices=("armv5t", "armv5te", "armv6j"))
+    parser.add_argument("--include-armv5", action="store_true",
+                        help="Allow building armv5t/armv5te targets")
     parser.add_argument("--define", action="append", default=[], metavar="NAME[=VALUE]")
     parser.add_argument("--cflag", action="append", default=[], metavar="FLAG",
                         help="Additional C compiler option, for example --cflag=-fno-schedule-insns")
     args = parser.parse_args()
+    if args.march in ("armv5t", "armv5te") and not args.include_armv5:
+        parser.error(f"--march {args.march} requires --include-armv5")
     cc = args.compiler if args.runner else shutil.which(args.compiler)
     if not cc:
         raise SystemExit(f"Compiler not found: {args.compiler}")
