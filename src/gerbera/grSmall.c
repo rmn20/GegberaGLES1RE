@@ -79,6 +79,109 @@ const unsigned char g_mutableParamsMask[12] =
 
 /* A row is hidden when its nearest interpolated depth is behind every
  * stored sample. Validate the endpoint range before using that bound. */
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6 && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+typedef char gr_check_depth_stride_[offsetof(_grPixelPipe, checked.depthBufferStride) == 136 ? 1 : -1];
+typedef char gr_check_depth_row_[offsetof(_grPixelPipe, depthRow) == 172 ? 1 : -1];
+typedef char gr_check_depth_n_[offsetof(_grPixelPipe, numScanlines) == 180 ? 1 : -1];
+typedef char gr_check_depth_scan_[offsetof(_grPixelPipe, scanlineInfo) == 184 ? 1 : -1];
+typedef char gr_check_depth_xadd_[offsetof(_grPixelPipe, xAdder) == 232 ? 1 : -1];
+typedef char gr_check_depth_yadd_[offsetof(_grPixelPipe, yAdder) == 272 ? 1 : -1];
+
+__attribute__((noinline, naked))
+int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsigned int reference)
+{
+    __asm__ volatile(
+        "push    {r4-r11, lr}\n\t"
+        "ldr     r7, [r0, #180]\n\t"      /* n = pipe->numScanlines */
+        "ldr     r3, [r0, #172]\n\t"      /* row = pipe->depthRow */
+        "ldr     r4, [r0, #232]\n\t"      /* dx = pipe->xAdder[0] */
+        "ldr     r5, [r0, #272]\n\t"      /* yAdd = pipe->yAdder[0] */
+        "ldr     r6, [r0, #136]\n\t"      /* stride = depthBufferStride */
+        "ldr     r0, [r0, #184]\n\t"      /* scan = scanlineInfo */
+    "1:\n\t"
+        "ldr     r8, [r0], #4\n\t"        /* span = *scan++ */
+        "lsrs    r9, r8, #16\n\t"         /* count = span >> 16 */
+        "beq     8f\n\t"
+        "uxth    r8, r8\n\t"              /* x = span & 0xffff */
+        "mla     r10, r4, r8, r2\n\t"     /* first = reference + dx * x */
+        "add     r8, r3, r8, lsl #1\n\t"  /* depth = row + 2 * x */
+        "cmp     r10, #0x40000000\n\t"    /* first > 0x3FFFFFFF ? */
+        "bhs     9f\n\t"
+        "ldrh    r12, [r8], #2\n\t"       /* d0 = *depth++ */
+        "add     r11, r1, r10, lsr #14\n\t" /* fBound = (first >> 14) + strictLess */
+        "cmp     r12, r11\n\t"
+        "bhs     9f\n\t"
+        "subs    r9, r9, #1\n\t"          /* rem = count - 1 */
+        "beq     8f\n\t"
+        "cmp     r4, #0\n\t"              /* dx == 0? */
+        "beq     3f\n\t"
+        "smull   r12, lr, r4, r9\n\t"     /* (int64_t)dx * (int)rem */
+        "adds    r12, r12, r10\n\t"
+        "adc     lr, lr, #0\n\t"
+        "orrs    lr, lr, r12, lsr #30\n\t"
+        "bne     9f\n\t"
+        "cmp     r4, #0\n\t"              /* dx < 0? */
+        "bge     3f\n\t"
+        "add     r11, r1, r12, lsr #14\n\t"
+        "ldrh    lr, [r8, #-2]\n\t"       /* d0 */
+        "cmp     lr, r11\n\t"
+        "bhs     9f\n\t"
+    "3:\n\t"
+        "cmp     r9, #4\n\t"
+        "bhs     5f\n\t"
+    "4:\n\t"
+        "ldrh    r12, [r8], #2\n\t"
+        "cmp     r12, r11\n\t"
+        "bhs     9f\n\t"
+        "subs    r9, r9, #1\n\t"
+        "bne     4b\n\t"
+    "8:\n\t"
+        "subs    r7, r7, #1\n\t"
+        "addne   r3, r3, r6\n\t"
+        "addne   r2, r2, r5\n\t"
+        "bne     1b\n\t"
+        "mov     r0, #1\n\t"
+        "pop     {r4-r11, pc}\n\t"
+    "5:\n\t"
+        "cmp     r11, #65536\n\t"
+        "bhs     9f\n\t"
+        "sub     r11, r11, #1\n\t"
+        "tst     r8, #2\n\t"
+        "beq     6f\n\t"
+        "ldrh    r12, [r8], #2\n\t"
+        "cmp     r12, r11\n\t"
+        "bhi     9f\n\t"
+        "sub     r9, r9, #1\n\t"
+        "cmp     r9, #3\n\t"
+        "bls     7f\n\t"
+    "6:\n\t"
+        "orr     r11, r11, r11, lsl #16\n\t"
+    "61:\n\t"
+        "ldmia   r8!, {r12, lr}\n\t"
+        "uqsub16 r12, r12, r11\n\t"
+        "uqsub16 lr, lr, r11\n\t"
+        "orrs    r12, r12, lr\n\t"
+        "bne     9f\n\t"
+        "sub     r9, r9, #4\n\t"
+        "cmp     r9, #3\n\t"
+        "bhi     61b\n\t"
+        "cmp     r9, #0\n\t"
+        "beq     8b\n\t"
+        "uxth    r11, r11\n\t"
+    "7:\n\t"
+        "ldrh    r12, [r8], #2\n\t"
+        "cmp     r12, r11\n\t"
+        "bhi     9f\n\t"
+        "subs    r9, r9, #1\n\t"
+        "bne     7b\n\t"
+        "b       8b\n\t"
+    "9:\n\t"
+        "mov     r0, #0\n\t"
+        "pop     {r4-r11, pc}\n\t");
+}
+#else
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((noinline, optimize("O3")))
 #endif
@@ -233,6 +336,7 @@ int grDepthSpansOccludedFastRef(const _grPixelPipe *pipe, int strictLess, unsign
     }
     return 1;
 }
+#endif
 
 int grDepthSpansOccludedFast(const _grPixelPipe *pipe, int strictLess)
 {
@@ -273,45 +377,31 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
     _grVertex *v0 = vertexBuffer + grUnpackIndex(tri->indices, 0);
     _grVertex *v1 = vertexBuffer + grUnpackIndex(tri->indices, 1);
     _grVertex *v2 = vertexBuffer + grUnpackIndex(tri->indices, 2);
-    _grVertex *sorted[3];
-    _grVertex *swap;
+    _grVertex *s0 = v0, *s1 = v1, *s2 = v2;
+    int y0 = v0->screenPosition[1];
+    int y1 = v1->screenPosition[1];
+    int y2 = v2->screenPosition[1];
     unsigned int magic0 = GR_STACK_CHECK_MAGIC0;
     unsigned int magic1 = GR_STACK_CHECK_MAGIC1;
     unsigned int activeGradientMask;
-    int flatShadeIndex = (int)(grUnpackIndex(origIndices, 0));
     int i;
 
     (void)magic0;
     (void)magic1;
-    sorted[0] = v0;
-    sorted[1] = v1;
-    sorted[2] = v2;
     /* y-sort (record +32 = screenPosition[1]); stable 3-sort keeping the
      * original order for equal y */
-    swap = sorted[0];
-    if (sorted[1]->screenPosition[1] < sorted[0]->screenPosition[1])
-        sorted[0] = sorted[1];
-    if (sorted[2]->screenPosition[1] < sorted[0]->screenPosition[1])
-    {
-        sorted[0] = sorted[2];
-        sorted[2] = swap;
-    }
-    if (sorted[0] == sorted[1])
-        sorted[1] = swap;
-    if (sorted[2]->screenPosition[1] < sorted[1]->screenPosition[1])
-    {
-        swap = sorted[1];
-        sorted[1] = sorted[2];
-        sorted[2] = swap;
-    }
+    if (y1 < y0) { int t = y0; y0 = y1; y1 = t; _grVertex *tv = s0; s0 = s1; s1 = tv; }
+    if (y2 < y0) { int t = y0; y0 = y2; y2 = t; _grVertex *tv = s0; s0 = s2; s2 = tv; }
+    if (y2 < y1) { _grVertex *tv = s1; s1 = s2; s2 = tv; }
 
-    if (grScanConvertTriangle(state, (_grRasterPoint *)&sorted[0]->screenPosition[0],
-                              (_grRasterPoint *)&sorted[1]->screenPosition[0],
-                              (_grRasterPoint *)&sorted[2]->screenPosition[0],
+    if (grScanConvertTriangle(state, (_grRasterPoint *)&s0->screenPosition[0],
+                              (_grRasterPoint *)&s1->screenPosition[0],
+                              (_grRasterPoint *)&s2->screenPosition[0],
                               emptyBits) != 0)
     {
         _grPixelPipe *pixelPipe = state->pixelPipeline;
         int yStart = pixelPipe->yStart;
+        int flatShadeIndex = (int)(grUnpackIndex(origIndices, 0));
 
         for (i = 0; i < 3; ++i)
         {
@@ -332,10 +422,14 @@ void grDrawClippedTriangle(Gerbera_s *state, _grClipTriangle *tri,
                                        state->drawSurface.buffers[1].stride * yStart);
 #if GERBERA_ARMV6_JIT
         int rejectDepth = state->fastDepthReject;
-        if (!grSetupTriangleGradientsVisibleVertsAtY(state, tri, v0, v1, v2, flatShadeIndex, activeGradientMask, rejectDepth, yStart))
+        if (!grSetupTriangleGradientsVisibleVertsAtY(state, tri, v0, v1, v2,
+                                                     flatShadeIndex, activeGradientMask,
+                                                     rejectDepth, yStart))
             goto done;
 #else
-        (void)grSetupTriangleGradientsVisibleVertsAtY(state, tri, v0, v1, v2, flatShadeIndex, activeGradientMask, 0, yStart);
+        (void)grSetupTriangleGradientsVisibleVertsAtY(state, tri, v0, v1, v2,
+                                                      flatShadeIndex, activeGradientMask,
+                                                      0, yStart);
 #endif
 
         pixelPipe->colorRow = (void *)((char *)state->drawSurface.buffers[0].data +

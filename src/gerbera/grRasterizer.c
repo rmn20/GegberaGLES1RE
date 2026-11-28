@@ -234,31 +234,88 @@ void grComputeDeltas(const _grGradientInfo *info, int gradient, int g01, int g02
     if (g01 != 0 || g02 != 0)
     {
         HGint64 syDelta = hgMul64(info->v01syPerArea, g02);
-        HGint64 sxDelta;
-
         syDelta = hgMadd64(syDelta, info->v02syPerArea,
                            (int)(0u - (unsigned int)g01));
-        sxDelta = hgMul64(info->v02sxPerArea, g01);
-        sxDelta = hgMadd64(sxDelta, info->v01sxPerArea,
-                           (int)(0u - (unsigned int)g02));
         if (__builtin_expect(info->shift < 18, 1))
         {
             int sh = 18 - info->shift; /* 1..18 because info->shift in 0..17 */
             int rsh = 32 - sh;         /* 14..31 */
             xAdder = (int)(((unsigned int)hgGet64h(syDelta) << sh) |
                            ((unsigned int)hgGet64l(syDelta) >> rsh));
-            yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
-                           ((unsigned int)hgGet64l(sxDelta) >> rsh));
         }
         else
         {
             int sh = info->shift - 18;
             xAdder = hgGet64h(syDelta) >> sh;
-            yAdder = hgGet64h(sxDelta) >> sh;
+        }
+        {
+            HGint64 sxDelta = hgMul64(info->v02sxPerArea, g01);
+            sxDelta = hgMadd64(sxDelta, info->v01sxPerArea,
+                               (int)(0u - (unsigned int)g02));
+            if (__builtin_expect(info->shift < 18, 1))
+            {
+                int sh = 18 - info->shift;
+                int rsh = 32 - sh;
+                yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
+                               ((unsigned int)hgGet64l(sxDelta) >> rsh));
+            }
+            else
+            {
+                int sh = info->shift - 18;
+                yAdder = hgGet64h(sxDelta) >> sh;
+            }
         }
     }
     info->pPP->xAdder[gradient] = xAdder;
     info->pPP->yAdder[gradient] = yAdder;
+}
+
+static inline void grComputeDeltasSeq(const _grGradientInfo *info, int gradient, int g01, int g02)
+{
+    if (g01 != 0 || g02 != 0)
+    {
+        int xAdder;
+        int yAdder;
+        {
+            HGint64 syDelta = hgMul64(info->v01syPerArea, g02);
+            syDelta = hgMadd64(syDelta, info->v02syPerArea,
+                               (int)(0u - (unsigned int)g01));
+            if (__builtin_expect(info->shift < 18, 1))
+            {
+                int sh = 18 - info->shift;
+                int rsh = 32 - sh;
+                xAdder = (int)(((unsigned int)hgGet64h(syDelta) << sh) |
+                               ((unsigned int)hgGet64l(syDelta) >> rsh));
+            }
+            else
+            {
+                xAdder = hgGet64h(syDelta) >> (info->shift - 18);
+            }
+            info->pPP->xAdder[gradient] = xAdder;
+        }
+        {
+            HGint64 sxDelta = hgMul64(info->v02sxPerArea, g01);
+            sxDelta = hgMadd64(sxDelta, info->v01sxPerArea,
+                               (int)(0u - (unsigned int)g02));
+            if (__builtin_expect(info->shift < 18, 1))
+            {
+                int sh = 18 - info->shift;
+                int rsh = 32 - sh;
+                yAdder = (int)(((unsigned int)hgGet64h(sxDelta) << sh) |
+                               ((unsigned int)hgGet64l(sxDelta) >> rsh));
+            }
+            else
+            {
+                yAdder = hgGet64h(sxDelta) >> (info->shift - 18);
+            }
+            info->pPP->yAdder[gradient] = yAdder;
+        }
+    }
+    else
+    {
+        info->pPP->xAdder[gradient] = 0;
+        info->pPP->yAdder[gradient] = 0;
+    }
 }
 
 /* --- grSetupTriangleGradients (grRasterizer.inl 603; DLL 26064-26248) --------
@@ -461,8 +518,8 @@ static int grSetupTriangleGradientsVisibleVertsAtY_slow(Gerbera_s *state, _grCli
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3")))
 #endif
-int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s *state, _grClipTriangle *tri,
-                                            _grVertex *v0, _grVertex *v1, _grVertex *v2,
+int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s * restrict state, _grClipTriangle * restrict tri,
+                                            _grVertex * restrict v0, _grVertex * restrict v1, _grVertex * restrict v2,
                                             int flatShadeIndex, unsigned int gradientMask,
                                             int rejectDepth, int advanceY)
 {
@@ -485,7 +542,6 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s *state, _grClipTriangle *t
     if (gradientMask != 0)
     {
         _grPixelPipe *pixelPipe = GR_PIXEL_PIPE(state);
-        _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
         HGint64 reciprocal;
         int recipShift;
         int signedRecip;
@@ -568,8 +624,6 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s *state, _grClipTriangle *t
         {
             if (((192 << (2 * texIndex)) & gradientMask) != 0)
             {
-                int baseValue[2];
-                int preShift[2];
                 int *tc0 = &v0->texCoord[texIndex].x;
                 int *tc1 = &v1->texCoord[texIndex].x;
                 int *tc2 = &v2->texCoord[texIndex].x;
@@ -594,16 +648,11 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s *state, _grClipTriangle *t
                         d0 >>= 1;
                         d1 >>= 1;
                         d2 >>= 1;
-                        preShift[coord] = clamped - 1;
+                        pairs[coord][1] = clamped - 1;
                     }
-                    grComputeDeltas(&info, coord + 2 * texIndex + 6,
-                                    d1 - d0, d2 - d0);
-                    baseValue[coord] = d0;
+                    grComputeDeltasSeq(&info, coord + 2 * texIndex + 6, d1 - d0, d2 - d0);
+                    pairs[coord][0] = d0;
                 }
-                pairs[0][0] = baseValue[0];
-                pairs[0][1] = preShift[0];
-                pairs[1][0] = baseValue[1];
-                pairs[1][1] = preShift[1];
                 grSetupTextureUnitCoord(state, texIndex, pairs, v0sx, v0sy);
             }
         }
@@ -732,6 +781,7 @@ int grSetupTriangleGradientsVisibleVertsAtY(Gerbera_s *state, _grClipTriangle *t
             }
             else
             {
+                _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
                 _grVertex *flat = vertexBuffer + flatShadeIndex;
                 const unsigned short *flatRGB = &flat->color.final[side][0];
 
@@ -779,7 +829,18 @@ void grSetupTriangleGradients(Gerbera_s *state, _grClipTriangle *tri,
 /* --- grDivsu (grScanConvert.inl 29; DLL 24922-24932) ------------------------- */
 
 #if defined(__GNUC__)
-__attribute__((noinline))
+__attribute__((noinline, used))
+#endif
+static unsigned int grFastRecip32(unsigned int d)
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    __asm__("grFastRecip32_asm")
+#endif
+    ;
+
+#if defined(__GNUC__)
+__attribute__((noinline, used))
 #endif
 int grDivsu(int a, int b)
 {
@@ -788,8 +849,19 @@ int grDivsu(int a, int b)
     return a / b;
 }
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+__attribute__((noinline, used))
+static int grDivsu_arm(int a, int b) __asm__("grDivsu_arm");
+static int grDivsu_arm(int a, int b)
+{
+    return grDivsu(a, b);
+}
+#endif
+
 #if defined(__GNUC__)
-__attribute__((noinline))
+__attribute__((noinline, used))
 #endif
 static unsigned int grFastRecip32(unsigned int d)
 {
@@ -986,6 +1058,460 @@ void grScanConvertWithoutXScissoring(_grEdgePair *edgePairs,
  * {yStart, numScanlines, scanlineInfo} into the pixel pipe (+188/+180/+184).
  * Returns the final scanline count (0 when the triangle degenerates). */
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+typedef char gr_check_sc_rect_[offsetof(Gerbera_s, renderScissor) == 104 ? 1 : -1];
+typedef char gr_check_sc_x0_[offsetof(Gerbera_s, renderScissor.x0) == 104 ? 1 : -1];
+typedef char gr_check_sc_x1_[offsetof(Gerbera_s, renderScissor.x1) == 108 ? 1 : -1];
+typedef char gr_check_sc_y0_[offsetof(Gerbera_s, renderScissor.y0) == 112 ? 1 : -1];
+typedef char gr_check_sc_y1_[offsetof(Gerbera_s, renderScissor.y1) == 116 ? 1 : -1];
+typedef char gr_check_sc_rs_[offsetof(Gerbera_s, renderStack) == 5240 ? 1 : -1];
+typedef char gr_check_sc_pp_[offsetof(Gerbera_s, pixelPipeline) == 5252 ? 1 : -1];
+typedef char gr_check_sc_esc_[offsetof(Gerbera_s, edgeSlopeCache) == 8020 ? 1 : -1];
+typedef char gr_check_sc_ns_[offsetof(_grPixelPipe, numScanlines) == 180 ? 1 : -1];
+typedef char gr_check_sc_si_[offsetof(_grPixelPipe, scanlineInfo) == 184 ? 1 : -1];
+typedef char gr_check_sc_ys_[offsetof(_grPixelPipe, yStart) == 188 ? 1 : -1];
+typedef char gr_check_sc_ptx_[offsetof(_grRasterPoint, x) == 0 ? 1 : -1];
+typedef char gr_check_sc_pty_[offsetof(_grRasterPoint, y) == 4 ? 1 : -1];
+
+__attribute__((naked, noinline))
+int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
+                          _grRasterPoint *p1, _grRasterPoint *p2,
+                          int emptyBits)
+{
+    (void)state;
+    (void)p0;
+    (void)p1;
+    (void)p2;
+    (void)emptyBits;
+    __asm__ __volatile__(
+        "push  {r4-r11, lr}\n\t"
+        "ldr   r4, [r1, #4]\n\t"             /* p0y */
+        "ldr   r6, [r3, #4]\n\t"             /* p2y */
+        "add   r10, r0, #104\n\t"            /* &renderScissor */
+        "ldmia r10, {r8, r9, r11, r12}\n\t"  /* r8=x0, r9=x1, r11=y0, r12=y1 */
+        "asr   r7, r4, #12\n\t"              /* v0yT */
+        "asr   r10, r6, #12\n\t"             /* v2yT */
+        "cmp   r7, r10\n\t"
+        "bge   .Lgrsc_ret0_nosub\n\t"
+        "cmp   r10, r11\n\t"
+        "cmpgt r12, r7\n\t"
+        "ble   .Lgrsc_ret0_nosub\n\t"
+
+        "sub   sp, sp, #28\n\t"
+        "str   r0, [sp, #0]\n\t"             /* state */
+        "ldr   r5, [r2, #4]\n\t"             /* p1y */
+        "ldr   r0, [r1, #0]\n\t"             /* p0x */
+        "ldr   r1, [r2, #0]\n\t"             /* p1x */
+        "ldr   r2, [r3, #0]\n\t"             /* p2x */
+        "asr   r3, r5, #12\n\t"              /* v1yT */
+
+        "cmp   r7, r11\n\t"
+        "movlt lr, r11\n\t"
+        "movge lr, r7\n\t"
+        "str   lr, [sp, #4]\n\t"             /* yStart = max(v0yT, y0) */
+        "sub   lr, r3, r7\n\t"               /* lr = v1yT - v0yT */
+
+        "cmp   r7, r12\n\t"
+        "movge r7, r12\n\t"                  /* v0yTop */
+        "cmp   r3, r12\n\t"
+        "movge r3, r12\n\t"                  /* v1yTop */
+        "cmp   r10, r12\n\t"
+        "movge r10, r12\n\t"                 /* v2yTop */
+        "sub   r12, r3, r7\n\t"              /* topHeight */
+        "sub   r10, r10, r3\n\t"             /* btmHeight */
+        "cmp   r7, r11\n\t"
+        "movge r3, #0\n\t"
+        "strge r3, [sp, #8]\n\t"             /* topAdvance = 0 */
+        "strge r3, [sp, #12]\n\t"            /* btmAdvance = 0 */
+        "blt   .Lgrsc_clip_y0\n\t"
+    ".Lgrsc_after_clip_y0:\n\t"
+        "orrs  r3, r12, r10\n\t"
+        "beq   .Lgrsc_ret0_sp\n\t"
+        "str   r12, [sp, #24]\n\t"           /* topHeight */
+        "str   r10, [sp, #20]\n\t"           /* btmHeight */
+
+        /* needsXScissoring */
+        "rsb   r11, r8, r0, asr #12\n\t"
+        "rsb   r12, r8, r1, asr #12\n\t"
+        "orr   r11, r11, r12\n\t"
+        "rsb   r12, r8, r2, asr #12\n\t"
+        "orr   r11, r11, r12\n\t"
+        "sub   r12, r9, r0, asr #12\n\t"
+        "orr   r11, r11, r12\n\t"
+        "sub   r12, r9, r1, asr #12\n\t"
+        "orr   r11, r11, r12\n\t"
+        "sub   r12, r9, r2, asr #12\n\t"
+        "orr   r11, r11, r12\n\t"
+        "str   r11, [sp, #16]\n\t"
+
+        /* Edge deltas & fracV0y/fracV1y */
+        "ldr   r7, [sp, #64]\n\t"            /* emptyBits */
+        "mov   r8, lr\n\t"                   /* r8 = v1yT - v0yT */
+        "sub   r10, r2, r0\n\t"
+        "asr   r10, r10, r7\n\t"
+        "lsl   r10, r10, #14\n\t"            /* r10 = num02 */
+        "sub   r11, r6, r4\n\t"
+        "asr   r11, r11, r7\n\t"             /* r11 = den02 */
+        "sub   r2, r2, r1\n\t"
+        "asr   r2, r2, r7\n\t"
+        "lsl   r2, r2, #14\n\t"              /* r2 = num12 */
+        "sub   r6, r6, r5\n\t"
+        "asr   r6, r6, r7\n\t"               /* r6 = den12 */
+        "sub   r3, r5, r4\n\t"
+        "asr   r3, r3, r7\n\t"               /* r3 = den01 */
+        "mvn   r7, #0\n\t"
+        "lsr   r7, r7, #20\n\t"              /* 0xFFF */
+        "bic   r4, r7, r4\n\t"               /* fracV0y */
+        "bic   r5, r7, r5\n\t"               /* fracV1y */
+        "orr   r4, r4, r5, lsl #16\n\t"      /* r4 = fracV0y | (fracV1y << 16) */
+        "mov   r7, r3\n\t"                   /* r7 = den01 */
+        "ldr   r9, [sp, #0]\n\t"
+        "add   r9, r9, #7936\n\t"
+        "add   r9, r9, #84\n\t"              /* r9 = cacheBase (+8020) */
+
+        /* slope02 = DIVIDE_EDGE(r10=num02, r11=den02) -> r5 */
+        "cmp   r11, #0\n\t"
+        "ble   .Lgrsc_divsu_02\n\t"
+        "cmp   r10, #0\n\t"
+        "moveq r5, #0\n\t"
+        "beq   .Lgrsc_after_slope02\n\t"
+        "cmp   r11, #1\n\t"
+        "moveq r5, r10\n\t"
+        "beq   .Lgrsc_after_slope02\n\t"
+        "eor   r12, r11, r11, lsr #8\n\t"
+        "and   r12, r12, #255\n\t"
+        "add   r12, r9, r12, lsl #3\n\t"
+        "ldmia r12, {r3, lr}\n\t"
+        "cmp   r11, r3\n\t"
+        "blne  .Lgrsc_miss_den11\n\t"
+        "cmp   r10, #0\n\t"
+        "rsbmi r12, r10, #0\n\t"
+        "movpl r12, r10\n\t"
+        "umull r3, r5, lr, r12\n\t"
+        "mul   r3, r5, r11\n\t"
+        "sub   r12, r12, r3\n\t"
+        "cmp   r11, r12\n\t"
+        "addls r5, r5, #1\n\t"
+        "cmp   r10, #0\n\t"
+        "rsbmi r5, r5, #0\n\t"
+    ".Lgrsc_after_slope02:\n\t"
+
+        /* longAtV0 -> r10, longAtV1 -> r8, longOnRight -> bit 15 of r4 */
+#if defined(__ARM_ARCH) && __ARM_ARCH >= 6
+        "uxth  r10, r4\n\t"
+#else
+        "mov   r10, r4, lsl #16\n\t"
+        "mov   r10, r10, lsr #16\n\t"
+#endif
+        "smull r11, r12, r10, r5\n\t"
+        "lsr   r11, r11, #12\n\t"
+        "orr   r11, r11, r12, lsl #20\n\t"
+        "add   r10, r11, r0, lsl #2\n\t"     /* r10 = longAtV0 */
+        "mla   r8, r5, r8, r10\n\t"          /* r8 = longAtV1 */
+        "lsr   r11, r4, #16\n\t"             /* fracV1y */
+        "smull r3, r12, r11, r5\n\t"
+        "lsr   r3, r3, #12\n\t"
+        "orr   r3, r3, r12, lsl #20\n\t"
+        "sub   r11, r8, r3\n\t"              /* longMid */
+        "rsbs  r11, r11, r1, lsl #2\n\t"     /* 4*p1x - longMid */
+        "orrmi r4, r4, #0x8000\n\t"          /* longOnRight in r4 bit 15 */
+
+        /* Top half */
+        "ldr   r12, [sp, #24]\n\t"           /* topHeight */
+        "cmp   r12, #0\n\t"
+        "beq   .Lgrsc_skip_top\n\t"
+        "ldr   r12, [sp, #64]\n\t"           /* emptyBits */
+        "sub   r3, r1, r0\n\t"
+        "asr   r3, r3, r12\n\t"
+        "lsl   r3, r3, #14\n\t"              /* r3 = num01 */
+        "cmp   r7, #0\n\t"
+        "ble   .Lgrsc_divsu_01\n\t"
+        "cmp   r3, #0\n\t"
+        "beq   .Lgrsc_after_slope01\n\t"
+        "cmp   r7, #1\n\t"
+        "beq   .Lgrsc_after_slope01\n\t"
+        "eor   r12, r7, r7, lsr #8\n\t"
+        "and   r12, r12, #255\n\t"
+        "add   r12, r9, r12, lsl #3\n\t"
+        "ldmia r12, {r11, lr}\n\t"
+        "cmp   r7, r11\n\t"
+        "blne  .Lgrsc_miss_den7\n\t"
+        "cmp   r3, #0\n\t"
+        "orrlt r4, r4, #0x80000000\n\t"
+        "rsblt r12, r3, #0\n\t"
+        "movge r12, r3\n\t"
+        "umull r11, r3, lr, r12\n\t"
+        "mul   r11, r3, r7\n\t"
+        "sub   r12, r12, r11\n\t"
+        "cmp   r7, r12\n\t"
+        "addls r3, r3, #1\n\t"
+        "tst   r4, #0x80000000\n\t"
+        "rsbne r3, r3, #0\n\t"
+        "bicne r4, r4, #0x80000000\n\t"
+    ".Lgrsc_after_slope01:\n\t"
+
+        "lsl   r12, r4, #20\n\t"
+        "lsr   r12, r12, #20\n\t"            /* fracV0y */
+        "smull r11, r7, r12, r3\n\t"
+        "lsr   r11, r11, #12\n\t"
+        "orr   r11, r11, r7, lsl #20\n\t"
+        "add   r0, r11, r0, lsl #2\n\t"      /* r0 = shortAtV0 */
+        "mov   r7, r5\n\t"                   /* r7 = slope02 */
+        "tst   r4, #0x8000\n\t"
+        "moveq r11, r0\n\t"
+        "moveq r0, r10\n\t"
+        "moveq r10, r11\n\t"
+        "moveq r11, r3\n\t"
+        "moveq r3, r7\n\t"
+        "moveq r7, r11\n\t"
+
+        "ldr   r11, [sp, #8]\n\t"            /* topAdvance */
+        "cmp   r11, #0\n\t"
+        "mlane r0, r3, r11, r0\n\t"
+        "mlane r10, r7, r11, r10\n\t"
+
+        "ldr   r11, [sp, #0]\n\t"
+        "add   r11, r11, #4096\n\t"
+        "ldr   r11, [r11, #1144]\n\t"
+        "add   r11, r11, #15616\n\t"
+        "add   r11, r11, #52\n\t"
+        "str   r11, [sp, #8]\n\t"            /* save scanStart */
+
+        "ldr   r12, [sp, #16]\n\t"           /* needsXSciss */
+        "cmp   r12, #0\n\t"
+        "blt   .Lgrsc_top_scissor\n\t"
+        "ldr   r12, [sp, #24]\n\t"           /* topHeight */
+        "str   r9, [sp, #24]\n\t"            /* preserve cacheBase */
+    ".Lgrsc_top_nosciss_loop:\n\t"
+        "asr   r9, r0, #14\n\t"
+        "rsbs  lr, r9, r10, asr #14\n\t"
+        "addgt r9, r9, lr, lsl #16\n\t"
+        "add   r0, r0, r3\n\t"
+        "add   r10, r10, r7\n\t"
+        "str   r9, [r11], #4\n\t"
+        "subs  r12, r12, #1\n\t"
+        "bne   .Lgrsc_top_nosciss_loop\n\t"
+        "ldr   r9, [sp, #24]\n\t"
+        "b     .Lgrsc_check_btm\n\t"
+
+    ".Lgrsc_skip_top:\n\t"
+        "ldr   r11, [sp, #0]\n\t"
+        "add   r11, r11, #4096\n\t"
+        "ldr   r11, [r11, #1144]\n\t"
+        "add   r11, r11, #15616\n\t"
+        "add   r11, r11, #52\n\t"
+        "str   r11, [sp, #8]\n\t"
+
+    ".Lgrsc_check_btm:\n\t"
+        "ldr   r12, [sp, #20]\n\t"           /* btmHeight */
+        "cmp   r12, #0\n\t"
+        "beq   .Lgrsc_trim\n\t"
+
+        /* slope12 = DIVIDE_EDGE(r2=num12, r6=den12) -> r3 */
+        "cmp   r6, #0\n\t"
+        "ble   .Lgrsc_divsu_12\n\t"
+        "cmp   r2, #0\n\t"
+        "moveq r3, #0\n\t"
+        "beq   .Lgrsc_after_slope12\n\t"
+        "cmp   r6, #1\n\t"
+        "moveq r3, r2\n\t"
+        "beq   .Lgrsc_after_slope12\n\t"
+        "eor   r12, r6, r6, lsr #8\n\t"
+        "and   r12, r12, #255\n\t"
+        "add   r12, r9, r12, lsl #3\n\t"
+        "ldmia r12, {r7, lr}\n\t"
+        "cmp   r6, r7\n\t"
+        "blne  .Lgrsc_miss_den6\n\t"
+        "cmp   r2, #0\n\t"
+        "rsbmi r12, r2, #0\n\t"
+        "movpl r12, r2\n\t"
+        "umull r7, r3, lr, r12\n\t"
+        "mul   r7, r3, r6\n\t"
+        "sub   r12, r12, r7\n\t"
+        "cmp   r6, r12\n\t"
+        "addls r3, r3, #1\n\t"
+        "cmp   r2, #0\n\t"
+        "rsbmi r3, r3, #0\n\t"
+    ".Lgrsc_after_slope12:\n\t"
+
+        "lsr   r12, r4, #16\n\t"             /* fracV1y */
+        "smull r7, r10, r12, r3\n\t"
+        "lsr   r7, r7, #12\n\t"
+        "orr   r7, r7, r10, lsl #20\n\t"
+        "add   r0, r7, r1, lsl #2\n\t"       /* r0 = shortAtV1 */
+        "tst   r4, #0x8000\n\t"
+        "moveq r10, r0\n\t"
+        "moveq r0, r8\n\t"
+        "moveq r8, r10\n\t"
+        "moveq r10, r3\n\t"
+        "moveq r3, r5\n\t"
+        "moveq r5, r10\n\t"
+
+        "ldr   r7, [sp, #12]\n\t"            /* btmAdvance */
+        "cmp   r7, #0\n\t"
+        "mlane r0, r3, r7, r0\n\t"
+        "mlane r8, r5, r7, r8\n\t"
+
+        "ldr   r12, [sp, #16]\n\t"           /* needsXSciss */
+        "cmp   r12, #0\n\t"
+        "ldr   r12, [sp, #20]\n\t"           /* btmHeight */
+        "blt   .Lgrsc_btm_scissor\n\t"
+    ".Lgrsc_btm_nosciss_loop:\n\t"
+        "asr   r1, r0, #14\n\t"
+        "rsbs  r2, r1, r8, asr #14\n\t"
+        "addgt r1, r1, r2, lsl #16\n\t"
+        "add   r0, r0, r3\n\t"
+        "add   r8, r8, r5\n\t"
+        "str   r1, [r11], #4\n\t"
+        "subs  r12, r12, #1\n\t"
+        "bne   .Lgrsc_btm_nosciss_loop\n\t"
+
+    ".Lgrsc_trim:\n\t"
+        "ldr   r0, [sp, #8]\n\t"             /* scanStart */
+    ".Lgrsc_trim_tail:\n\t"
+        "ldr   r1, [r11, #-4]!\n\t"
+        "movs  r1, r1, lsr #16\n\t"
+        "bne   .Lgrsc_tail_found\n\t"
+        "cmp   r11, r0\n\t"
+        "bne   .Lgrsc_trim_tail\n\t"
+    ".Lgrsc_ret0_sp:\n\t"
+        "add   sp, sp, #28\n\t"
+    ".Lgrsc_ret0_nosub:\n\t"
+        "mov   r0, #0\n\t"
+        "pop   {r4-r11, pc}\n\t"
+
+    ".Lgrsc_tail_found:\n\t"
+        "mov   r2, r0\n\t"
+    ".Lgrsc_trim_head:\n\t"
+        "ldr   r1, [r0], #4\n\t"
+        "movs  r1, r1, lsr #16\n\t"
+        "beq   .Lgrsc_trim_head\n\t"
+        "sub   r0, r0, #4\n\t"
+        "sub   r3, r11, r0\n\t"
+        "add   r3, r3, #4\n\t"
+        "lsr   r3, r3, #2\n\t"
+        "sub   r2, r0, r2\n\t"
+        "ldr   r1, [sp, #4]\n\t"             /* yStart */
+        "add   r1, r1, r2, asr #2\n\t"
+        "ldr   r4, [sp, #0]\n\t"             /* state */
+        "add   r4, r4, #4096\n\t"
+        "ldr   r4, [r4, #1156]\n\t"          /* pixelPipe */
+        "str   r3, [r4, #180]\n\t"
+        "str   r0, [r4, #184]\n\t"
+        "str   r1, [r4, #188]\n\t"
+        "mov   r0, r3\n\t"
+        "add   sp, sp, #28\n\t"
+        "pop   {r4-r11, pc}\n\t"
+
+        /* --- Cold out-of-line helpers --- */
+    ".Lgrsc_clip_y0:\n\t"
+        "sub   r7, r11, r7\n\t"              /* topAdvance = y0 - v0yTop */
+        "str   r7, [sp, #8]\n\t"
+        "subs  r12, r12, r7\n\t"
+        "movlt r12, #0\n\t"
+        "cmp   r3, r11\n\t"
+        "sublt r3, r11, r3\n\t"
+        "movge r3, #0\n\t"
+        "str   r3, [sp, #12]\n\t"
+        "subs  r10, r10, r3\n\t"
+        "movlt r10, #0\n\t"
+        "b     .Lgrsc_after_clip_y0\n\t"
+
+    ".Lgrsc_top_scissor:\n\t"
+        "push  {r1, r2, r5, r6}\n\t"
+        "ldr   r5, [sp, #16]\n\t"            /* state */
+        "ldr   r1, [r5, #104]\n\t"           /* x0 */
+        "ldr   r2, [r5, #108]\n\t"           /* x1 */
+        "ldr   r12, [sp, #40]\n\t"           /* topHeight */
+    ".Lgrsc_top_sciss_loop:\n\t"
+        "asr   r5, r0, #14\n\t"
+        "cmp   r5, r1\n\t"
+        "movlt r5, r1\n\t"
+        "asr   r6, r10, #14\n\t"
+        "cmp   r6, r2\n\t"
+        "movgt r6, r2\n\t"
+        "subs  r6, r6, r5\n\t"
+        "addgt r5, r5, r6, lsl #16\n\t"
+        "add   r0, r0, r3\n\t"
+        "add   r10, r10, r7\n\t"
+        "str   r5, [r11], #4\n\t"
+        "subs  r12, r12, #1\n\t"
+        "bne   .Lgrsc_top_sciss_loop\n\t"
+        "pop   {r1, r2, r5, r6}\n\t"
+        "b     .Lgrsc_check_btm\n\t"
+
+    ".Lgrsc_btm_scissor:\n\t"
+        "ldr   r9, [sp, #0]\n\t"             /* state (reloaded after? wait: dead after btm!) */
+        "ldr   r1, [r9, #104]\n\t"           /* x0 */
+        "ldr   r2, [r9, #108]\n\t"           /* x1 */
+    ".Lgrsc_btm_sciss_loop:\n\t"
+        "asr   r6, r0, #14\n\t"
+        "cmp   r6, r1\n\t"
+        "movlt r6, r1\n\t"
+        "asr   r7, r8, #14\n\t"
+        "cmp   r7, r2\n\t"
+        "movgt r7, r2\n\t"
+        "subs  r7, r7, r6\n\t"
+        "addgt r6, r6, r7, lsl #16\n\t"
+        "add   r0, r0, r3\n\t"
+        "add   r8, r8, r5\n\t"
+        "str   r6, [r11], #4\n\t"
+        "subs  r12, r12, #1\n\t"
+        "bne   .Lgrsc_btm_sciss_loop\n\t"
+        "b     .Lgrsc_trim\n\t"
+
+    ".Lgrsc_miss_den11:\n\t"
+        "push  {r0, r1, r2, r3, r4, r5, r12, lr}\n\t"
+        "mov   r4, r12\n\t"
+        "mov   r5, r11\n\t"
+        "b     .Lgrsc_miss_common\n\t"
+    ".Lgrsc_miss_den7:\n\t"
+        "push  {r0, r1, r2, r3, r4, r5, r12, lr}\n\t"
+        "mov   r4, r12\n\t"
+        "mov   r5, r7\n\t"
+        "b     .Lgrsc_miss_common\n\t"
+    ".Lgrsc_miss_den6:\n\t"
+        "push  {r0, r1, r2, r3, r4, r5, r12, lr}\n\t"
+        "mov   r4, r12\n\t"
+        "mov   r5, r6\n\t"
+    ".Lgrsc_miss_common:\n\t"
+        "mov   r0, r5\n\t"
+        "bl    grFastRecip32_asm\n\t"
+        "str   r5, [r4, #0]\n\t"
+        "str   r0, [r4, #4]\n\t"
+        "mov   lr, r0\n\t"
+        "pop   {r0, r1, r2, r3, r4, r5, r12}\n\t"
+        "ldr   pc, [sp], #4\n\t"
+
+    ".Lgrsc_divsu_02:\n\t"
+        "push  {r0, r1, r2, r3, r12, lr}\n\t"
+        "mov   r0, r10\n\t"
+        "mov   r1, r11\n\t"
+        "bl    grDivsu_arm\n\t"
+        "mov   r5, r0\n\t"
+        "pop   {r0, r1, r2, r3, r12, lr}\n\t"
+        "b     .Lgrsc_after_slope02\n\t"
+    ".Lgrsc_divsu_01:\n\t"
+        "push  {r0, r1, r2, r3, r12, lr}\n\t"
+        "mov   r0, r3\n\t"
+        "mov   r1, r7\n\t"
+        "bl    grDivsu_arm\n\t"
+        "str   r0, [sp, #12]\n\t"
+        "pop   {r0, r1, r2, r3, r12, lr}\n\t"
+        "b     .Lgrsc_after_slope01\n\t"
+    ".Lgrsc_divsu_12:\n\t"
+        "push  {r0, r1, r2, r3, r12, lr}\n\t"
+        "mov   r0, r2\n\t"
+        "mov   r1, r6\n\t"
+        "bl    grDivsu_arm\n\t"
+        "str   r0, [sp, #12]\n\t"
+        "pop   {r0, r1, r2, r3, r12, lr}\n\t"
+        "b     .Lgrsc_after_slope12\n\t"
+    );
+}
+#else
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3")))
 #endif
@@ -1174,6 +1700,7 @@ int grScanConvertTriangle(Gerbera_s *state, _grRasterPoint *p0,
     }
     return total;
 }
+#endif
 
 /* --- grInterpolateVertexGradients (grRasterizer.inl 251; DLL 25530-25899) -----
  * Interpolates the per-vertex attributes of a clip-generated vertex from the
@@ -1579,6 +2106,295 @@ void grDrawClippedPoint(Gerbera_s *state, _grClipTriangle *tri,
 
 /* --- grSetupTextureUnit (grRasterizer.inl 69; DLL 25345-25526) ------------- */
 
+#if !HG_ASSERT_ENABLED && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__arm__) && !defined(__thumb__) && (__ARM_ARCH >= 5) && \
+    (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+typedef char gr_check_tu_off_[offsetof(Gerbera_s, textureUnit) == 5108 ? 1 : -1];
+typedef char gr_check_tu_sz_[sizeof(_grTextureUnitState) == 32 && offsetof(_grTextureUnitState, texture) == 0 ? 1 : -1];
+typedef char gr_check_tu_pp_[offsetof(Gerbera_s, pixelPipeline) == 5252 ? 1 : -1];
+typedef char gr_check_tu_agm_[offsetof(Gerbera_s, activeGradientMask) == 5260 ? 1 : -1];
+typedef char gr_check_tu_ml_[sizeof(_grMipLevel) == 16 && offsetof(_grMipLevel, pixels) == 0 && offsetof(_grMipLevel, log2Dim) == 4 ? 1 : -1];
+typedef char gr_check_tu_tex_[offsetof(_grTexture, mipmap) == 0 && offsetof(_grTexture, palette) == 176 &&
+                              offsetof(_grTexture, numMipLevels) == 180 && offsetof(_grTexture, parmMask) == 183 &&
+                              offsetof(_grTexture, wrapMode) == 204 && offsetof(_grTexture, filterMask) == 206 ? 1 : -1];
+typedef char gr_check_tu_ppu_[offsetof(_grPixelPipe, textureUnit) == 0 && sizeof(_grPixelPipeTextureUnit) == 64 &&
+                              offsetof(_grPixelPipeTextureUnit, pixels) == 4 && offsetof(_grPixelPipeTextureUnit, palette) == 8 &&
+                              offsetof(_grPixelPipeTextureUnit, linear) == 12 && offsetof(_grPixelPipeTextureUnit, sMask) == 16 &&
+                              offsetof(_grPixelPipeTextureUnit, tMask) == 20 && offsetof(_grPixelPipeTextureUnit, rShift) == 24 &&
+                              offsetof(_grPixelPipeTextureUnit, log2DimS) == 32 ? 1 : -1];
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, noclone, naked))
+#else
+__attribute__((noinline, naked))
+#endif
+static void grSetupTextureUnitCoord(Gerbera_s * restrict state, int texIndex, int (* restrict g0)[2],
+                                    int v0sx, int v0sy)
+{
+    __asm__ volatile(
+        "push    {r4-r11, lr}\n\t"
+        "add     lr, r0, #4096\n\t"
+        "ldr     r4, [lr, #1156]\n\t"     /* pipe */
+        "ldr     r8, [lr, #1164]\n\t"     /* activeGradientMask */
+        "add     r5, r0, r1, lsl #6\n\t"
+        "add     r5, r5, #5056\n\t"
+        "ldr     r5, [r5, #52]\n\t"       /* texture */
+        "mov     r6, r2\n\t"              /* g0 */
+        "mov     r7, r1\n\t"              /* texIndex */
+        "mov     r9, r3\n\t"              /* v0sx */
+        "ldrb    r3, [r5, #183]\n\t"      /* parmMask */
+        "mov     r0, #0\n\t"              /* mipLevel = 0 */
+        "mov     r1, #1\n\t"              /* isMag = 1 */
+        "tst     r3, #32\n\t"
+        "beq     10f\n\t"
+        "ldrh    r2, [r5, #206]\n\t"      /* filterMask[0] | (filterMask[1]<<8) */
+        "tst     r2, #2\n\t"
+        "bne     0f\n\t"
+        "eor     r3, r2, r2, lsr #8\n\t"
+        "tst     r3, #255\n\t"
+        "beq     10f\n\t"
+    "0:\n\t"
+        "mov     r10, #0\n\t"             /* maxRho2_lo */
+        "mov     r11, #0\n\t"             /* maxRho2_hi */
+        /* mip coord i = 1 */
+        "lsl     r12, r7, #1\n\t"
+        "add     lr, r12, #1\n\t"
+        "mov     r0, #64\n\t"
+        "tst     r8, r0, lsl lr\n\t"
+        "beq     2f\n\t"
+        "add     lr, r12, #7\n\t"
+        "add     lr, r4, lr, lsl #2\n\t"
+        "ldr     r0, [lr, #232]\n\t"
+        "ldr     r1, [lr, #272]\n\t"
+        "smull   r2, r3, r0, r0\n\t"
+        "smlal   r2, r3, r1, r1\n\t"
+        "ldrsh   r0, [r5, #6]\n\t"
+        "ldr     r1, [r6, #12]\n\t"
+        "add     r1, r1, #7\n\t"
+        "sub     r0, r1, r0\n\t"
+        "lsl     r0, r0, #1\n\t"
+        "cmp     r0, #0\n\t"
+        "movlt   r0, #0\n\t"
+        "cmp     r0, #63\n\t"
+        "movgt   r0, #63\n\t"
+        "cmp     r0, #31\n\t"
+        "bgt     1f\n\t"
+        "rsb     r1, r0, #32\n\t"
+        "lsr     r2, r2, r0\n\t"
+        "orr     r2, r2, r3, lsl r1\n\t"
+        "lsr     r3, r3, r0\n\t"
+        "b       3f\n\t"
+    "1:\n\t"
+        "sub     r1, r0, #32\n\t"
+        "lsr     r2, r3, r1\n\t"
+        "mov     r3, #0\n\t"
+    "3:\n\t"
+        "cmp     r10, r2\n\t"
+        "sbcs    r1, r11, r3\n\t"
+        "movlo   r10, r2\n\t"
+        "movlo   r11, r3\n\t"
+    "2:\n\t"
+        /* mip coord i = 0 */
+        "lsl     r12, r7, #1\n\t"
+        "mov     r0, #64\n\t"
+        "tst     r8, r0, lsl r12\n\t"
+        "beq     5f\n\t"
+        "add     lr, r12, #6\n\t"
+        "add     lr, r4, lr, lsl #2\n\t"
+        "ldr     r0, [lr, #232]\n\t"
+        "ldr     r1, [lr, #272]\n\t"
+        "smull   r2, r3, r0, r0\n\t"
+        "smlal   r2, r3, r1, r1\n\t"
+        "ldrsh   r0, [r5, #4]\n\t"
+        "ldr     r1, [r6, #4]\n\t"
+        "add     r1, r1, #7\n\t"
+        "sub     r0, r1, r0\n\t"
+        "lsl     r0, r0, #1\n\t"
+        "cmp     r0, #0\n\t"
+        "movlt   r0, #0\n\t"
+        "cmp     r0, #63\n\t"
+        "movgt   r0, #63\n\t"
+        "cmp     r0, #31\n\t"
+        "bgt     4f\n\t"
+        "rsb     r1, r0, #32\n\t"
+        "lsr     r2, r2, r0\n\t"
+        "orr     r2, r2, r3, lsl r1\n\t"
+        "lsr     r3, r3, r0\n\t"
+        "b       6f\n\t"
+    "4:\n\t"
+        "sub     r1, r0, #32\n\t"
+        "lsr     r2, r3, r1\n\t"
+        "mov     r3, #0\n\t"
+    "6:\n\t"
+        "cmp     r10, r2\n\t"
+        "sbcs    r1, r11, r3\n\t"
+        "movlo   r10, r2\n\t"
+        "movlo   r11, r3\n\t"
+    "5:\n\t"
+        "cmp     r11, #0x8000\n\t"
+        "bhs     7f\n\t"
+        "lsl     r0, r11, #16\n\t"
+        "orr     r0, r0, r10, lsr #16\n\t"
+        "add     r0, r0, r0, lsr #3\n\t"
+        "clz     r0, r0\n\t"
+        "rsbs    r0, r0, #20\n\t"
+        "movle   r0, #0\n\t"
+        "asrgt   r0, r0, #1\n\t"
+        "cmp     r0, #0\n\t"
+        "moveq   r1, #1\n\t"
+        "beq     8f\n\t"
+        "mov     r1, #0\n\t"
+        "ldrsh   r2, [r5, #180]\n\t"
+        "sub     r2, r2, #1\n\t"
+        "cmp     r0, r2\n\t"
+        "movgt   r0, r2\n\t"
+        "b       8f\n\t"
+    "7:\n\t"
+        "mov     r1, #0\n\t"
+        "ldrsh   r0, [r5, #180]\n\t"
+        "sub     r0, r0, #1\n\t"
+    "8:\n\t"
+        "ldrb    r2, [r5, #206]\n\t"
+        "tst     r2, #2\n\t"
+        "moveq   r0, #0\n\t"
+    "10:\n\t"
+        "add     r2, r5, #206\n\t"
+        "ldrb    r1, [r2, r1]\n\t"        /* filterByte */
+        "and     r1, r1, #1\n\t"          /* linear */
+        "add     r0, r5, r0, lsl #4\n\t"  /* mipmap */
+        "ldrsh   r2, [r0, #4]\n\t"        /* log2S */
+        "ldrsh   r3, [r0, #6]\n\t"        /* log2T */
+        "add     r11, r4, r7, lsl #6\n\t" /* tex */
+        "str     r1, [r11, #12]\n\t"
+        "str     r2, [r11, #32]\n\t"
+        "ldr     r12, [r0]\n\t"
+        "str     r12, [r11, #4]\n\t"
+        "ldr     r12, [r5, #176]\n\t"
+        "str     r12, [r11, #8]\n\t"
+        "mov     r12, #1\n\t"
+        "lsl     lr, r12, r2\n\t"
+        "sub     lr, lr, #1\n\t"
+        "str     lr, [r11, #16]\n\t"
+        "lsl     lr, r12, r3\n\t"
+        "sub     lr, lr, #1\n\t"
+        "str     lr, [r11, #20]\n\t"
+        "ldrh    r5, [r5, #204]\n\t"      /* wrapMode[0] | (wrapMode[1] << 8) */
+        "orr     r5, r5, r1, lsl #16\n\t" /* | (linear << 16) */
+        "lsl     r7, r7, #1\n\t"          /* 2 * texIndex */
+        "orr     r7, r7, r2, lsl #8\n\t"
+        "orr     r7, r7, r3, lsl #16\n\t"
+        "ldr     r10, [sp, #36]\n\t"      /* v0sy */
+        /* coord i = 1 */
+        "and     r0, r7, #3\n\t"
+        "add     lr, r0, #1\n\t"
+        "mov     r1, #64\n\t"
+        "tst     r8, r1, lsl lr\n\t"
+        "beq     12f\n\t"
+        "add     r0, r0, #7\n\t"
+        "add     r0, r4, r0, lsl #2\n\t"
+        "lsrs    r2, r7, #16\n\t"         /* l2 = log2T */
+        "beq     11f\n\t"
+        "ldr     r3, [r6, #12]\n\t"       /* g0sh = g0[1][1] */
+        "mov     r1, #0\n\t"
+        "tst     r5, #0x10000\n\t"
+        "beq     13f\n\t"
+        "subs    r1, r2, r3\n\t"
+        "mov     r12, #0x100000\n\t"
+        "lsrge   r1, r12, r1\n\t"
+        "rsblt   r1, r1, #0\n\t"
+        "lsllt   r1, r12, r1\n\t"
+    "13:\n\t"
+        "ldr     r12, [r6, #8]\n\t"       /* g0val = g0[1][0] */
+        "sub     r1, r12, r1\n\t"
+        "ldr     r12, [r0, #232]\n\t"     /* xAdd */
+        "ldr     lr, [r0, #272]\n\t"      /* yAdd */
+        "smull   r2, r3, r9, r12\n\t"
+        "smlal   r2, r3, r10, lr\n\t"
+        "lsr     r2, r2, #12\n\t"
+        "orr     r2, r2, r3, lsl #20\n\t"
+        "sub     r1, r1, r2\n\t"          /* ref */
+        "ldr     r3, [r6, #12]\n\t"       /* g0sh */
+        "lsr     r2, r5, #8\n\t"
+        "and     r2, r2, #255\n\t"        /* wrapMode[1] */
+        "cmp     r2, #1\n\t"
+        "addeq   r2, r3, #21\n\t"         /* baseShift */
+        "moveq   r3, #0\n\t"              /* lsh */
+        "lsrne   r2, r2, #1\n\t"
+        "addne   r3, r3, r2\n\t"
+        "rsbne   r2, r2, #32\n\t"
+        "rsbne   r3, r3, #11\n\t"
+        "lsl     r1, r1, r3\n\t"
+        "lsl     r12, r12, r3\n\t"
+        "lsl     lr, lr, r3\n\t"
+        "str     r1, [r0, #192]\n\t"
+        "str     r12, [r0, #232]\n\t"
+        "str     lr, [r0, #272]\n\t"
+        "sub     r2, r2, r7, lsr #16\n\t"
+        "str     r2, [r11, #28]\n\t"
+        "b       12f\n\t"
+    "11:\n\t"
+        "str     r2, [r0, #232]\n\t"
+        "str     r2, [r0, #272]\n\t"
+        "str     r2, [r0, #192]\n\t"
+        "str     r2, [r11, #28]\n\t"
+    "12:\n\t"
+        /* coord i = 0 */
+        "and     r0, r7, #3\n\t"
+        "mov     r1, #64\n\t"
+        "tst     r8, r1, lsl r0\n\t"
+        "popeq   {r4-r11, pc}\n\t"
+        "add     r0, r0, #6\n\t"
+        "add     r0, r4, r0, lsl #2\n\t"
+        "lsr     r2, r7, #8\n\t"
+        "ands    r2, r2, #255\n\t"        /* l2 = log2S */
+        "beq     14f\n\t"
+        "ldr     r3, [r6, #4]\n\t"        /* g0sh = g0[0][1] */
+        "mov     r1, #0\n\t"
+        "tst     r5, #0x10000\n\t"
+        "beq     15f\n\t"
+        "subs    r1, r2, r3\n\t"
+        "mov     r12, #0x100000\n\t"
+        "lsrge   r1, r12, r1\n\t"
+        "rsblt   r1, r1, #0\n\t"
+        "lsllt   r1, r12, r1\n\t"
+    "15:\n\t"
+        "ldr     r12, [r6]\n\t"           /* g0val = g0[0][0] */
+        "sub     r1, r12, r1\n\t"
+        "ldr     r12, [r0, #232]\n\t"
+        "ldr     lr, [r0, #272]\n\t"
+        "smull   r2, r3, r9, r12\n\t"
+        "smlal   r2, r3, r10, lr\n\t"
+        "lsr     r2, r2, #12\n\t"
+        "orr     r2, r2, r3, lsl #20\n\t"
+        "sub     r1, r1, r2\n\t"
+        "ldr     r3, [r6, #4]\n\t"        /* g0sh */
+        "and     r2, r5, #255\n\t"        /* wrapMode[0] */
+        "cmp     r2, #1\n\t"
+        "addeq   r2, r3, #21\n\t"
+        "moveq   r3, #0\n\t"
+        "lsrne   r2, r2, #1\n\t"
+        "addne   r3, r3, r2\n\t"
+        "rsbne   r2, r2, #32\n\t"
+        "rsbne   r3, r3, #11\n\t"
+        "lsl     r1, r1, r3\n\t"
+        "lsl     r12, r12, r3\n\t"
+        "lsl     lr, lr, r3\n\t"
+        "str     r1, [r0, #192]\n\t"
+        "str     r12, [r0, #232]\n\t"
+        "str     lr, [r0, #272]\n\t"
+        "lsr     r1, r7, #8\n\t"
+        "and     r1, r1, #255\n\t"
+        "sub     r2, r2, r1\n\t"
+        "str     r2, [r11, #24]\n\t"
+        "pop     {r4-r11, pc}\n\t"
+    "14:\n\t"
+        "str     r2, [r0, #232]\n\t"
+        "str     r2, [r0, #272]\n\t"
+        "str     r2, [r0, #192]\n\t"
+        "str     r2, [r11, #24]\n\t"
+        "pop     {r4-r11, pc}\n\t");
+}
+#else
 static inline int grComputeMipLevel(const _grTexture * restrict texture,
                                     const _grPixelPipe * restrict pipe,
                                     int texIndex, unsigned int activeGradMask,
@@ -1767,6 +2583,7 @@ static void grSetupTextureUnitCoord(Gerbera_s * restrict state, int texIndex, in
     tex->linear = linear;
     tex->palette = texture->palette;
 }
+#endif
 
 void grSetupTextureUnit(Gerbera_s * restrict state, int texIndex, int (* restrict g0)[2],
                         int v0sx, int v0sy)

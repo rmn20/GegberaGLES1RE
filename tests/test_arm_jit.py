@@ -390,6 +390,69 @@ def check_spans(lib, machine, code, data, stack, stop):
     assert lib.grCompileARMPixelPipelineEx(direct, 2000, buffer(bytes(signature)), 0, C.byref(mask), 1) > 0
     print(f"ARM JIT: {ext_checks} extended pixel pipeline comparisons passed")
 
+    mip_fog_checks = 0
+    for out_idx, modulate, (width, height), span_list in product(
+            (1, 3), (0, 1), ((2, 2), (3, 1)),
+            ([(13 << 16) | 1, (7 << 16) | 3], [(0 << 16) | 0, (4 << 16) | 2, (9 << 16) | 1],
+             [(1 << 16) | 5, (3 << 16) | 2, (5 << 16) | 1, (8 << 16) | 0])):
+        signature = bytearray(144)
+        signature[:16] = destinations[out_idx]
+        signature[10] = 2
+        for offset, value in ((16, 1), (17, signature[8]), (18, 0),
+                              (19, 0), (20, 0), (21, 0), (22, 3),
+                              (30, 0), (40, 1), (41, 0), (42, 1), (45, 0), (47, 1)):
+            signature[offset] = value
+        tex_rec = bytearray(pixel_texture_record(descriptors, fmt=2, mode=0 if modulate else 3))
+        tex_rec[17] = 0
+        signature[56:100] = tex_rec
+        direct = buffer(bytes(4096))
+        mask = C.c_uint32()
+        length = lib.grCompileARMPixelPipelineEx(direct, 4096, buffer(bytes(signature)), 0, C.byref(mask), 1)
+        assert length > 0, (out_idx, modulate, width, height)
+        ext_code = bytes(direct)[:length]
+        program, output = buffer(bytes(32768)), buffer(bytes(65536))
+        assert lib.grExecuteProgram(program, buffer(bytes(signature)), 4096) > 0
+        size = lib.differential_raster_compile(program, 0x3FF, output, 65536, buffer(bytes(16)))
+        assert size > 0
+        hc_code = bytes(output)[:size]
+        for cname, cref, cxadd, cyadd in color_variants:
+            if modulate and cname != "const_255":
+                continue
+            oracle.cursor = data
+            initial = [bytes(rng.getrandbits(8) for _ in range(128)) + b"\xA5" * 16,
+                       struct.pack("<32H", *([0, 0xFFFF, 0x4000, 0x8000] * 8)) + b"\xA5" * 16]
+            targets = [allocate(len(value), value) for value in initial]
+            scratch = allocate(16384)
+            pipe = scratch + 64
+            spans = allocate(4 * len(span_list), words(span_list))
+            texels = allocate(4 << 4, words([rng.getrandbits(32) for _ in range(16)]))
+            s_mask, t_mask = (1 << width) - 1, (1 << height) - 1
+            s_shift, t_shift = 32 - width, 32 - height
+            oracle.write(pipe, words([0, texels, 0, 0, s_mask, t_mask, s_shift, t_shift, width]))
+            oracle.write(pipe + 128, words([allocate(16, bytes(kernel))]))
+            oracle.write(pipe + 132, words([16 * signature[9], 32, 16, 0xFF7090B0, 0, 3, 3, 255, 255]))
+            oracle.write(pipe + 168, words([*targets, 0, 2, spans, 1]))
+            gradients = [
+                0x10000000, 96 << 16, *cref, 0x91234567, 0xFEDCBA98, 0, 0,
+                0x01000000, 0x071234, *cxadd, 0x13456789, 0xABCDEF01, 0, 0,
+                0x02000000, -0x031111, *cyadd, 0x17234567, 0xDBECA987, 0, 0,
+            ]
+            oracle.write(pipe + 192, words(gradients))
+            original_stack = oracle.readback(scratch, 16384)
+            results = []
+            for emitted in (hc_code, ext_code):
+                for address, value in zip(targets, initial):
+                    oracle.write(address, value)
+                oracle.write(scratch, original_stack)
+                entry = install_code(emitted)
+                call(entry, [scratch], saved)
+                results.append(tuple(oracle.readback(address, len(value)) for address, value in zip(targets, initial)))
+                assert all(machine.reg_read(reg) == value for reg, value in saved.items())
+                assert machine.reg_read(ARM.UC_ARM_REG_SP) == stack + 65536 - 4096
+            assert results[0] == results[1], ("MipReplaceFogFast4", out_idx, modulate, width, height, span_list, cname)
+            mip_fog_checks += 1
+    print(f"ARM JIT: {mip_fog_checks} MipReplaceFogFast4 pixel pipeline comparisons passed")
+
     blend_checks = 0
     blend_destinations = (descriptors[1], descriptors[5])
     for out_idx, tex_fmt, modulate, fog, depth, alpha_mode in product(

@@ -537,30 +537,27 @@ static void grTransformVertexFloat3Common(Gerbera_s *state, _grVertex *vertex)
         "sub   r11, r10, r7\n\t"
         "cmp   r11, #16\n\t"
         "bhi   10f\n\t"
-        "orr   r2, r3, #0x00800000\n\t"
+        "orrs  r2, r3, #0x00800000\n\t"
         "mov   r2, r2, lsl #8\n\t"
         "mov   r2, r2, lsr #2\n\t"
-        "cmp   r3, #0\n\t"
         "rsbmi r2, r2, #0\n\t"
         "mov   r2, r2, asr r11\n\t"
     "2:\n\t"
         "sub   r11, r10, r8\n\t"
         "cmp   r11, #16\n\t"
         "bhi   11f\n\t"
-        "orr   r3, r4, #0x00800000\n\t"
+        "orrs  r3, r4, #0x00800000\n\t"
         "mov   r3, r3, lsl #8\n\t"
         "mov   r3, r3, lsr #2\n\t"
-        "cmp   r4, #0\n\t"
         "rsbmi r3, r3, #0\n\t"
         "mov   r3, r3, asr r11\n\t"
     "3:\n\t"
         "sub   r11, r10, r9\n\t"
         "cmp   r11, #16\n\t"
         "bhi   12f\n\t"
-        "orr   r4, r5, #0x00800000\n\t"
+        "orrs  r4, r5, #0x00800000\n\t"
         "mov   r4, r4, lsl #8\n\t"
         "mov   r4, r4, lsr #2\n\t"
-        "cmp   r5, #0\n\t"
         "rsbmi r4, r4, #0\n\t"
         "mov   r4, r4, asr r11\n\t"
     "4:\n\t"
@@ -881,40 +878,40 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
     (void)vertexList;
     __asm__ __volatile__(
         "stmfd sp!, {r4-r11, lr}\n\t"
-        "sub   sp, sp, #52\n\t"
-        "str   r0, [sp, #48]\n\t"       /* [sp+48] = state (for rare slow path) */
+        "sub   sp, sp, #48\n\t"
+        "str   r0, [sp, #44]\n\t"       /* [sp+44] = state (for rare slow path) */
         "mov   r4, r1\n\t"              /* r4 = vertexList */
         "add   ip, r0, #4096\n\t"
         "ldr   r5, [ip, #1144]\n\t"     /* renderStack */
-        "ldr   r6, [ip, #1308]\n\t"     /* r6 = stride */
-        "ldr   r7, [ip, #1316]\n\t"     /* r7 = data */
         "add   r1, r0, #1024\n\t"
         "add   r1, r1, #232\n\t"
-        "ldmia r1, {r2, r3, r8, r9, r10}\n\t" /* exps, m0, m1, m2, m3 */
+        "ldmia r1, {r2, r6, r7, r8, r10}\n\t" /* exps, m0, m1, m2, m3 */
+        "ldr   r0, [ip, #1308]\n\t"     /* stride */
+        "ldr   r1, [ip, #1316]\n\t"     /* data */
+        "stmia sp, {r0, r1}\n\t"        /* [sp+0] = stride, [sp+4] = data */
         "ldr   r0, [ip, #1856]\n\t"     /* fogEnd */
         "ldr   r1, [ip, #1860]\n\t"     /* fogOORange */
         "mov   r10, r10, asr #3\n\t"    /* m3_shr3 */
         "add   r5, r5, #1328\n\t"
         "add   r5, r5, #4\n\t"          /* r5 = vertexBuffer */
-        "str   r3, [sp, #0]\n\t"        /* [sp+0] = m0 */
-        "str   r8, [sp, #4]\n\t"        /* [sp+4] = m1 */
-        "str   r9, [sp, #8]\n\t"        /* [sp+8] = m2 */
-        "str   r2, [sp, #12]\n\t"       /* [sp+12] = exps */
-        "str   r10, [sp, #16]\n\t"      /* [sp+16] = m3_shr3 */
-        "movs  r2, r2, lsr #24\n\t"
-        "addne r2, r2, #127\n\t"        /* ea3_biased */
+        "str   r10, [sp, #8]\n\t"       /* [sp+8] = m3_shr3 */
+        "movs  r10, r2, lsr #24\n\t"
+        "addne r10, r10, #127\n\t"      /* ea3_biased */
+        "str   r10, [sp, #12]\n\t"      /* [sp+12] = ea3_biased */
+        "str   r2, [sp, #16]\n\t"       /* [sp+16] = exps */
         "mov   r3, r0, lsr #23\n\t"     /* fogEndExp */
-        "mov   r8, r0, lsl #9\n\t"
-        "mov   r8, r8, lsr #2\n\t"
-        "orr   r8, r8, #0x40000000\n\t" /* fogEndMant */
-        "mov   r9, r1, lsl #8\n\t"
-        "orr   r9, r9, #0x80000000\n\t" /* fogOORangeMant */
-        "rsb   r10, r3, #268\n\t"
-        "sub   r10, r10, r1, lsr #23\n\t" /* kFog = 268 - fogEndExp - fogOORangeExp */
+        "mov   r10, r0, lsl #9\n\t"
+        "mov   r10, r10, lsr #2\n\t"
+        "orr   r10, r10, #0x40000000\n\t" /* fogEndMant */
+        "mov   r11, r1, lsl #8\n\t"
+        "orr   r11, r11, #0x80000000\n\t" /* fogOORangeMant */
+        "rsb   lr, r3, #268\n\t"
+        "sub   lr, lr, r1, lsr #23\n\t"
+        "sub   lr, lr, #1\n\t"          /* kFog - 1 = 267 - fogEndExp - fogOORangeExp */
         "add   ip, sp, #20\n\t"
-        "stmia ip, {r2, r3, r8, r9, r10}\n\t"
-        "str   r0, [sp, #40]\n\t"       /* fogEnd */
-        "str   r1, [sp, #44]\n\t"       /* fogOORange */
+        "stmia ip, {r3, r10, r11, lr}\n\t"
+        "str   r0, [sp, #36]\n\t"       /* [sp+36] = fogEnd */
+        "str   r1, [sp, #40]\n\t"       /* [sp+40] = fogOORange */
         "ldrb  r0, [r4], #1\n\t"
         "add   r9, r5, r0, lsl #7\n\t"
 
@@ -922,129 +919,117 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
         "ldrh  r0, [r9, #4]\n\t"
         "movs  r0, r0, lsr #14\n\t"
         "bne   8f\n\t"
-        "ldr   r0, [r9, #0]\n\t"
-        "mla   r3, r6, r0, r7\n\t"
-        "ldmia r3, {r0, r1, r2}\n\t"    /* r0=x, r1=y, r2=z (kept live!) */
+        "ldr   r2, [r9, #0]\n\t"
+        "ldmia sp, {r0, r1}\n\t"        /* r0 = stride, r1 = data */
+        "mla   r3, r0, r2, r1\n\t"
+        "ldmia r3, {r0, r1, r2}\n\t"    /* r0=x, r1=y, r2=z */
         "mov   ip, #255\n\t"
-        "and   r10, ip, r0, lsr #23\n\t"
-        "and   r11, ip, r1, lsr #23\n\t"
-        "and   lr,  ip, r2, lsr #23\n\t"
-        "sub   r3, r10, #1\n\t"
-        "cmp   r3, #254\n\t"
-        "sublo r3, r11, #1\n\t"
-        "cmplo r3, #254\n\t"
-        "sublo r3, lr, #1\n\t"
-        "cmplo r3, #254\n\t"
+        "and   r3,  ip, r0, lsr #23\n\t"
+        "and   r10, ip, r1, lsr #23\n\t"
+        "and   r11, ip, r2, lsr #23\n\t"
+        "sub   ip, r3, #1\n\t"
+        "cmp   ip, #254\n\t"
+        "sublo ip, r10, #1\n\t"
+        "cmplo ip, #254\n\t"
+        "sublo ip, r11, #1\n\t"
+        "cmplo ip, #254\n\t"
         "bhs   12f\n\t"
 
-        "ldr   r8, [sp, #12]\n\t"       /* exps (ea0, ea1, ea2 non-zero) */
-        "and   r3, r8, #255\n\t"
-        "add   r10, r10, r3\n\t"
+        "ldr   ip, [sp, #16]\n\t"       /* exps */
+        "and   lr, ip, #255\n\t"
+        "add   r3, r3, lr\n\t"
 #if defined(__ARM_ARCH) && __ARM_ARCH >= 6
-        "uxtb  r3, r8, ror #8\n\t"
-        "add   r11, r11, r3\n\t"
-        "uxtb  r3, r8, ror #16\n\t"
-        "add   lr,  lr,  r3\n\t"
+        "uxtb  lr, ip, ror #8\n\t"
+        "add   r10, r10, lr\n\t"
+        "uxtb  lr, ip, ror #16\n\t"
+        "add   r11, r11, lr\n\t"
 #else
-        "and   r3, r8, #0xFF00\n\t"
-        "add   r11, r11, r3, lsr #8\n\t"
-        "mov   r3, r8, lsr #16\n\t"
-        "and   r3, r3, #255\n\t"
-        "add   lr,  lr,  r3\n\t"
+        "and   lr, ip, #0xFF00\n\t"
+        "add   r10, r10, lr, lsr #8\n\t"
+        "mov   lr, ip, lsr #16\n\t"
+        "and   lr, lr, #255\n\t"
+        "add   r11, r11, lr\n\t"
 #endif
-        "ldr   r8, [sp, #20]\n\t"       /* ea3 */
-        "mov   ip, r8\n\t"
+        "ldr   lr, [sp, #12]\n\t"       /* ea3 */
+        "mov   ip, lr\n\t"
+        "cmp   ip, r3\n\t"
+        "movlt ip, r3\n\t"
         "cmp   ip, r10\n\t"
         "movlt ip, r10\n\t"
         "cmp   ip, r11\n\t"
-        "movlt ip, r11\n\t"
-        "cmp   ip, lr\n\t"
-        "movlt ip, lr\n\t"              /* ip = maxExp */
-        "orr   r11, r11, lr, lsl #16\n\t" /* r11 = eY | (eZ << 16); lr free */
+        "movlt ip, r11\n\t"             /* ip = maxExp */
 
-        "ldr   r3, [sp, #16]\n\t"       /* m3_shr3 */
-        "sub   r8, ip, r8\n\t"
-        "cmp   r8, #31\n\t"
-        "movgt r8, #31\n\t"
-        "mov   r3, r3, asr r8\n\t"      /* r3 = sum */
+        "sub   r3, ip, r3\n\t"
+        "cmp   r3, #31\n\t"
+        "movgt r3, #31\n\t"
+        "orrs  r0, r0, #0x00800000\n\t"
+        "mov   r0, r0, lsl #8\n\t"
+        "mov   r0, r0, lsr #2\n\t"
+        "rsbmi r0, r0, #0\n\t"
+        "smull lr, r0, r6, r0\n\t"
+        "mov   r3, r0, asr r3\n\t"
 
         "sub   r10, ip, r10\n\t"
         "cmp   r10, #31\n\t"
         "movgt r10, #31\n\t"
-        "ldr   r8, [sp, #0]\n\t"        /* m0 */
-        "cmp   r0, #0\n\t"
-        "orr   r0, r0, #0x00800000\n\t"
-        "mov   r0, r0, lsl #8\n\t"
-        "mov   r0, r0, lsr #2\n\t"
-        "rsbmi r0, r0, #0\n\t"
-        "smull lr, r0, r8, r0\n\t"
-        "add   r3, r3, r0, asr r10\n\t"
-
-        "mov   r0, r11, lsl #16\n\t"
-        "sub   r0, ip, r0, lsr #16\n\t"
-        "cmp   r0, #31\n\t"
-        "movgt r0, #31\n\t"
-        "ldr   r8, [sp, #4]\n\t"        /* m1 */
-        "cmp   r1, #0\n\t"
-        "orr   r1, r1, #0x00800000\n\t"
+        "orrs  r1, r1, #0x00800000\n\t"
         "mov   r1, r1, lsl #8\n\t"
         "mov   r1, r1, lsr #2\n\t"
         "rsbmi r1, r1, #0\n\t"
-        "smull lr, r1, r8, r1\n\t"
-        "add   r3, r3, r1, asr r0\n\t"
+        "smull lr, r1, r7, r1\n\t"
+        "add   r3, r3, r1, asr r10\n\t"
 
-        "mov   lr, r11, lsr #16\n\t"
-        "sub   lr, ip, lr\n\t"
-        "cmp   lr, #31\n\t"
-        "movgt lr, #31\n\t"
-        "ldr   r8, [sp, #8]\n\t"        /* m2 */
-        "cmp   r2, #0\n\t"
-        "orr   r2, r2, #0x00800000\n\t"
+        "sub   r11, ip, r11\n\t"
+        "cmp   r11, #31\n\t"
+        "movgt r11, #31\n\t"
+        "orrs  r2, r2, #0x00800000\n\t"
         "mov   r2, r2, lsl #8\n\t"
         "mov   r2, r2, lsr #2\n\t"
         "rsbmi r2, r2, #0\n\t"
-        "smull r10, r2, r8, r2\n\t"
-        "add   r3, r3, r2, asr lr\n\t"
+        "smull lr, r2, r8, r2\n\t"
+        "add   r3, r3, r2, asr r11\n\t"
+
+        "add   lr, sp, #8\n\t"
+        "ldmia lr, {r0, r1}\n\t"        /* r0 = m3_shr3, r1 = ea3 */
+        "sub   r1, ip, r1\n\t"
+        "cmp   r1, #31\n\t"
+        "movgt r1, #31\n\t"
+        "add   r3, r3, r0, asr r1\n\t"
     "4:\n\t"
         "cmp   r3, #0\n\t"
         "beq   7f\n\t"
         "rsblt r3, r3, #0\n\t"
         "clz   r1, r3\n\t"
-        "sub   r1, r1, #1\n\t"
+        "subs  r1, r1, #1\n\t"
+        "movge r3, r3, lsl r1\n\t"
+        "movlt r3, r3, lsr #1\n\t"
         "sub   ip, ip, r1\n\t"
-        "sub   ip, ip, #124\n\t"
-        "cmp   ip, #0\n\t"
+        "subs  ip, ip, #124\n\t"
         "ble   7f\n\t"
         "cmp   ip, #254\n\t"
         "bgt   6f\n\t"
-        "cmp   r1, #0\n\t"
-        "movge r3, r3, lsl r1\n\t"
-        "movlt r3, r3, lsr #1\n\t"
         "bic   r3, r3, #0x7F\n\t"
-        "add   r2, sp, #24\n\t"
-        "ldmia r2, {r0, r8, r10, lr}\n\t"   /* fogEndExp, fogEndMant, fogOORangeMant, kFog */
-        "subs  r1, r0, ip\n\t"
+        "add   r2, sp, #20\n\t"
+        "ldmia r2, {r0, r1, r10, lr}\n\t" /* fogEndExp, fogEndMant, fogOORangeMant, kFog - 1 */
+        "subs  r2, r0, ip\n\t"
         "blt   6f\n\t"
-        "cmpeq r8, r3\n\t"
+        "cmpeq r1, r3\n\t"
         "bls   6f\n\t"
-        "cmp   r1, #31\n\t"
-        "movhi r1, #31\n\t"
-        "mov   r11, r3, lsr r1\n\t"
-        "cmp   r3, r11, lsl r1\n\t"
+        "cmp   r2, #31\n\t"
+        "movhi r2, #31\n\t"
+        "mov   r11, r3, lsr r2\n\t"
+        "cmp   r3, r11, lsl r2\n\t"
         "addne r11, r11, #1\n\t"
-        "sub   r3, r8, r11\n\t"
+        "sub   r3, r1, r11\n\t"
         "clz   ip, r3\n\t"
-        "sub   ip, ip, #1\n\t"
-        "subs  r0, r0, ip\n\t"
-        "ble   6f\n\t"
+        "cmp   r0, ip\n\t"
+        "blt   6f\n\t"
         "mov   r3, r3, lsl ip\n\t"
-        "mov   r3, r3, lsl #1\n\t"
         "bic   r3, r3, #0xFF\n\t"
-        "umull r1, r11, r3, r10\n\t"
+        "umulls r1, r11, r3, r10\n\t"
         "add   r0, lr, ip\n\t"
-        "cmp   r11, #0\n\t"
-        "sublt r0, r0, #1\n\t"
-        "movlt r11, r11, lsr #1\n\t"
+        "submi r0, r0, #1\n\t"
+        "movmi r11, r11, lsr #1\n\t"
         "bic   r11, r11, #0x7F\n\t"
         "cmp   r0, #31\n\t"
         "bhi   5f\n\t"
@@ -1058,7 +1043,7 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
         "cmp   r0, #255\n\t"
         "addne r9, r5, r0, lsl #7\n\t"
         "bne   1b\n\t"
-        "add   sp, sp, #52\n\t"
+        "add   sp, sp, #48\n\t"
         "ldmfd sp!, {r4-r11, pc}\n\t"
 
     "5:\n\t"
@@ -1072,94 +1057,89 @@ static void grApplyFogLINEAR_float3Fast(Gerbera_s *state, unsigned char *vertexL
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
     "7:\n\t"
-        "ldr   r0, [sp, #40]\n\t"
-        "ldr   r1, [sp, #44]\n\t"
+        "ldr   r0, [sp, #36]\n\t"
+        "ldr   r1, [sp, #40]\n\t"
         "bl    grApplyFogLINEAR_zeroZ_asm\n\t"
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
     "8:\n\t"
-        "ldr   r0, [sp, #48]\n\t"
+        "ldr   r0, [sp, #44]\n\t"
         "mov   r1, r9\n\t"
         "bl    grApplyFogLINEAR_slow_asm\n\t"
         "strh  r0, [r9, #54]\n\t"
         "b     9b\n\t"
 
     "12:\n\t"
-        "cmp   r10, #255\n\t"
+        "cmp   r3,  #255\n\t"
+        "cmpne r10, #255\n\t"
         "cmpne r11, #255\n\t"
-        "cmpne lr,  #255\n\t"
         "beq   8b\n\t"
-        "ldr   r8, [sp, #12]\n\t"
-        "and   r3, r8, #255\n\t"
-        "cmp   r10, #0\n\t"
-        "cmpne r3, #0\n\t"
-        "addne r10, r10, r3\n\t"
-        "moveq r10, #0\n\t"
-        "and   r3, r8, #0xFF00\n\t"
-        "movs  r3, r3, lsr #8\n\t"
-        "cmpne r11, #0\n\t"
-        "addne r11, r11, r3\n\t"
-        "moveq r11, #0\n\t"
-        "mov   r3, r8, lsr #16\n\t"
-        "ands  r3, r3, #255\n\t"
+        "ldr   ip, [sp, #16]\n\t"
+        "and   lr, ip, #255\n\t"
+        "cmp   r3, #0\n\t"
         "cmpne lr, #0\n\t"
-        "addne lr, lr, r3\n\t"
-        "moveq lr, #0\n\t"
-        "ldr   r8, [sp, #20]\n\t"
-        "mov   ip, r8\n\t"
+        "addne r3, r3, lr\n\t"
+        "moveq r3, #0\n\t"
+        "and   lr, ip, #0xFF00\n\t"
+        "movs  lr, lr, lsr #8\n\t"
+        "cmpne r10, #0\n\t"
+        "addne r10, r10, lr\n\t"
+        "moveq r10, #0\n\t"
+        "mov   lr, ip, lsr #16\n\t"
+        "ands  lr, lr, #255\n\t"
+        "cmpne r11, #0\n\t"
+        "addne r11, r11, lr\n\t"
+        "moveq r11, #0\n\t"
+        "ldr   lr, [sp, #12]\n\t"
+        "mov   ip, lr\n\t"
+        "cmp   ip, r3\n\t"
+        "movlt ip, r3\n\t"
         "cmp   ip, r10\n\t"
         "movlt ip, r10\n\t"
         "cmp   ip, r11\n\t"
         "movlt ip, r11\n\t"
-        "cmp   ip, lr\n\t"
-        "movlt ip, lr\n\t"
-        "orr   r11, r11, lr, lsl #16\n\t"
-        "ldr   r3, [sp, #16]\n\t"
-        "sub   r8, ip, r8\n\t"
-        "cmp   r8, #31\n\t"
-        "movgt r8, #31\n\t"
-        "mov   r3, r3, asr r8\n\t"
-        "cmp   r10, #0\n\t"
+        "cmp   r3, #0\n\t"
         "beq   2f\n\t"
-        "sub   r10, ip, r10\n\t"
-        "cmp   r10, #31\n\t"
-        "movgt r10, #31\n\t"
-        "ldr   r8, [sp, #0]\n\t"
-        "cmp   r0, #0\n\t"
-        "orr   r0, r0, #0x00800000\n\t"
+        "sub   r3, ip, r3\n\t"
+        "cmp   r3, #31\n\t"
+        "movgt r3, #31\n\t"
+        "orrs  r0, r0, #0x00800000\n\t"
         "mov   r0, r0, lsl #8\n\t"
         "mov   r0, r0, lsr #2\n\t"
         "rsbmi r0, r0, #0\n\t"
-        "smull lr, r0, r8, r0\n\t"
-        "add   r3, r3, r0, asr r10\n\t"
+        "smull lr, r0, r6, r0\n\t"
+        "mov   r3, r0, asr r3\n\t"
     "2:\n\t"
-        "movs  r0, r11, lsl #16\n\t"
+        "cmp   r10, #0\n\t"
         "beq   3f\n\t"
-        "sub   r0, ip, r0, lsr #16\n\t"
-        "cmp   r0, #31\n\t"
-        "movgt r0, #31\n\t"
-        "ldr   r8, [sp, #4]\n\t"
-        "cmp   r1, #0\n\t"
-        "orr   r1, r1, #0x00800000\n\t"
+        "sub   r10, ip, r10\n\t"
+        "cmp   r10, #31\n\t"
+        "movgt r10, #31\n\t"
+        "orrs  r1, r1, #0x00800000\n\t"
         "mov   r1, r1, lsl #8\n\t"
         "mov   r1, r1, lsr #2\n\t"
         "rsbmi r1, r1, #0\n\t"
-        "smull lr, r1, r8, r1\n\t"
-        "add   r3, r3, r1, asr r0\n\t"
+        "smull lr, r1, r7, r1\n\t"
+        "add   r3, r3, r1, asr r10\n\t"
     "3:\n\t"
-        "movs  lr, r11, lsr #16\n\t"
-        "beq   4b\n\t"
-        "sub   lr, ip, lr\n\t"
-        "cmp   lr, #31\n\t"
-        "movgt lr, #31\n\t"
-        "ldr   r8, [sp, #8]\n\t"
-        "cmp   r2, #0\n\t"
-        "orr   r2, r2, #0x00800000\n\t"
+        "cmp   r11, #0\n\t"
+        "beq   13f\n\t"
+        "sub   r11, ip, r11\n\t"
+        "cmp   r11, #31\n\t"
+        "movgt r11, #31\n\t"
+        "orrs  r2, r2, #0x00800000\n\t"
         "mov   r2, r2, lsl #8\n\t"
         "mov   r2, r2, lsr #2\n\t"
         "rsbmi r2, r2, #0\n\t"
-        "smull r10, r2, r8, r2\n\t"
-        "add   r3, r3, r2, asr lr\n\t"
+        "smull lr, r2, r8, r2\n\t"
+        "add   r3, r3, r2, asr r11\n\t"
+    "13:\n\t"
+        "add   lr, sp, #8\n\t"
+        "ldmia lr, {r0, r1}\n\t"
+        "sub   r1, ip, r1\n\t"
+        "cmp   r1, #31\n\t"
+        "movgt r1, #31\n\t"
+        "add   r3, r3, r0, asr r1\n\t"
         "b     4b\n\t"
     );
 }
@@ -2102,6 +2082,41 @@ void grTransformTexCoordDEFAULT(Gerbera_s *state, unsigned char *vertexList, int
     } while (*vertexLista++ != 0xFF);
 }
 
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void grTransformTexCoordFLOATx4_slow(Gerbera_s *state, unsigned char *vertexList, int texUnit,
+                                            unsigned char *ptr, int stride, int size)
+{
+    _grVertex *vertexBuffer = GR_VERTEX_BUFFER(state);
+    unsigned char *vertexLista = vertexList + 1;
+    _grVertex *vertex = &vertexBuffer[*vertexList];
+
+    do
+    {
+        int *strq = (int *)&ptr[stride * vertex->index];
+        int str1[4];
+        if (grIsAligned(strq, 4) == 0 &&
+            grAssert("grIsAligned(ptr + stride*vertex->index, 4)", "grVertexPipeline.inl", 1868) != 0)
+            grDie(0);
+        str1[0] = IScalar_iftos(strq[0]);
+        str1[1] = IScalar_iftos(strq[1]);
+        if (size == 2)
+        {
+            ITCTransform_mulfv2(&vertex->texCoord[texUnit].x,
+                                &state->texCoordTransform[texUnit], str1);
+        }
+        else
+        {
+            str1[2] = IScalar_iftos(strq[2]);
+            str1[3] = (size == 3) ? IScalar_one() : IScalar_iftos(strq[3]);
+            ITCTransform_mulfv4(&vertex->texCoord[texUnit].x,
+                                &state->texCoordTransform[texUnit], str1);
+        }
+        vertex = &vertexBuffer[*vertexLista];
+    } while (*vertexLista++ != 0xFF);
+}
+
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 __attribute__((optimize("O3")))
 #endif
@@ -2116,10 +2131,14 @@ void grTransformTexCoordFLOATx4(Gerbera_s *state, unsigned char *vertexList, int
     unsigned char *vertexLista;
 
     GR_FETCH_CHECK(vertexList, 1866);
+    if (__builtin_expect(size != 2 || (unsigned int)state->texCoordTransform[texUnit].cl != 0x80200802u, 0))
+    {
+        grTransformTexCoordFLOATx4_slow(state, vertexList, texUnit, ptr, stride, size);
+        return;
+    }
     vertexBuffer = GR_VERTEX_BUFFER(state);
     vertexLista = vertexList + 1;
     vertex = &vertexBuffer[*vertexList];
-    if (__builtin_expect(size == 2 && (unsigned int)state->texCoordTransform[texUnit].cl == 0x80200802u, 1))
     {
 #if defined(__GNUC__) && !defined(__clang__) && defined(__arm__) && !defined(__thumb__)
         register unsigned char *vbuf __asm__("r4") = (unsigned char *)vertexBuffer;
@@ -2213,18 +2232,7 @@ void grTransformTexCoordFLOATx4(Gerbera_s *state, unsigned char *vertexList, int
             vertex = &vertexBuffer[*vertexLista];
         } while (*vertexLista++ != 0xFF);
 #endif
-        return;
     }
-    do
-    {
-        if (grIsAligned(&ptr[stride * vertex->index], 4) == 0 &&
-            grAssert("grIsAligned(ptr + stride*vertex->index, 4)", "grVertexPipeline.inl", 1868) != 0)
-            grDie(0);
-        ITCTransform_mulfv(&vertex->texCoord[texUnit].x,
-                           &state->texCoordTransform[texUnit],
-                           (int *)&ptr[stride * vertex->index], size);
-        vertex = &vertexBuffer[*vertexLista];
-    } while (*vertexLista++ != 0xFF);
 }
 
 /* --- point size fetchers (fragments 2416-2489) ------------------------------ */

@@ -656,7 +656,7 @@ static inline int grApi_stp(const _IVector4 *pA, const _IVector4 *pB, const _IVe
     (defined(__ARMEL__) || (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
 static inline int grApi_stp_raw_v(const _grVertex *A, const _grVertex *B, const _grVertex *C)
 {
-    int t0, t1, t2, t3, t4, lo, nbc, nca;
+    int t0, t1, t2, t3, lo, nbc, nca;
 
     __asm__(
         "ldr   %[t0], [%[B], #12]\n\t"
@@ -665,31 +665,31 @@ static inline int grApi_stp_raw_v(const _grVertex *A, const _grVertex *B, const 
         "ldr   %[t3], [%[C], #16]\n\t"
         "mov   %[t1], %[t1], lsl #1\n\t"
         "mov   %[t3], %[t3], lsl #1\n\t"
-        "rsb   %[t4], %[t2], #0\n\t"
         "smull %[lo], %[nbc], %[t0], %[t3]\n\t"
-        "smlal %[lo], %[nbc], %[t4], %[t1]\n\t"
+        "rsb   %[t1], %[t1], #0\n\t"
+        "smlal %[lo], %[nbc], %[t2], %[t1]\n\t"
         "ldr   %[t0], [%[A], #12]\n\t"
         "ldr   %[t1], [%[A], #16]\n\t"
         "mov   %[t1], %[t1], lsl #1\n\t"
-        "rsb   %[t4], %[t0], #0\n\t"
         "smull %[lo], %[nca], %[t2], %[t1]\n\t"
-        "smlal %[lo], %[nca], %[t4], %[t3]\n\t"
+        "rsb   %[t3], %[t3], #0\n\t"
+        "smlal %[lo], %[nca], %[t0], %[t3]\n\t"
+        "ldr   %[t2], [%[A], #24]\n\t"
+        "smull %[lo], %[t3], %[nbc], %[t2]\n\t"
+        "ldr   %[t2], [%[B], #24]\n\t"
+        "smlal %[lo], %[t3], %[nca], %[t2]\n\t"
         "ldr   %[t2], [%[B], #12]\n\t"
-        "ldr   %[t3], [%[B], #16]\n\t"
-        "mov   %[t3], %[t3], lsl #1\n\t"
-        "rsb   %[t4], %[t2], #0\n\t"
-        "smull %[lo], %[t2], %[t0], %[t3]\n\t"
-        "smlal %[lo], %[t2], %[t4], %[t1]\n\t"
-        "ldr   %[t0], [%[A], #24]\n\t"
-        "smull %[lo], %[t4], %[nbc], %[t0]\n\t"
-        "ldr   %[t0], [%[B], #24]\n\t"
-        "smlal %[lo], %[t4], %[nca], %[t0]\n\t"
+        "ldr   %[nbc], [%[B], #16]\n\t"
+        "mov   %[nbc], %[nbc], lsl #1\n\t"
+        "smull %[lo], %[nca], %[t0], %[nbc]\n\t"
+        "rsb   %[t1], %[t1], #0\n\t"
+        "smlal %[lo], %[nca], %[t2], %[t1]\n\t"
         "ldr   %[t0], [%[C], #24]\n\t"
-        "smlal %[lo], %[t4], %[t2], %[t0]"
+        "smlal %[lo], %[t3], %[nca], %[t0]"
         : [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3),
-          [t4] "=&r"(t4), [lo] "=&r"(lo), [nbc] "=&r"(nbc), [nca] "=&r"(nca)
+          [lo] "=&r"(lo), [nbc] "=&r"(nbc), [nca] "=&r"(nca)
         : [A] "r"(A), [B] "r"(B), [C] "r"(C));
-    return t4;
+    return t3;
 }
 #endif
 
